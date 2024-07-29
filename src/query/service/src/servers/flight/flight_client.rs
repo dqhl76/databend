@@ -13,7 +13,6 @@
 // limitations under the License.
 
 use std::collections::VecDeque;
-use std::error::Error;
 use std::str::FromStr;
 use std::sync::atomic::AtomicPtr;
 use std::sync::atomic::AtomicUsize;
@@ -174,6 +173,11 @@ impl FlightClient {
         let streaming = self.get_streaming(request).await?;
 
         let (notify, rx) = Self::streaming_receiver(streaming);
+
+        info!(
+            "client side establish do_get connection with x-target: {}",
+            target
+        );
         Ok(FlightExchange::create_receiver(
             notify,
             rx,
@@ -220,6 +224,7 @@ impl FlightClient {
                         }
                     }
                 }
+                info!("client side: do_get close");
 
                 drop(streaming);
                 tx.close();
@@ -311,7 +316,7 @@ impl FlightReceiver {
             Err(_) => Ok(None),
             Ok(Err(error)) => {
                 info!("Error while receiving data from flight : {:?}", error);
-                if error.source().map_or(false, |e| e.is::<hyper::Error>()) {
+                if error.code() == ErrorCode::CANNOT_CONNECT_NODE {
                     // only retry when error is network problem
                     if self.retry().await.is_ok() {
                         info!("Reconnect Successfully");
