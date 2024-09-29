@@ -22,21 +22,28 @@ use databend_common_catalog::plan::TopK;
 use databend_common_catalog::table::Table;
 use databend_common_catalog::table_context::TableContext;
 use databend_common_exception::Result;
+use databend_common_expression::TableSchema;
 use databend_common_functions::BUILTIN_FUNCTIONS;
 use databend_common_pipeline_core::Pipeline;
 use databend_common_pipeline_transforms::processors::TransformPipelineHelper;
 use databend_common_sql::evaluator::BlockOperator;
 use databend_common_sql::evaluator::CompoundBlockOperator;
+use databend_storages_common_index::BloomIndex;
 
-use crate::io::AggIndexReader;
-use crate::io::BlockReader;
-use crate::io::VirtualColumnReader;
-use crate::operations::read::build_fuse_parquet_source_pipeline;
-use crate::operations::read::fuse_source::build_fuse_native_source_pipeline;
-use crate::pruning::SegmentLocation;
 use crate::FuseLazyPartInfo;
 use crate::FuseStorageFormat;
 use crate::FuseTable;
+use crate::io::AggIndexReader;
+use crate::io::BlockReader;
+use crate::io::BloomIndexBuilder;
+use crate::io::VirtualColumnReader;
+use crate::operations::read::build_fuse_parquet_source_pipeline;
+use crate::operations::read::fuse_source::build_fuse_native_source_pipeline;
+use crate::pruning::FusePruner;
+use crate::pruning::PruningContext;
+use crate::pruning::SegmentLocation;
+use crate::pruning_pipeline::CompactReadTransform;
+use crate::pruning_pipeline::ReadSegmentSource;
 
 impl FuseTable {
     pub fn create_block_reader(
@@ -150,6 +157,15 @@ impl FuseTable {
                     snapshot_loc: snapshot_loc.clone(),
                 });
             }
+        }
+        let enable_prune_pipeline = ctx.get_settings().get_enable_prune_pipeline()?;
+        if enable_prune_pipeline {
+            self.build_prune_pipeline(
+                pipeline,
+                self.schema_with_stream(),
+                plan.clone(),
+                ctx.clone(),
+            );
         }
         if !lazy_init_segments.is_empty() {
             let table = self.clone();
@@ -278,5 +294,83 @@ impl FuseTable {
                 virtual_reader,
             ),
         }
+    }
+
+    fn build_prune_pipeline(
+        &self,
+        pipeline: &mut Pipeline,
+        table_schema: Arc<TableSchema>,
+        plan: DataSourcePlan,
+        table_ctx: Arc<dyn TableContext>,
+    ) -> Result<()> {
+        let dal = self.operator.clone();
+        let push_downs = plan.push_downs.clone();
+        let snapshot_loc = plan.statistics.snapshot.clone();
+        let bloom_index_builder = if table_ctx
+            .get_settings()
+            .get_enable_auto_fix_missing_bloom_index()?
+        {
+            let storage_format = self.storage_format;
+
+            let bloom_columns_map = self
+                .bloom_index_cols()
+                .bloom_index_fields(table_schema.clone(), BloomIndex::supported_type)?;
+
+            Some(BloomIndexBuilder {
+                table_ctx: table_ctx.clone(),
+                table_schema: table_schema.clone(),
+                table_dal: dal.clone(),
+                storage_format,
+                bloom_columns_map,
+            })
+        } else {
+            None
+        };
+
+        let pruner_context = if !self.is_native() || self.cluster_key_meta.is_none() {
+            PruningContext::try_create(
+                &table_ctx,
+                dal.clone(),
+                table_schema.clone(),
+                &push_downs,
+                None,
+                vec![],
+                self.bloom_index_cols.clone(),
+                8, // TODO
+                bloom_index_builder,
+            )
+        } else {
+            let cluster_keys = self.cluster_keys(table_ctx.clone());
+
+            PruningContext::try_create(
+                &table_ctx,
+                dal.clone(),
+                table_schema.clone(),
+                &push_downs,
+                self.cluster_key_meta.clone(),
+                cluster_keys,
+                self.bloom_index_cols.clone(),
+                8, // TODO
+                bloom_index_builder,
+            )
+        }?;
+
+        pipeline.add_source(
+            |output| {
+                ReadSegmentSource::create(
+                    table_ctx.clone(),
+                    pruner_context.internal_column_pruner.clone(),
+                    snapshot_loc.clone(),
+                    output,
+                )
+            },
+            1,
+        )?;
+
+        pipeline.add_transform(|input, output| {
+            CompactReadTransform::create(dal.clone(), table_schema.clone(), input, output)
+        })?;
+
+        Ok(())
     }
 }

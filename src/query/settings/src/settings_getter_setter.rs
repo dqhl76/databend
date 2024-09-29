@@ -18,12 +18,12 @@ use databend_common_exception::Result;
 use databend_common_io::GeometryDataType;
 use databend_common_meta_app::principal::UserSettingValue;
 
-use crate::settings::Settings;
-use crate::settings_default::DefaultSettings;
 use crate::ChangeValue;
 use crate::ReplaceIntoShuffleStrategy;
 use crate::ScopeLevel;
 use crate::SettingMode;
+use crate::settings::Settings;
+use crate::settings_default::DefaultSettings;
 
 #[derive(Clone, Copy)]
 pub enum FlightCompression {
@@ -743,5 +743,9 @@ impl Settings {
 
     pub fn get_max_spill_io_requests(&self) -> Result<u64> {
         self.try_get_u64("max_spill_io_requests")
+    }
+
+    pub fn get_enable_prune_pipeline(&self) -> Result<bool> {
+        Ok(self.try_get_u64("enable_prune_pipeline")? == 1)
     }
 }
