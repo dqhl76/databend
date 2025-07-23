@@ -18,7 +18,6 @@ use std::collections::VecDeque;
 use std::fmt::Debug;
 use std::fmt::Formatter;
 use std::sync::atomic::AtomicBool;
-use std::sync::atomic::AtomicU64;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -158,21 +157,9 @@ impl Node {
     }
 }
 
-const POINTS_MASK: u64 = 0xFFFFFFFF00000000;
-const EPOCH_MASK: u64 = 0x00000000FFFFFFFF;
-
-// DEFAULT_POINTS is equal to Priority::MEDIUM
-const DEFAULT_POINTS: u64 = 3;
-
 struct ExecutingGraph {
     finished_nodes: AtomicUsize,
     graph: StableGraph<Arc<Node>, EdgeInfo>,
-    /// points store two values
-    ///
-    /// - the high 32 bit store the number of points that can be consumed
-    /// - the low 32 bit store this points belong to which epoch
-    points: AtomicU64,
-    max_points: AtomicU64,
     query_id: Arc<String>,
     should_finish: AtomicBool,
     finished_notify: Arc<WatchNotify>,
@@ -185,7 +172,6 @@ type StateLockGuard = ExecutingGraph;
 impl ExecutingGraph {
     pub fn create(
         mut pipeline: Pipeline,
-        init_epoch: u32,
         query_id: Arc<String>,
         finish_condvar_notify: Option<Arc<(Mutex<bool>, Condvar)>>,
     ) -> Result<ExecutingGraph> {
@@ -196,8 +182,6 @@ impl ExecutingGraph {
         Ok(ExecutingGraph {
             graph,
             finished_nodes: AtomicUsize::new(0),
-            points: AtomicU64::new((DEFAULT_POINTS << 32) | init_epoch as u64),
-            max_points: AtomicU64::new(DEFAULT_POINTS),
             query_id,
             should_finish: AtomicBool::new(false),
             finished_notify: Arc::new(WatchNotify::new()),
@@ -208,7 +192,6 @@ impl ExecutingGraph {
 
     pub fn from_pipelines(
         mut pipelines: Vec<Pipeline>,
-        init_epoch: u32,
         query_id: Arc<String>,
         finish_condvar_notify: Option<Arc<(Mutex<bool>, Condvar)>>,
     ) -> Result<ExecutingGraph> {
@@ -222,8 +205,6 @@ impl ExecutingGraph {
         Ok(ExecutingGraph {
             finished_nodes: AtomicUsize::new(0),
             graph,
-            points: AtomicU64::new((DEFAULT_POINTS << 32) | init_epoch as u64),
-            max_points: AtomicU64::new(DEFAULT_POINTS),
             query_id,
             should_finish: AtomicBool::new(false),
             finished_notify: Arc::new(WatchNotify::new()),
@@ -439,42 +420,6 @@ impl ExecutingGraph {
 
         Ok(())
     }
-
-    /// Checks if a task can be performed in the current epoch, consuming a point if possible.
-    pub fn can_perform_task(&self, global_epoch: u32) -> bool {
-        let max_points = self.max_points.load(Ordering::SeqCst);
-        let mut expected_value = 0;
-        let mut desired_value = 0;
-
-        loop {
-            match self.points.compare_exchange_weak(
-                expected_value,
-                desired_value,
-                Ordering::SeqCst,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => {
-                    return (desired_value & EPOCH_MASK) as u32 == global_epoch;
-                }
-                Err(new_expected) => {
-                    let remain_points = (new_expected & POINTS_MASK) >> 32;
-                    let epoch = new_expected & EPOCH_MASK;
-
-                    expected_value = new_expected;
-
-                    if epoch > global_epoch as u64 {
-                        desired_value = new_expected;
-                    } else if epoch < global_epoch as u64 {
-                        desired_value = (max_points - 1) << 32 | global_epoch as u64;
-                    } else if remain_points >= 1 {
-                        desired_value = (remain_points - 1) << 32 | epoch;
-                    } else {
-                        desired_value = max_points << 32 | (epoch + 1);
-                    }
-                }
-            }
-        }
-    }
 }
 
 #[derive(Clone)]
@@ -596,57 +541,30 @@ impl ScheduleQueue {
         debug_assert!(!context.has_task());
 
         while let Some(processor) = self.async_queue.pop_front() {
-            if processor
-                .graph
-                .can_perform_task(executor.epoch.load(Ordering::SeqCst))
-            {
-                let query_id = processor.graph.get_query_id().clone();
-                Self::schedule_async_task_with_condition(
-                    processor,
-                    query_id,
-                    executor,
-                    context.get_worker_id(),
-                    context.get_workers_condvar().clone(),
-                    global.clone(),
-                )
-            } else {
-                let mut tasks = VecDeque::with_capacity(1);
-                tasks.push_back(ExecutorTask::Async(processor));
-                global.push_tasks(context.get_worker_id(), None, tasks);
+            let query_id = processor.graph.get_query_id().clone();
+            Self::schedule_async_task_with_condition(
+                processor,
+                query_id,
+                executor,
+                context.get_worker_id(),
+                context.get_workers_condvar().clone(),
+                global.clone(),
+            )
+        }
+
+        if !self.sync_queue.is_empty() {
+            if let Some(processor) = self.sync_queue.pop_front() {
+                context.set_task(ExecutorTask::Sync(processor));
             }
         }
 
         if !self.sync_queue.is_empty() {
-            while let Some(processor) = self.sync_queue.pop_front() {
-                if processor
-                    .graph
-                    .can_perform_task(executor.epoch.load(Ordering::SeqCst))
-                {
-                    context.set_task(ExecutorTask::Sync(processor));
-                    break;
-                } else {
-                    let mut tasks = VecDeque::with_capacity(1);
-                    tasks.push_back(ExecutorTask::Sync(processor));
-                    global.push_tasks(context.get_worker_id(), None, tasks);
-                }
-            }
-        }
-
-        if !self.sync_queue.is_empty() {
-            let mut current_tasks = VecDeque::with_capacity(self.sync_queue.len());
             let mut next_tasks = VecDeque::with_capacity(self.sync_queue.len());
             while let Some(processor) = self.sync_queue.pop_front() {
-                if processor
-                    .graph
-                    .can_perform_task(executor.epoch.load(Ordering::SeqCst))
-                {
-                    current_tasks.push_back(ExecutorTask::Sync(processor));
-                } else {
-                    next_tasks.push_back(ExecutorTask::Sync(processor));
-                }
+                next_tasks.push_back(ExecutorTask::Sync(processor));
             }
             let worker_id = context.get_worker_id();
-            global.push_tasks(worker_id, Some(current_tasks), next_tasks);
+            global.push_tasks(worker_id, None, next_tasks);
         }
     }
 
@@ -688,24 +606,21 @@ pub struct RunningGraph(ExecutingGraph);
 impl RunningGraph {
     pub fn create(
         pipeline: Pipeline,
-        init_epoch: u32,
         query_id: Arc<String>,
         finish_condvar_notify: Option<Arc<(Mutex<bool>, Condvar)>>,
     ) -> Result<Arc<RunningGraph>> {
-        let graph_state =
-            ExecutingGraph::create(pipeline, init_epoch, query_id, finish_condvar_notify)?;
+        let graph_state = ExecutingGraph::create(pipeline, query_id, finish_condvar_notify)?;
         debug!("Create running graph:{:?}", graph_state);
         Ok(Arc::new(RunningGraph(graph_state)))
     }
 
     pub fn from_pipelines(
         pipelines: Vec<Pipeline>,
-        init_epoch: u32,
         query_id: Arc<String>,
         finish_condvar_notify: Option<Arc<(Mutex<bool>, Condvar)>>,
     ) -> Result<Arc<RunningGraph>> {
         let graph_state =
-            ExecutingGraph::from_pipelines(pipelines, init_epoch, query_id, finish_condvar_notify)?;
+            ExecutingGraph::from_pipelines(pipelines, query_id, finish_condvar_notify)?;
         debug!("Create running graph:{:?}", graph_state);
         Ok(Arc::new(RunningGraph(graph_state)))
     }
@@ -837,11 +752,6 @@ impl RunningGraph {
         self.0.should_finish.load(Ordering::SeqCst)
     }
 
-    /// Checks if a task can be performed in the current epoch, consuming a point if possible.
-    pub fn can_perform_task(&self, global_epoch: u32) -> bool {
-        self.0.can_perform_task(global_epoch)
-    }
-
     pub fn get_query_id(&self) -> Arc<String> {
         self.0.query_id.clone()
     }
@@ -853,10 +763,6 @@ impl RunningGraph {
 
     pub fn record_node_error(&self, node_index: NodeIndex, error: NodeErrorType) {
         self.0.graph[node_index].record_error(error);
-    }
-
-    pub fn get_points(&self) -> u64 {
-        self.0.points.load(Ordering::SeqCst)
     }
 
     pub fn get_finished_notify(&self) -> Arc<WatchNotify> {
@@ -964,11 +870,6 @@ impl RunningGraph {
         }
 
         format!("{:?}", nodes_display)
-    }
-
-    /// Change the priority
-    pub fn change_priority(&self, priority: u64) {
-        self.0.max_points.store(priority, Ordering::SeqCst);
     }
 }
 

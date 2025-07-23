@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::atomic::AtomicU32;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use databend_common_base::runtime::catch_unwind;
@@ -43,8 +41,6 @@ pub struct QueriesPipelineExecutor {
     pub global_tasks_queue: Arc<QueriesExecutorTasksQueue>,
     finished_notify: Arc<WatchNotify>,
     finished_error: Mutex<Option<ErrorCode>>,
-
-    pub epoch: AtomicU32,
 }
 
 impl QueriesPipelineExecutor {
@@ -59,7 +55,6 @@ impl QueriesPipelineExecutor {
             async_runtime: GlobalIORuntime::instance(),
             finished_error: Mutex::new(None),
             finished_notify: Arc::new(WatchNotify::new()),
-            epoch: AtomicU32::new(0),
         }))
     }
 
@@ -149,8 +144,7 @@ impl QueriesPipelineExecutor {
         while !self.global_tasks_queue.is_finished() {
             // When there are not enough tasks, the thread will be blocked, so we need loop check.
             while !self.global_tasks_queue.is_finished() && !context.has_task() {
-                self.global_tasks_queue
-                    .steal_task_to_context(&mut context, self);
+                self.global_tasks_queue.steal_task_to_context(&mut context);
             }
 
             while !self.global_tasks_queue.is_finished() && context.has_task() {
@@ -232,11 +226,6 @@ impl QueriesPipelineExecutor {
 
     pub fn is_finished(&self) -> bool {
         self.global_tasks_queue.is_finished()
-    }
-
-    #[inline]
-    pub(crate) fn increase_global_epoch(&self) {
-        self.epoch.fetch_add(1, Ordering::SeqCst);
     }
 }
 

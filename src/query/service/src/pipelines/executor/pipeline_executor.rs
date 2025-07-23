@@ -42,6 +42,8 @@ use crate::pipelines::executor::RunningGraph;
 
 pub type InitCallback = Box<dyn FnOnce() -> Result<()> + Send + Sync + 'static>;
 
+/// The queries executor schedules multiple queries simultaneously,
+/// with each QueryWrapper corresponding to a single query
 pub struct QueryWrapper {
     graph: Arc<RunningGraph>,
     settings: ExecutorSettings,
@@ -74,7 +76,6 @@ impl PipelineExecutor {
 
             let graph = RunningGraph::create(
                 pipeline,
-                1,
                 settings.query_id.clone(),
                 Some(finish_condvar.clone()),
             )?;
@@ -129,7 +130,6 @@ impl PipelineExecutor {
 
             let graph = RunningGraph::from_pipelines(
                 pipelines,
-                1,
                 settings.query_id.clone(),
                 Some(finish_condvar.clone()),
             )?;
@@ -286,14 +286,7 @@ impl PipelineExecutor {
         }
     }
 
-    pub fn change_priority(&self, priority: u8) {
-        match self {
-            PipelineExecutor::QueryPipelineExecutor(_) => {
-                unreachable!("[PIPELINE-EXECUTOR] Logic error: cannot change priority for QueryPipelineExecutor")
-            }
-            PipelineExecutor::QueriesPipelineExecutor(query_wrapper) => {
-                query_wrapper.graph.change_priority(priority as u64);
-            }
-        }
+    pub fn change_priority(&self, _priority: u8) {
+        todo!()
     }
 }

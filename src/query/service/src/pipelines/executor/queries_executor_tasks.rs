@@ -24,7 +24,6 @@ use crate::pipelines::executor::executor_graph::ProcessorWrapper;
 use crate::pipelines::executor::executor_worker_context::CompletedAsyncTask;
 use crate::pipelines::executor::ExecutorTask;
 use crate::pipelines::executor::ExecutorWorkerContext;
-use crate::pipelines::executor::QueriesPipelineExecutor;
 use crate::pipelines::executor::WatchNotify;
 use crate::pipelines::executor::WorkersCondvar;
 use crate::pipelines::executor::WorkersWaitingStatus;
@@ -100,27 +99,12 @@ impl QueriesExecutorTasksQueue {
 
     /// Pull task from the global task queue
     /// Method is thread unsafe and require thread safe call
-    pub fn steal_task_to_context(
-        self: &Arc<Self>,
-        context: &mut ExecutorWorkerContext,
-        executor: &Arc<QueriesPipelineExecutor>,
-    ) {
+    pub fn steal_task_to_context(self: &Arc<Self>, context: &mut ExecutorWorkerContext) {
         let mut workers_tasks = self.workers_tasks.lock();
         while !workers_tasks.current_tasks.is_empty() {
             let task = workers_tasks
                 .current_tasks
                 .pop_task(context.get_worker_id());
-
-            // the tasks in the current_tasks may be swapped from next_tasks.
-            // so we need to check the points again, it can ensure every task cost a point.
-            if let Some(graph) = task.get_graph() {
-                if !graph.can_perform_task(executor.epoch.load(Ordering::SeqCst)) {
-                    workers_tasks
-                        .next_tasks
-                        .push_task(context.get_worker_id(), task);
-                    continue;
-                }
-            }
 
             context.set_task(task);
 
@@ -152,7 +136,6 @@ impl QueriesExecutorTasksQueue {
 
         if workers_tasks.current_tasks.is_empty() && !workers_tasks.next_tasks.is_empty() {
             workers_tasks.swap_tasks();
-            executor.increase_global_epoch();
             return;
         }
 
