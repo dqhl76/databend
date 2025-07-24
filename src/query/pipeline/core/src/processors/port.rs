@@ -20,6 +20,7 @@ use databend_common_base::runtime::drop_guard;
 use databend_common_base::runtime::profile::Profile;
 use databend_common_base::runtime::profile::ProfileStatisticsName;
 use databend_common_base::runtime::QueryTimeSeriesProfile;
+use databend_common_base::runtime::ThreadTracker;
 use databend_common_base::runtime::TimeSeriesProfileName;
 use databend_common_exception::Result;
 use databend_common_expression::DataBlock;
@@ -185,12 +186,58 @@ impl InputPort {
 
     #[inline(always)]
     pub fn pull_data(&self) -> Option<Result<DataBlock>> {
+        let max_rows_limit = ThreadTracker::max_rows_limit();
+        if let Some(limit) = max_rows_limit {
+            self.pull_partial_data(limit)
+        } else {
+            self.pull_all_data()
+        }
+    }
+
+    /// Pull all available data without any row limit.
+    ///
+    /// This method provides the original behavior with minimal overhead
+    /// when no row limit is configured.
+    #[inline(always)]
+    pub fn pull_all_data(&self) -> Option<Result<DataBlock>> {
         unsafe {
             UpdateTrigger::update_input(&self.update_trigger);
             let unset_flags = HAS_DATA | NEED_DATA;
             match self.shared.swap(std::ptr::null_mut(), 0, unset_flags) {
                 address if address.is_null() => None,
                 address => Some((*Box::from_raw(address)).0),
+            }
+        }
+    }
+
+    /// Pull data with a row limit, preserving excess rows for subsequent pulls.
+    ///
+    /// When the available data block exceeds the specified limit:
+    /// 1. The first `limit` rows are returned to the caller
+    /// 2. The remaining rows are placed back into shared status
+    pub fn pull_partial_data(&self, limit: usize) -> Option<Result<DataBlock>> {
+        unsafe {
+            UpdateTrigger::update_input(&self.update_trigger);
+            // retrieve data without changing flags to prevent concurrent modifications
+            match self.shared.swap(std::ptr::null_mut(), 0, 0) {
+                address if address.is_null() => None,
+                address => {
+                    let data_block = (*Box::from_raw(address)).0;
+                    if let Ok(data_block) = &data_block {
+                        if data_block.num_rows() > limit {
+                            let need = data_block.slice(0..limit);
+                            let remain = data_block.slice(limit..data_block.num_rows());
+                            let remain_data = Box::into_raw(Box::new(SharedData(Ok(remain))));
+                            // put back the remainder without changing flags
+                            // This keeps HAS_DATA set so we will have next pull to retrieve it
+                            self.shared.swap(remain_data, 0, 0);
+                            return Some(Ok(need));
+                        }
+                    }
+                    // Take entire datablock and unset the flags to signal ready for next loop
+                    self.shared.set_flags(0, HAS_DATA | NEED_DATA);
+                    Some(data_block)
+                }
             }
         }
     }

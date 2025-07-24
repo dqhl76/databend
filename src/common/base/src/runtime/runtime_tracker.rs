@@ -143,6 +143,7 @@ pub struct TrackingPayload {
     pub local_time_series_profile: Option<Arc<TimeSeriesProfiles>>,
     pub workload_group_resource: Option<Arc<WorkloadGroupResource>>,
     pub perf_enabled: bool,
+    pub max_rows_limit: Option<usize>,
 }
 
 pub struct TrackingGuard {
@@ -222,6 +223,7 @@ impl ThreadTracker {
                 local_time_series_profile: None,
                 workload_group_resource: None,
                 perf_enabled: false,
+                max_rows_limit: None,
             }),
         }
     }
@@ -335,6 +337,12 @@ impl ThreadTracker {
             })
             .ok()
             .and_then(|x| x)
+    }
+
+    pub fn max_rows_limit() -> Option<usize> {
+        TRACKER
+            .try_with(|tracker| tracker.borrow().payload.max_rows_limit)
+            .unwrap_or(None)
     }
 }
 

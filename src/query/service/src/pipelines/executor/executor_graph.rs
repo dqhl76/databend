@@ -366,7 +366,10 @@ impl ExecutingGraph {
                 let node = &locker.graph[schedule_index];
 
                 let event = {
-                    let guard = ThreadTracker::tracking(node.tracking_payload.clone());
+                    let mut payload = node.tracking_payload.clone();
+                    payload.max_rows_limit = Some(1000);
+
+                    let guard = ThreadTracker::tracking(payload);
 
                     if state_guard_cache.is_none() {
                         state_guard_cache = Some(node.state.lock().unwrap());

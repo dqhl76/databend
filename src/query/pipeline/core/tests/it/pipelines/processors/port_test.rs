@@ -108,6 +108,80 @@ async fn test_input_and_output_port() -> Result<()> {
     }
 }
 
+mod test_test_input_and_output_with_limit {
+    use std::sync::Arc;
+
+    use databend_common_base::runtime::ThreadTracker;
+    use databend_common_exception::Result;
+    use databend_common_expression::types::Int32Type;
+    use databend_common_expression::DataBlock;
+    use databend_common_expression::FromData;
+    use databend_common_pipeline_core::processors::connect;
+    use databend_common_pipeline_core::processors::InputPort;
+    use databend_common_pipeline_core::processors::OutputPort;
+
+    fn round_trip(input: Arc<InputPort>, output: Arc<OutputPort>) -> Result<usize> {
+        input.set_need_data();
+        assert!(output.can_push());
+        let col = Int32Type::from_data(vec![1, 2, 3, 4, 5]);
+        let block = DataBlock::new_from_columns(vec![col.clone()]);
+        output.push_data(Ok(block));
+        assert!(input.has_data());
+        let data_block = input.pull_data().unwrap()?;
+        Ok(data_block.num_rows())
+    }
+
+    fn test_with_row_limit(
+        input: Arc<InputPort>,
+        output: Arc<OutputPort>,
+        limit: Option<usize>,
+    ) -> Result<usize> {
+        let mut payload = ThreadTracker::new_tracking_payload();
+        payload.max_rows_limit = limit;
+        let _guard = ThreadTracker::tracking(payload);
+        round_trip(input, output)
+    }
+
+    #[test]
+    fn test_input_and_output_with_limit_basic() -> Result<()> {
+        unsafe {
+            let input = InputPort::create();
+            let output = OutputPort::create();
+            connect(&input, &output);
+
+            // Test 1: No limit - should return all 5 rows
+            let rows = test_with_row_limit(input.clone(), output.clone(), None)?;
+            assert_eq!(rows, 5);
+
+            // Test 2: Limit > data size - should return all 5 rows
+            let rows = test_with_row_limit(input.clone(), output.clone(), Some(100))?;
+            assert_eq!(rows, 5);
+
+            // Test 3: Limit = data size - should return all 5 rows
+            let rows = test_with_row_limit(input.clone(), output.clone(), Some(5))?;
+            assert_eq!(rows, 5);
+
+            // Test 4: Limit < data size - should return limited rows and leave remaining data
+            let rows = test_with_row_limit(input.clone(), output.clone(), Some(2))?;
+            assert_eq!(rows, 2);
+            assert_eq!(input.has_data(), true);
+
+            // Test 5: Pull remaining data after limit
+            {
+                let mut payload = ThreadTracker::new_tracking_payload();
+                payload.max_rows_limit = Some(100);
+                let _guard = ThreadTracker::tracking(payload);
+                let data_block = input.pull_data().unwrap()?;
+                assert_eq!(data_block.num_rows(), 3);
+                assert_eq!(input.has_data(), false);
+                assert_eq!(input.is_need_data(), false);
+            }
+        }
+
+        Ok(())
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn test_input_and_output_flags() -> Result<()> {
     unsafe {
@@ -121,9 +195,5 @@ async fn test_input_and_output_flags() -> Result<()> {
         input.set_need_data();
         assert!(input.is_finished());
     }
-
-    // assert_eq!(output.can_push());
-    // input.set_need_data();
-    // assert_eq!(!output.can_push());
     Ok(())
 }
