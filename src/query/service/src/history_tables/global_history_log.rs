@@ -46,6 +46,7 @@ use futures_util::future::join_all;
 use futures_util::TryStreamExt;
 use log::error;
 use log::info;
+use log::warn;
 use opendal::raw::normalize_root;
 use parking_lot::Mutex;
 use rand::random;
@@ -161,26 +162,34 @@ impl GlobalHistoryLog {
             let meta_key = format!("{}/history_log_transform", self.tenant_id).clone();
             let log = GlobalHistoryLog::instance();
             let handle = spawn(async move {
-                let mut consecutive_error = 0;
+                let mut persistent_error_cnt = 0;
+                let mut temp_error_cnt = 0;
                 loop {
                     match log.transform(&table_clone, &meta_key).await {
                         Ok(acquired_lock) => {
                             if acquired_lock {
-                                consecutive_error = 0;
+                                persistent_error_cnt = 0;
+                                temp_error_cnt = 0;
                             }
                         }
                         Err(e) => {
-                            error!(
+                            warn!(
                                 "[HISTORY-TABLES] {} log transform failed due to {}, retry {}",
-                                table_clone.name, e, consecutive_error
+                                table_clone.name, e, persistent_error_cnt
                             );
-                            consecutive_error += 1;
-                            if consecutive_error > 3 {
-                                error!(
-                                    "[HISTORY-TABLES] {} log transform failed too many times, exit",
-                                    table_clone.name
-                                );
-                                break;
+                            if is_temp_error(e) {
+                                let backoff_second = 2u64.pow(temp_error_cnt);
+                                temp_error_cnt += 1;
+                                sleep(Duration::from_secs(backoff_second)).await;
+                            } else {
+                                persistent_error_cnt += 1;
+                                if persistent_error_cnt > 3 {
+                                    error!(
+                                        "[HISTORY-TABLES] {} log transform failed too many times, giving up",
+                                        table_clone.name
+                                    );
+                                    return;
+                                }
                             }
                         }
                     }
@@ -432,4 +441,10 @@ pub async fn setup_operator(params: &Option<StorageParams>) -> Result<()> {
     };
     GlobalLogger::instance().set_operator(op).await;
     Ok(())
+}
+
+/// Check if the error is a temporary error,
+/// We will use this to determine if we should retry the operation.
+fn is_temp_error(e: ErrorCode) {
+    if e.code() == ErrorCode::STORAGE_OTHER || e.code() == ErrorCode::StorageUnavailable() ||
 }
