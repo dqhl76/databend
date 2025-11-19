@@ -16,28 +16,46 @@ use std::sync::Arc;
 use std::time::Instant;
 use std::vec;
 
+use arrow_ipc::writer::IpcWriteOptions;
 use bumpalo::Bump;
 use databend_common_base::base::convert_byte_size;
 use databend_common_base::base::convert_number_size;
 use databend_common_catalog::plan::AggIndexMeta;
 use databend_common_exception::Result;
+use databend_common_expression::types::BinaryType;
+use databend_common_expression::types::Int64Type;
+use databend_common_expression::types::StringType;
 use databend_common_expression::AggregateHashTable;
 use databend_common_expression::BlockMetaInfoDowncast;
 use databend_common_expression::DataBlock;
+use databend_common_expression::FromData;
 use databend_common_expression::HashTableConfig;
+use databend_common_expression::PartitionedPayload;
 use databend_common_expression::PayloadFlushState;
 use databend_common_expression::ProbeState;
 use databend_common_expression::ProjectedBlock;
+use databend_common_expression::MAX_AGGREGATE_HASHTABLE_BUCKETS_NUM;
 use databend_common_pipeline::core::InputPort;
 use databend_common_pipeline::core::OutputPort;
 use databend_common_pipeline::core::Processor;
 use databend_common_pipeline_transforms::processors::AccumulatingTransform;
 use databend_common_pipeline_transforms::processors::AccumulatingTransformer;
 use databend_common_pipeline_transforms::MemorySettings;
+use databend_common_storages_fuse::TableContext;
+use databend_common_storages_parquet::serialize_row_group_meta_to_bytes;
 
 use crate::pipelines::memory_settings::MemorySettingsExt;
+use crate::pipelines::processors::transforms::aggregator::aggregate_exchange_injector::scatter_partitioned_payload;
 use crate::pipelines::processors::transforms::aggregator::aggregate_meta::AggregateMeta;
+use crate::pipelines::processors::transforms::aggregator::exchange_defines;
+use crate::pipelines::processors::transforms::aggregator::AggregateSerdeMeta;
 use crate::pipelines::processors::transforms::aggregator::AggregatorParams;
+use crate::pipelines::processors::transforms::aggregator::FlightSerialized;
+use crate::pipelines::processors::transforms::aggregator::FlightSerializedMeta;
+use crate::pipelines::processors::transforms::aggregator::NewAggregateSpiller;
+use crate::pipelines::processors::transforms::aggregator::SharedPartitionStream;
+use crate::servers::flight::v1::exchange::serde::serialize_block;
+use crate::servers::flight::v1::exchange::ExchangeShuffleMeta;
 use crate::sessions::QueryContext;
 #[allow(clippy::enum_variant_names)]
 enum HashTable {
@@ -50,15 +68,64 @@ impl Default for HashTable {
         Self::MovedOut
     }
 }
-pub struct NewTransformPartialAggregate {
-    hash_table: HashTable,
-    probe_state: ProbeState,
-    params: Arc<AggregatorParams>,
+
+struct PartialAggregationStatistics {
     start: Instant,
     first_block_start: Option<Instant>,
     processed_bytes: usize,
     processed_rows: usize,
+}
+
+impl PartialAggregationStatistics {
+    fn new() -> Self {
+        Self {
+            start: Instant::now(),
+            first_block_start: None,
+            processed_bytes: 0,
+            processed_rows: 0,
+        }
+    }
+
+    fn record_block(&mut self, rows: usize, bytes: usize) {
+        self.processed_rows += rows;
+        self.processed_bytes += bytes;
+        if self.first_block_start.is_none() {
+            self.first_block_start = Some(Instant::now());
+        }
+    }
+
+    fn log_finish_statistics(&self, hashtable: &AggregateHashTable) {
+        let elapsed = self.start.elapsed().as_secs_f64();
+        let real_elapsed = self
+            .first_block_start
+            .as_ref()
+            .map(|t| t.elapsed().as_secs_f64())
+            .unwrap_or(elapsed);
+
+        log::info!(
+            "[TRANSFORM-AGGREGATOR] Aggregation completed: {} → {} rows in {:.2}s (real: {:.2}s), throughput: {} rows/sec, {}/sec, total: {}",
+            self.processed_rows,
+            hashtable.payload.len(),
+            elapsed,
+            real_elapsed,
+            convert_number_size(self.processed_rows as f64 / elapsed),
+            convert_byte_size(self.processed_bytes as f64 / elapsed),
+            convert_byte_size(self.processed_bytes as f64),
+        );
+    }
+}
+
+/// NewTransformPartialAggregate combine partial aggregation and spilling logic
+/// When memory exceeds threshold, it will spill out current hash table into a buffer
+/// and real spill out will happen when the buffer is full.
+pub struct NewTransformPartialAggregate {
+    hash_table: HashTable,
+    probe_state: ProbeState,
+    params: Arc<AggregatorParams>,
+    statistics: PartialAggregationStatistics,
     settings: MemorySettings,
+    spillers: Vec<NewAggregateSpiller>,
+    local_pos: usize,
 }
 
 impl NewTransformPartialAggregate {
@@ -68,7 +135,20 @@ impl NewTransformPartialAggregate {
         output: Arc<OutputPort>,
         params: Arc<AggregatorParams>,
         config: HashTableConfig,
+        partition_streams: Vec<SharedPartitionStream>,
+        local_pos: usize,
     ) -> Result<Box<dyn Processor>> {
+        let spillers = partition_streams
+            .into_iter()
+            .map(|stream| {
+                NewAggregateSpiller::try_create(
+                    ctx.clone(),
+                    MAX_AGGREGATE_HASHTABLE_BUCKETS_NUM as usize,
+                    stream.clone(),
+                )
+            })
+            .collect::<Result<Vec<NewAggregateSpiller>>>()?;
+
         let arena = Arc::new(Bump::new());
         let hash_table = HashTable::AggregateHashTable(AggregateHashTable::new(
             params.group_data_types.clone(),
@@ -85,10 +165,9 @@ impl NewTransformPartialAggregate {
                 hash_table,
                 probe_state: ProbeState::default(),
                 settings: MemorySettings::from_aggregate_settings(&ctx)?,
-                start: Instant::now(),
-                first_block_start: None,
-                processed_bytes: 0,
-                processed_rows: 0,
+                statistics: PartialAggregationStatistics::new(),
+                spillers,
+                local_pos,
             },
         ))
     }
@@ -115,12 +194,9 @@ impl NewTransformPartialAggregate {
         let block = block.consume_convert_to_full();
         let group_columns = ProjectedBlock::project(&self.params.group_columns, &block);
         let rows_num = block.num_rows();
+        let block_bytes = block.memory_size();
 
-        self.processed_bytes += block.memory_size();
-        self.processed_rows += rows_num;
-        if self.first_block_start.is_none() {
-            self.first_block_start = Some(Instant::now());
-        }
+        self.statistics.record_block(rows_num, block_bytes);
 
         {
             match &mut self.hash_table {
@@ -169,7 +245,25 @@ impl NewTransformPartialAggregate {
         }
     }
 
-    fn spill_out(&mut self) -> Result<Vec<DataBlock>> {
+    fn spill_partition_to(
+        &mut self,
+        spiller_idx: usize,
+        mut partition: PartitionedPayload,
+    ) -> Result<()> {
+        let spiller = &mut self.spillers[spiller_idx];
+        for (bucket, payload) in partition.payloads.into_iter().enumerate() {
+            if payload.len() == 0 {
+                continue;
+            }
+
+            let data_block = payload.aggregate_flush_all()?.consume_convert_to_full();
+            spiller.spill(bucket, data_block)?;
+        }
+
+        Ok(())
+    }
+
+    fn spill_out(&mut self) -> Result<()> {
         if let HashTable::AggregateHashTable(v) = std::mem::take(&mut self.hash_table) {
             let group_types = v.payload.group_types.clone();
             let aggrs = v.payload.aggrs.clone();
@@ -182,13 +276,27 @@ impl NewTransformPartialAggregate {
             let mut state = PayloadFlushState::default();
 
             // repartition to max for normalization
-            let partitioned_payload = v
+            let partition = v
                 .payload
                 .repartition(1 << config.max_radix_bits, &mut state);
 
-            let blocks = vec![DataBlock::empty_with_meta(
-                AggregateMeta::create_agg_spilling(partitioned_payload),
-            )];
+            match self.spillers.len() {
+                1 => {
+                    // standalone mode
+                    self.spill_partition_to(0, partition)?;
+                }
+                nodes_num => {
+                    // cluster mode
+                    // need firstly scatter the data into node number of partitions
+                    // then spill each partition to corresponding spiller
+                    for (idx, partition) in scatter_partitioned_payload(partition, nodes_num)?
+                        .into_iter()
+                        .enumerate()
+                    {
+                        self.spill_partition_to(idx, partition)?;
+                    }
+                }
+            }
 
             let arena = Arc::new(Bump::new());
             self.hash_table = HashTable::AggregateHashTable(AggregateHashTable::new(
@@ -197,9 +305,71 @@ impl NewTransformPartialAggregate {
                 config,
                 arena,
             ));
-            return Ok(blocks);
+        } else {
+            unreachable!("[TRANSFORM-AGGREGATOR] Invalid hash table state during spill check")
         }
-        unreachable!("[TRANSFORM-AGGREGATOR] Invalid hash table state during spill check")
+        Ok(())
+    }
+
+    fn finish_local_new_spiller(spiller: &mut NewAggregateSpiller) -> Result<FlightSerialized> {
+        let spilled_payloads = spiller.spill_finish()?;
+        let block = if spilled_payloads.is_empty() {
+            DataBlock::empty()
+        } else {
+            DataBlock::empty_with_meta(AggregateMeta::create_new_spilled(spilled_payloads))
+        };
+        Ok(FlightSerialized::DataBlock(block))
+    }
+
+    fn finish_exchange_new_spiller(
+        spiller: &mut NewAggregateSpiller,
+        write_options: &IpcWriteOptions,
+    ) -> Result<FlightSerialized> {
+        let spilled_payloads = spiller.spill_finish()?;
+        if spilled_payloads.is_empty() {
+            return Ok(FlightSerialized::DataBlock(serialize_block(
+                -1,
+                DataBlock::empty(),
+                write_options,
+            )?));
+        }
+
+        let mut bucket_column = Vec::with_capacity(spilled_payloads.len());
+        let mut row_group_column = Vec::with_capacity(spilled_payloads.len());
+        let mut location_column = Vec::with_capacity(spilled_payloads.len());
+        for payload in spilled_payloads {
+            bucket_column.push(payload.bucket as i64);
+            location_column.push(payload.location);
+            row_group_column.push(serialize_row_group_meta_to_bytes(&payload.row_group)?);
+        }
+
+        let data_block = DataBlock::new_from_columns(vec![
+            Int64Type::from_data(bucket_column),
+            StringType::from_data(location_column),
+            BinaryType::from_data(row_group_column),
+        ]);
+        let meta = AggregateSerdeMeta::create_new_spilled();
+        let data_block = data_block.add_meta(Some(meta))?;
+        Ok(FlightSerialized::DataBlock(serialize_block(
+            -1,
+            data_block,
+            write_options,
+        )?))
+    }
+
+    fn spill_finish(&mut self) -> Result<Vec<FlightSerialized>> {
+        let mut serialized_blocks = vec![];
+        let write_options = exchange_defines::spilled_write_options();
+
+        for (index, spiller) in self.spillers.iter_mut().enumerate() {
+            if index == self.local_pos {
+                serialized_blocks.push(Self::finish_local_new_spiller(spiller)?);
+            } else {
+                serialized_blocks.push(Self::finish_exchange_new_spiller(spiller, &write_options)?);
+            }
+        }
+
+        Ok(serialized_blocks)
     }
 }
 
@@ -225,31 +395,18 @@ impl AccumulatingTransform for NewTransformPartialAggregate {
                 }
             },
             HashTable::AggregateHashTable(hashtable) => {
-                let partition_count = hashtable.payload.partition_count();
-                let mut blocks = Vec::with_capacity(partition_count);
+                let spilled_blocks = self.spill_finish()?;
+                let flight_serialized_meta = FlightSerializedMeta::create(spilled_blocks);
+                let mut spilled_blocks = vec![DataBlock::empty_with_meta(flight_serialized_meta)];
 
-                log::info!(
-                    "[TRANSFORM-AGGREGATOR] Aggregation completed: {} → {} rows in {:.2}s (real: {:.2}s), throughput: {} rows/sec, {}/sec, total: {}",
-                    self.processed_rows,
-                    hashtable.payload.len(),
-                    self.start.elapsed().as_secs_f64(),
-                    if let Some(t) = &self.first_block_start {
-                        t.elapsed().as_secs_f64()
-                    } else {
-                        self.start.elapsed().as_secs_f64()
-                    },
-                    convert_number_size(
-                        self.processed_rows as f64 / self.start.elapsed().as_secs_f64()
-                    ),
-                    convert_byte_size(
-                        self.processed_bytes as f64 / self.start.elapsed().as_secs_f64()
-                    ),
-                    convert_byte_size(self.processed_bytes as f64),
-                );
+                let partition_count = hashtable.payload.partition_count();
+                let mut memory_blocks = Vec::with_capacity(partition_count);
+
+                self.statistics.log_finish_statistics(&hashtable);
 
                 for (bucket, payload) in hashtable.payload.payloads.into_iter().enumerate() {
                     if payload.len() != 0 {
-                        blocks.push(DataBlock::empty_with_meta(
+                        memory_blocks.push(DataBlock::empty_with_meta(
                             AggregateMeta::create_agg_payload(
                                 bucket as isize,
                                 payload,
@@ -259,7 +416,8 @@ impl AccumulatingTransform for NewTransformPartialAggregate {
                     }
                 }
 
-                blocks
+                spilled_blocks.extend(memory_blocks);
+                spilled_blocks
             }
         })
     }
