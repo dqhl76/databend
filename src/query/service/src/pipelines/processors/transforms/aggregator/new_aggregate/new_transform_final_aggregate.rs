@@ -29,6 +29,7 @@ use databend_common_pipeline::core::InputPort;
 use databend_common_pipeline::core::OutputPort;
 use databend_common_pipeline::core::Processor;
 use log::debug;
+use log::info;
 use parking_lot::Mutex;
 use tokio::sync::Barrier;
 
@@ -161,53 +162,40 @@ impl NewFinalAggregateTransform {
             new_produced.push_to_queue(partition_id, meta);
         }
 
-        // if spill already triggered, local repartition queue is all spilled out
-        // we only need to spill the new produced repartitioned queues out
         if self.round_state.is_spilled {
-            // when no more task, we need to finalize the partition stream
-            if self.round_state.working_queue.is_empty() {
-                self.spill(new_produced, true)?;
-            } else {
-                self.spill(new_produced, false)?;
-            }
+            info!("[FinalAggregateTransform-{}] already spilled in this round, spill new produced too", self.id);
+            self.spill(new_produced)?;
             return Ok(());
         }
 
-        // merge new produced repartitioned queues into local repartitioned queues
         self.repartitioned_queues.merge_queues(new_produced);
 
-        // if the queue is triggered spill and repartition too many times, considering performance affect, we may not
-        // continue to trigger spill
-        let can_trigger_spill =
-            self.round_state.current_queue_spill_round < self.round_state.max_aggregate_spill_level;
-        let need_spill = self.spiller.memory_settings.check_spill();
-
-        if !can_trigger_spill {
-            if need_spill {
-                debug!(
-                    "NewFinalAggregateTransform[{}] skip spill after {} rounds",
-                    self.id, self.round_state.current_queue_spill_round
-                );
-            }
+        // other processor has spilled in this round, we need to spill too
+        if self.shared_state.lock().is_spilled {
+            info!(
+                "[FinalAggregateTransform-{}] detected other processor spilled, spill too",
+                self.id
+            );
+            let queues = self.repartitioned_queues.take_queues();
+            self.spill(queues)?;
+            self.round_state.is_spilled = true;
             return Ok(());
         }
 
-        if need_spill {
-            debug!(
-                "NewFinalAggregateTransform[{}] trigger spill due to memory limit, spilled round {}",
-                self.id, self.round_state.current_queue_spill_round
-            );
-            self.shared_state.lock().is_spilled = true;
-        }
+        // we issue spill based on memory usage
+        let need_spill = self.spiller.memory_settings.check_spill();
+        let can_trigger_spill =
+            self.round_state.current_queue_spill_round < self.round_state.max_aggregate_spill_level;
 
-        // if other processor or itself trigger spill, this processor will need spill its local repartitioned queue out
-        if self.shared_state.lock().is_spilled
-            && !self.round_state.is_spilled
-            && !self.round_state.working_queue.is_empty()
-        {
+        if need_spill && can_trigger_spill {
+            info!(
+                "[FinalAggregateTransform-{}] detected memory pressure",
+                self.id
+            );
             self.round_state.is_spilled = true;
+            self.shared_state.lock().is_spilled = true;
             let queues = self.repartitioned_queues.take_queues();
-            self.spill(queues, false)?;
+            self.spill(queues)?;
         }
 
         Ok(())
@@ -308,12 +296,13 @@ impl NewFinalAggregateTransform {
         Ok(())
     }
 
-    pub fn spill(&mut self, mut queues: RepartitionedQueues, finalize: bool) -> Result<()> {
+    pub fn spill(&mut self, mut queues: RepartitionedQueues) -> Result<()> {
         for (id, queue) in queues.0.iter_mut().enumerate() {
             while let Some(meta) = queue.pop() {
                 match meta {
                     AggregateMeta::AggregatePayload(AggregatePayload { payload, .. }) => {
                         let data_block = payload.aggregate_flush_all()?.consume_convert_to_full();
+                        info!("spill out:(id {}) {:?}", id, data_block);
                         self.spiller.spill(id, data_block)?;
                     }
                     AggregateMeta::NewSpilled(_) => {
@@ -330,7 +319,8 @@ impl NewFinalAggregateTransform {
             }
         }
 
-        if finalize {
+        if self.round_state.working_queue.is_empty() {
+            info!("[FinalAggregateTransform-{}] finish spill round", self.id);
             let spilled_payloads = self.spiller.spill_finish()?;
             for payload in spilled_payloads {
                 self.repartitioned_queues.push_to_queue(

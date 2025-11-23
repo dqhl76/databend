@@ -252,6 +252,7 @@ impl SharedPartitionStreamInner {
 
     pub fn partition(&mut self, partition_id: u64, block: DataBlock) -> Vec<(usize, DataBlock)> {
         let indices = vec![partition_id; block.num_rows()];
+        info!("inner {:?} {:?}", partition_id, block);
         self.partition_stream.partition(indices, block, true)
     }
 }
@@ -285,6 +286,7 @@ impl SharedPartitionStream {
 
     pub fn partition(&self, partition_id: usize, block: DataBlock) -> Vec<(usize, DataBlock)> {
         let mut inner = self.inner.lock();
+        info!("spilled block {}: {:?}", partition_id, block);
         inner.partition(partition_id as u64, block)
     }
 }
@@ -322,13 +324,16 @@ impl NewAggregateSpiller {
     }
 
     pub fn spill(&mut self, partition_id: usize, block: DataBlock) -> Result<()> {
+        info!("spilled block {}: {:?}", partition_id, block);
         let ready_blocks = self.partition_stream.partition(partition_id, block);
+        info!("spilled ready blocks1: {:?}", ready_blocks);
         self.payload_writers.write_ready_blocks(ready_blocks)?;
         Ok(())
     }
 
     pub fn spill_finish(&mut self) -> Result<Vec<NewSpilledPayload>> {
         let pending_blocks = self.partition_stream.finish();
+        info!("spilled ready blocks2: {:?}", pending_blocks);
         self.payload_writers.write_ready_blocks(pending_blocks)?;
 
         let payloads = self.payload_writers.finalize()?;
@@ -365,6 +370,7 @@ impl NewAggregateSpiller {
         );
 
         if let Some(block) = data_block {
+            info!("read spill {:?}", block);
             Ok(AggregateMeta::Serialized(SerializedPayload {
                 bucket,
                 data_block: block,

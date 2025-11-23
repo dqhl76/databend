@@ -1,0 +1,45 @@
+statement ok
+set sandbox_tenant = 'test_tenant';
+
+statement ok
+use tpch_test;
+
+statement ok
+analyze table customer
+
+statement ok
+analyze table lineitem
+
+statement ok
+analyze table nation
+
+statement ok
+analyze table orders
+
+statement ok
+analyze table partsupp
+
+statement ok
+analyze table part
+
+statement ok
+analyze table region
+
+statement ok
+analyze table supplier
+
+statement ok
+set max_threads = 2;
+
+statement ok
+set enable_experiment_aggregate = 1;
+
+statement ok
+set max_aggregate_spill_level = 1;
+
+
+statement ok
+set force_aggregate_data_spill = 1;
+
+include ./queries.test
+
