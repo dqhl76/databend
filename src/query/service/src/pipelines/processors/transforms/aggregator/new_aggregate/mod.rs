@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod cluster_final_aggregate_transform;
 mod datablock_splitter;
 mod new_aggregate_spiller;
 mod new_final_aggregate_state;
