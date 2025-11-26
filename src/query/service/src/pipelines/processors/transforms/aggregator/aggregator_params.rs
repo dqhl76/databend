@@ -45,6 +45,8 @@ pub struct AggregatorParams {
 
     pub max_block_rows: usize,
     pub max_block_bytes: usize,
+
+    pub max_aggregate_spill_level: usize,
 }
 
 impl AggregatorParams {
@@ -61,6 +63,7 @@ impl AggregatorParams {
         enable_experiment_aggregate: bool,
         max_block_rows: usize,
         max_block_bytes: usize,
+        max_aggregate_spill_level: usize,
     ) -> Result<Arc<AggregatorParams>> {
         let states_layout = if !agg_funcs.is_empty() {
             Some(get_states_layout(agg_funcs)?)
@@ -81,6 +84,7 @@ impl AggregatorParams {
             max_block_bytes,
             max_spill_io_requests,
             enable_experiment_aggregate,
+            max_aggregate_spill_level,
         }))
     }
 

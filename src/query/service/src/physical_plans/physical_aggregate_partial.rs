@@ -172,28 +172,14 @@ impl IPhysicalPlan for AggregatePartial {
 
     fn build_pipeline2(&self, builder: &mut PipelineBuilder) -> Result<()> {
         self.input.build_pipeline(builder)?;
-
-        let max_block_rows = builder.settings.get_max_block_size()? as usize;
-        let max_block_bytes = builder.settings.get_max_block_bytes()? as usize;
         let max_threads = builder.settings.get_max_threads()?;
-        let max_spill_io_requests = builder.settings.get_max_spill_io_requests()?;
-
-        let enable_experimental_aggregate_hashtable = builder
-            .settings
-            .get_enable_experimental_aggregate_hashtable()?;
-
-        let enable_experiment_aggregate = builder.settings.get_enable_experiment_aggregate()?;
 
         let params = PipelineBuilder::build_aggregator_params(
             self.input.output_schema()?,
             &self.group_by,
             &self.agg_funcs,
-            enable_experimental_aggregate_hashtable,
             builder.is_exchange_parent(),
-            max_spill_io_requests as usize,
-            enable_experiment_aggregate,
-            max_block_rows,
-            max_block_bytes,
+            builder.settings.clone(),
         )?;
 
         if params.group_columns.is_empty() {
@@ -233,8 +219,8 @@ impl IPhysicalPlan for AggregatePartial {
                 .map(|_| {
                     SharedPartitionStream::new(
                         builder.main_pipeline.output_len(),
-                        max_block_rows,
-                        max_block_bytes,
+                        params.max_block_rows,
+                        params.max_block_bytes,
                         MAX_AGGREGATE_HASHTABLE_BUCKETS_NUM as usize,
                     )
                 })

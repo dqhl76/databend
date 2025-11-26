@@ -13,6 +13,7 @@
 // limitations under the License.
 
 mod datablock_splitter;
+mod experimental_final_aggregate;
 mod new_aggregate_spiller;
 mod new_final_aggregate_state;
 mod new_transform_aggregate_partial;
@@ -20,6 +21,7 @@ mod new_transform_final_aggregate;
 mod transform_partition_bucket_scatter;
 
 pub use datablock_splitter::split_partitioned_meta_into_datablocks;
+pub use experimental_final_aggregate::ExperimentalFinalAggregator;
 pub use new_aggregate_spiller::NewAggregateSpiller;
 pub use new_aggregate_spiller::SharedPartitionStream;
 pub use new_final_aggregate_state::FinalAggregateSharedState;

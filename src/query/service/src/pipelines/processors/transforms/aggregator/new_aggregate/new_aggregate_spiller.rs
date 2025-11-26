@@ -302,7 +302,7 @@ impl SharedPartitionStream {
 pub struct NewAggregateSpiller {
     pub memory_settings: MemorySettings,
     read_setting: ReadSettings,
-    partition_count: usize,
+    pub partition_count: usize,
     partition_stream: SharedPartitionStream,
     payload_writers: AggregatePayloadWriters,
 }

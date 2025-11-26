@@ -20,6 +20,7 @@ use databend_common_expression::DataField;
 use databend_common_expression::DataSchemaRef;
 use databend_common_functions::aggregates::AggregateFunctionFactory;
 use databend_common_functions::aggregates::AggregateFunctionSortDesc;
+use databend_common_settings::Settings;
 use databend_common_sql::executor::physical_plans::AggregateFunctionDesc;
 use databend_common_sql::plans::UDFType;
 use databend_common_sql::IndexType;
@@ -34,13 +35,17 @@ impl PipelineBuilder {
         input_schema: DataSchemaRef,
         group_by: &[IndexType],
         agg_funcs: &[AggregateFunctionDesc],
-        enable_experimental_aggregate_hashtable: bool,
         cluster_aggregator: bool,
-        max_spill_io_requests: usize,
-        enable_experiment_aggregate: bool,
-        max_block_rows: usize,
-        max_block_bytes: usize,
+        settings: Arc<Settings>,
     ) -> Result<Arc<AggregatorParams>> {
+        let max_block_rows = settings.get_max_block_size()? as usize;
+        let max_block_bytes = settings.get_max_block_bytes()? as usize;
+        let enable_experimental_aggregate_hashtable =
+            settings.get_enable_experimental_aggregate_hashtable()?;
+        let max_spill_io_requests = settings.get_max_spill_io_requests()? as usize;
+        let enable_experiment_aggregate = settings.get_enable_experiment_aggregate()?;
+        let max_aggregate_spill_level = settings.get_max_aggregate_spill_level()? as usize;
+
         let mut agg_args = Vec::with_capacity(agg_funcs.len());
         let (group_by, group_data_types) = group_by
             .iter()
@@ -136,6 +141,7 @@ impl PipelineBuilder {
             enable_experiment_aggregate,
             max_block_rows,
             max_block_bytes,
+            max_aggregate_spill_level,
         )?;
 
         log::debug!("aggregate states layout: {:?}", params.states_layout);
