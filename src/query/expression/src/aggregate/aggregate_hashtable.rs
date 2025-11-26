@@ -295,12 +295,9 @@ impl AggregateHashTable {
         self.combine_payloads(&other.payload, flush_state)
     }
 
-    pub fn take_payloads(&mut self, buckets: &[usize]) -> Result<Vec<Payload>> {
-        let taken = self.payload.take_payloads(buckets)?;
-        // TODO: this may be need re-evaluated if we really need to rebuild the hash index or just clear
-        let mut hash_index = HashIndex::with_capacity(self.hash_index.capacity);
-        self.rebuild_index_with(&mut hash_index);
-        self.hash_index = hash_index;
+    pub fn take_payloads(&mut self, payload_indices: &[usize]) -> Result<Vec<Payload>> {
+        let taken = self.payload.take_payloads(payload_indices)?;
+        self.clear_ht();
         Ok(taken)
     }
 
@@ -496,5 +493,19 @@ impl AggregateHashTable {
                 .map(|arena| arena.allocated_bytes())
                 .sum::<usize>()
             + self.hash_index.allocated_bytes()
+    }
+
+    pub fn repartition(&mut self, new_capacity: usize) {
+        let mut state = PayloadFlushState::default();
+        let temp_partitioned_payload = PartitionedPayload::new(
+            self.payload.group_types.clone(),
+            self.payload.aggrs.clone(),
+            1,
+            vec![Arc::new(Bump::new())],
+        );
+        let payload = std::mem::replace(&mut self.payload, temp_partitioned_payload);
+        self.payload = payload.repartition(new_capacity, &mut state);
+
+        self.clear_ht();
     }
 }

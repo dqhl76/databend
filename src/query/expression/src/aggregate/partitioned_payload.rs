@@ -135,22 +135,22 @@ impl PartitionedPayload {
         self.row_layout.states_layout.as_ref()
     }
 
-    pub fn take_payloads(&mut self, buckets: &[usize]) -> Result<Vec<Payload>> {
-        let mut taken = Vec::with_capacity(buckets.len());
+    pub fn take_payloads(&mut self, payload_indices: &[usize]) -> Result<Vec<Payload>> {
+        let mut taken = Vec::with_capacity(payload_indices.len());
         let partition_count = self.partition_count();
         let states_layout = self.row_layout.states_layout.clone();
 
-        for &bucket in buckets {
-            if bucket >= partition_count {
+        for &index in payload_indices {
+            if index >= partition_count {
                 return Err(ErrorCode::Internal(format!(
-                    "Bucket {} out of range, partition count: {}",
-                    bucket, partition_count
+                    "Payload {} out of range, partition count: {}",
+                    index, partition_count
                 )));
             }
 
             let new_arena = if self.separated_arenas {
                 let arena = Arc::new(Bump::new());
-                self.arenas[bucket] = arena.clone();
+                self.arenas[index] = arena.clone();
                 arena
             } else {
                 warn!("Reusing the same arena for all partitions during take_payloads");
@@ -164,7 +164,7 @@ impl PartitionedPayload {
                 states_layout.clone(),
             );
 
-            let old = std::mem::replace(&mut self.payloads[bucket], new_payload);
+            let old = std::mem::replace(&mut self.payloads[index], new_payload);
             taken.push(old);
         }
 
