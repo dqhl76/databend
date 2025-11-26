@@ -53,6 +53,7 @@ use databend_common_expression::Column;
 use databend_common_expression::DataBlock;
 use databend_common_expression::FromData;
 use databend_common_expression::HashTableConfig;
+use databend_common_expression::PartitionedPayload;
 use databend_common_expression::PayloadFlushState;
 use databend_common_expression::ProbeState;
 use databend_common_functions::aggregates::AggregateFunctionFactory;
@@ -217,4 +218,103 @@ fn test_layout() {
         Layout::new::<i128>(),
         Layout::from_size_align(16, 16).unwrap()
     );
+}
+
+#[test]
+fn test_partitioned_payload_with_individual_arenas() {
+    let group_types = vec![Int64Type::data_type()];
+    let aggrs = vec![];
+    let partition_count = 4usize;
+
+    let payload = PartitionedPayload::new_with_partition_bumps(
+        group_types.clone(),
+        aggrs.clone(),
+        partition_count as u64,
+    );
+
+    assert_eq!(payload.partition_count(), partition_count);
+    assert_eq!(payload.arenas.len(), partition_count);
+
+    for i in 0..partition_count {
+        for j in (i + 1)..partition_count {
+            assert!(!Arc::ptr_eq(&payload.arenas[i], &payload.arenas[j]));
+        }
+    }
+
+    let mut state = PayloadFlushState::default();
+    let repartitioned = payload.repartition(partition_count * 2, &mut state);
+
+    assert_eq!(repartitioned.partition_count(), partition_count * 2);
+    assert_eq!(repartitioned.arenas.len(), partition_count * 2);
+    for i in 0..repartitioned.partition_count() {
+        for j in (i + 1)..repartitioned.partition_count() {
+            assert!(!Arc::ptr_eq(
+                &repartitioned.arenas[i],
+                &repartitioned.arenas[j]
+            ));
+        }
+    }
+}
+
+#[test]
+fn test_take_payloads_and_rebuild() {
+    let factory = AggregateFunctionFactory::instance();
+    let group_types = vec![Int64Type::data_type()];
+    let aggrs = vec![factory
+        .get("count", vec![], vec![Int64Type::data_type()], vec![])
+        .unwrap()];
+    let config = HashTableConfig::default().with_initial_radix_bits(1);
+
+    let mut hashtable =
+        AggregateHashTable::new_with_separated_arenas(group_types.clone(), aggrs.clone(), config);
+
+    let rows_first = 64usize;
+    let columns = vec![Int64Type::from_data((0..rows_first as i64).collect_vec())];
+    let group_block_entries: Vec<BlockEntry> = columns.iter().cloned().map(|c| c.into()).collect();
+    let params = vec![vec![columns[0].clone().into()]];
+    let params = params.iter().map(|v| v.into()).collect_vec();
+
+    let mut probe_state = ProbeState::default();
+    let _ = hashtable
+        .add_groups(
+            &mut probe_state,
+            (&group_block_entries).into(),
+            &params,
+            (&[]).into(),
+            rows_first,
+        )
+        .unwrap();
+
+    let initial_len = hashtable.len();
+    let taken = hashtable.take_payloads(&[0]).unwrap();
+    assert_eq!(taken.len(), 1);
+    let taken_rows = taken[0].len();
+    assert_eq!(hashtable.len(), initial_len - taken_rows);
+
+    // new rows should still be accepted and counted
+    let rows_second = 32usize;
+    let columns_second = vec![Int64Type::from_data(
+        (rows_first as i64..rows_first as i64 + rows_second as i64).collect_vec(),
+    )];
+    let group_entries_second: Vec<BlockEntry> =
+        columns_second.iter().cloned().map(|c| c.into()).collect();
+    let params_second = vec![vec![columns_second[0].clone().into()]];
+    let params_second = params_second.iter().map(|v| v.into()).collect_vec();
+
+    let mut probe_state_second = ProbeState::default();
+    let _ = hashtable
+        .add_groups(
+            &mut probe_state_second,
+            (&group_entries_second).into(),
+            &params_second,
+            (&[]).into(),
+            rows_second,
+        )
+        .unwrap();
+
+    assert_eq!(hashtable.len(), initial_len - taken_rows + rows_second);
+
+    // The arena for the taken bucket should be replaced with a new one.
+    let replaced_arena = &hashtable.payload.arenas[0];
+    assert!(!Arc::ptr_eq(replaced_arena, &taken[0].arena));
 }

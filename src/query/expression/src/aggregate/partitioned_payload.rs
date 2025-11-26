@@ -15,7 +15,10 @@
 use std::sync::Arc;
 
 use bumpalo::Bump;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
 use itertools::Itertools;
+use log::warn;
 
 use super::payload::Payload;
 use super::probe_state::ProbeState;
@@ -37,6 +40,7 @@ pub struct PartitionedPayload {
 
     pub arenas: Vec<Arc<Bump>>,
 
+    separated_arenas: bool,
     partition_count: u64,
     mask_v: u64,
     shift_v: u64,
@@ -52,8 +56,43 @@ impl PartitionedPayload {
         partition_count: u64,
         arenas: Vec<Arc<Bump>>,
     ) -> Self {
+        Self::new_inner(group_types, aggrs, partition_count, arenas, false)
+    }
+
+    pub fn new_with_individual_arenas(
+        group_types: Vec<DataType>,
+        aggrs: Vec<AggregateFunctionRef>,
+        partition_count: u64,
+        arenas: Vec<Arc<Bump>>,
+    ) -> Self {
+        Self::new_inner(group_types, aggrs, partition_count, arenas, true)
+    }
+
+    pub fn new_with_partition_bumps(
+        group_types: Vec<DataType>,
+        aggrs: Vec<AggregateFunctionRef>,
+        partition_count: u64,
+    ) -> Self {
+        let arenas = (0..partition_count)
+            .map(|_| Arc::new(Bump::new()))
+            .collect();
+        Self::new_with_individual_arenas(group_types, aggrs, partition_count, arenas)
+    }
+
+    fn new_inner(
+        group_types: Vec<DataType>,
+        aggrs: Vec<AggregateFunctionRef>,
+        partition_count: u64,
+        arenas: Vec<Arc<Bump>>,
+        separated_arenas: bool,
+    ) -> Self {
         let radix_bits = partition_count.trailing_zeros() as u64;
         debug_assert_eq!(1 << radix_bits, partition_count);
+        debug_assert!(!arenas.is_empty());
+        debug_assert!(
+            !separated_arenas || arenas.len() == partition_count as usize,
+            "arenas length must match partition count when separated"
+        );
 
         let states_layout = if !aggrs.is_empty() {
             Some(get_states_layout(&aggrs).unwrap())
@@ -62,9 +101,10 @@ impl PartitionedPayload {
         };
 
         let payloads = (0..partition_count)
-            .map(|_| {
+            .map(|idx| {
+                let arena_idx = if separated_arenas { idx as usize } else { 0 };
                 Payload::new(
-                    arenas[0].clone(),
+                    arenas[arena_idx].clone(),
                     group_types.clone(),
                     aggrs.clone(),
                     states_layout.clone(),
@@ -82,6 +122,7 @@ impl PartitionedPayload {
             group_types,
             aggrs,
             row_layout: offsets,
+            separated_arenas,
             partition_count,
 
             arenas,
@@ -92,6 +133,42 @@ impl PartitionedPayload {
 
     pub fn states_layout(&self) -> Option<&StatesLayout> {
         self.row_layout.states_layout.as_ref()
+    }
+
+    pub fn take_payloads(&mut self, buckets: &[usize]) -> Result<Vec<Payload>> {
+        let mut taken = Vec::with_capacity(buckets.len());
+        let partition_count = self.partition_count();
+        let states_layout = self.row_layout.states_layout.clone();
+
+        for &bucket in buckets {
+            if bucket >= partition_count {
+                return Err(ErrorCode::Internal(format!(
+                    "Bucket {} out of range, partition count: {}",
+                    bucket, partition_count
+                )));
+            }
+
+            let new_arena = if self.separated_arenas {
+                let arena = Arc::new(Bump::new());
+                self.arenas[bucket] = arena.clone();
+                arena
+            } else {
+                warn!("Reusing the same arena for all partitions during take_payloads");
+                self.arenas[0].clone()
+            };
+
+            let new_payload = Payload::new(
+                new_arena,
+                self.group_types.clone(),
+                self.aggrs.clone(),
+                states_layout.clone(),
+            );
+
+            let old = std::mem::replace(&mut self.payloads[bucket], new_payload);
+            taken.push(old);
+        }
+
+        Ok(taken)
     }
 
     pub fn mark_min_cardinality(&mut self) {
@@ -152,12 +229,20 @@ impl PartitionedPayload {
             return self;
         }
 
-        let mut new_partition_payload = PartitionedPayload::new(
-            self.group_types.clone(),
-            self.aggrs.clone(),
-            new_partition_count as u64,
-            self.arenas.clone(),
-        );
+        let mut new_partition_payload = if self.separated_arenas {
+            PartitionedPayload::new_with_partition_bumps(
+                self.group_types.clone(),
+                self.aggrs.clone(),
+                new_partition_count as u64,
+            )
+        } else {
+            PartitionedPayload::new(
+                self.group_types.clone(),
+                self.aggrs.clone(),
+                new_partition_count as u64,
+                self.arenas.clone(),
+            )
+        };
 
         new_partition_payload.combine(self, state);
         new_partition_payload

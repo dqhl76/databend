@@ -63,6 +63,15 @@ impl AggregateHashTable {
         Self::new_with_capacity(group_types, aggrs, config, capacity, arena)
     }
 
+    pub fn new_with_separated_arenas(
+        group_types: Vec<DataType>,
+        aggrs: Vec<AggregateFunctionRef>,
+        config: HashTableConfig,
+    ) -> Self {
+        let capacity = Self::initial_capacity();
+        Self::new_with_capacity_and_separated_arenas(group_types, aggrs, config, capacity)
+    }
+
     pub fn new_with_capacity(
         group_types: Vec<DataType>,
         aggrs: Vec<AggregateFunctionRef>,
@@ -78,6 +87,25 @@ impl AggregateHashTable {
                 aggrs,
                 1 << config.initial_radix_bits,
                 vec![arena],
+            ),
+            hash_index: HashIndex::with_capacity(capacity),
+            config,
+        }
+    }
+
+    pub fn new_with_capacity_and_separated_arenas(
+        group_types: Vec<DataType>,
+        aggrs: Vec<AggregateFunctionRef>,
+        config: HashTableConfig,
+        capacity: usize,
+    ) -> Self {
+        Self {
+            direct_append: false,
+            current_radix_bits: config.initial_radix_bits,
+            payload: PartitionedPayload::new_with_partition_bumps(
+                group_types,
+                aggrs,
+                1 << config.initial_radix_bits,
             ),
             hash_index: HashIndex::with_capacity(capacity),
             config,
@@ -267,6 +295,15 @@ impl AggregateHashTable {
         self.combine_payloads(&other.payload, flush_state)
     }
 
+    pub fn take_payloads(&mut self, buckets: &[usize]) -> Result<Vec<Payload>> {
+        let taken = self.payload.take_payloads(buckets)?;
+        // TODO: this may be need re-evaluated if we really need to rebuild the hash index or just clear
+        let mut hash_index = HashIndex::with_capacity(self.hash_index.capacity);
+        self.rebuild_index_with(&mut hash_index);
+        self.hash_index = hash_index;
+        Ok(taken)
+    }
+
     pub fn combine_payloads(
         &mut self,
         payloads: &PartitionedPayload,
@@ -407,6 +444,11 @@ impl AggregateHashTable {
 
         let mut hash_index = HashIndex::with_capacity(new_capacity);
 
+        self.rebuild_index_with(&mut hash_index);
+        self.hash_index = hash_index
+    }
+
+    fn rebuild_index_with(&self, hash_index: &mut HashIndex) {
         // iterate over payloads and copy to new entries
         for payload in self.payload.payloads.iter() {
             for page in payload.pages.iter() {
@@ -430,8 +472,6 @@ impl AggregateHashTable {
                 }
             }
         }
-
-        self.hash_index = hash_index
     }
 
     fn initial_capacity() -> usize {
