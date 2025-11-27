@@ -88,6 +88,45 @@ impl SerializedPayload {
         Ok(hashtable)
     }
 
+    pub fn convert_to_aggregate_table_with_separated_arenas(
+        &self,
+        group_types: Vec<DataType>,
+        aggrs: Vec<Arc<dyn AggregateFunction>>,
+        num_states: usize,
+        radix_bits: u64,
+        need_init_entry: bool,
+    ) -> Result<AggregateHashTable> {
+        let rows_num = self.data_block.num_rows();
+        let capacity = AggregateHashTable::get_capacity_for_count(rows_num);
+        let config = HashTableConfig::default().with_initial_radix_bits(radix_bits);
+        let mut state = ProbeState::default();
+        let group_len = group_types.len();
+        let mut hashtable = AggregateHashTable::new_directly_with_separated_arenas(
+            group_types,
+            aggrs,
+            config,
+            capacity,
+            need_init_entry,
+        );
+
+        let states_index: Vec<usize> = (0..num_states).collect();
+        let agg_states = ProjectedBlock::project(&states_index, &self.data_block);
+
+        let group_index: Vec<usize> = (num_states..(num_states + group_len)).collect();
+        let group_columns = ProjectedBlock::project(&group_index, &self.data_block);
+
+        let _ = hashtable.add_groups(
+            &mut state,
+            group_columns,
+            &[(&[]).into()],
+            agg_states,
+            rows_num,
+        )?;
+
+        hashtable.payload.mark_min_cardinality();
+        Ok(hashtable)
+    }
+
     pub fn convert_to_partitioned_payload(
         &self,
         group_types: Vec<DataType>,

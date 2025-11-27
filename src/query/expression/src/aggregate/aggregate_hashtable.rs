@@ -143,6 +143,35 @@ impl AggregateHashTable {
         }
     }
 
+    pub fn new_directly_with_separated_arenas(
+        group_types: Vec<DataType>,
+        aggrs: Vec<AggregateFunctionRef>,
+        config: HashTableConfig,
+        capacity: usize,
+        need_init_entry: bool,
+    ) -> Self {
+        let entries = if need_init_entry {
+            vec![Entry::default(); capacity]
+        } else {
+            vec![]
+        };
+        Self {
+            direct_append: !need_init_entry,
+            current_radix_bits: config.initial_radix_bits,
+            payload: PartitionedPayload::new_with_partition_bumps(
+                group_types,
+                aggrs,
+                1 << config.initial_radix_bits,
+            ),
+            hash_index: HashIndex {
+                entries,
+                count: 0,
+                capacity,
+            },
+            config,
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.payload.len()
     }

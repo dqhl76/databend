@@ -1,0 +1,210 @@
+// Copyright 2021 Datafuse Labs
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+use std::any::Any;
+use std::cmp::min;
+use std::sync::Arc;
+
+use bumpalo::Bump;
+use databend_common_exception::ErrorCode;
+use databend_common_exception::Result;
+use databend_common_expression::AggregateHashTable;
+use databend_common_expression::BlockMetaInfoDowncast;
+use databend_common_expression::HashTableConfig;
+use databend_common_expression::PayloadFlushState;
+use databend_common_pipeline::core::Event;
+use databend_common_pipeline::core::InputPort;
+use databend_common_pipeline::core::OutputPort;
+use databend_common_pipeline::core::Processor;
+
+use crate::pipelines::processors::transforms::aggregator::AggregateMeta;
+use crate::pipelines::processors::transforms::aggregator::AggregatorParams;
+use crate::pipelines::processors::transforms::aggregator::NewAggregateSpiller;
+use crate::pipelines::processors::transforms::aggregator::SharedPartitionStream;
+use crate::sessions::QueryContext;
+
+pub struct ExperimentalFinalAggregator {
+    input: Arc<InputPort>,
+    output: Arc<OutputPort>,
+    id: usize,
+    input_data: Option<AggregateMeta>,
+    hashtable: Option<AggregateHashTable>,
+    params: Arc<AggregatorParams>,
+    flush_state: PayloadFlushState,
+    spiller: NewAggregateSpiller,
+}
+
+impl Processor for ExperimentalFinalAggregator {
+    fn name(&self) -> String {
+        "ExperimentalFinalAggregateFinal".to_string()
+    }
+
+    fn as_any(&mut self) -> &mut dyn Any {
+        self
+    }
+
+    fn event(&mut self) -> Result<Event> {
+        if self.output.is_finished() {
+            self.input.finish();
+            return Ok(Event::Finished);
+        }
+
+        if !self.output.can_push() {
+            self.input.set_not_need_data();
+            return Ok(Event::NeedConsume);
+        }
+
+        if self.input.has_data() {
+            let mut data_block = self.input.pull_data().unwrap()?;
+            if let Some(block_meta) = data_block
+                .take_meta()
+                .and_then(AggregateMeta::downcast_from)
+            {
+                self.input_data = Some(block_meta);
+                return Ok(Event::Sync);
+            }
+        }
+
+        if self.input.is_finished() {
+            self.output.finish();
+            return Ok(Event::Finished);
+        }
+
+        self.input.set_need_data();
+        Ok(Event::NeedData)
+    }
+
+    fn process(&mut self) -> Result<()> {
+        let input_data = self.input_data.take();
+        if let Some(input_data) = input_data {
+            if let AggregateMeta::Partitioned { bucket, data, .. } = input_data {
+                for meta in data {
+                    match &meta {
+                        AggregateMeta::Serialized(_) | AggregateMeta::AggregatePayload(_) => {
+                            self.final_aggregate(meta)?;
+                        }
+                        AggregateMeta::NewBucketSpilled(_) => {
+                            let meta = self.restore(meta)?;
+                            self.final_aggregate(meta)?;
+                        }
+                        _ => unexpected_meta(&meta)?,
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn async_process(&mut self) -> Result<()> {
+        todo!()
+    }
+}
+
+impl ExperimentalFinalAggregator {
+    pub fn try_create(
+        input: Arc<InputPort>,
+        output: Arc<OutputPort>,
+        id: usize,
+        params: Arc<AggregatorParams>,
+        ctx: Arc<QueryContext>,
+    ) -> Result<Box<dyn Processor>> {
+        let partition_count = min(128, 2_usize.pow(params.max_aggregate_spill_level as u32));
+        let stream = SharedPartitionStream::new(
+            1, // todo: need to support stream without sharing
+            params.max_block_rows,
+            params.max_block_bytes,
+            partition_count,
+        );
+        let spiller = NewAggregateSpiller::try_create(ctx.clone(), partition_count, stream, true)?;
+        Ok(Box::new(ExperimentalFinalAggregator {
+            input,
+            output,
+            id,
+            input_data: None,
+            hashtable: None,
+            params,
+            flush_state: PayloadFlushState::default(),
+            spiller,
+        }))
+    }
+
+    pub fn restore(&self, meta: AggregateMeta) -> Result<AggregateMeta> {
+        let AggregateMeta::NewBucketSpilled(payload) = meta else {
+            unexpected_meta(&meta)?
+        };
+
+        self.spiller.restore(payload)
+    }
+
+    pub fn final_aggregate(&mut self, meta: AggregateMeta) -> Result<()> {
+        let mut agg_hashtable = self.hashtable.take();
+        match meta {
+            AggregateMeta::Serialized(payload) => match agg_hashtable {
+                Some(mut ht) => {
+                    let payload = payload.convert_to_partitioned_payload(
+                        self.params.group_data_types.clone(),
+                        self.params.aggregate_functions.clone(),
+                        self.params.num_states(),
+                        0,
+                        Arc::new(Bump::new()),
+                    )?;
+                    ht.combine_payloads(&payload, &mut self.flush_state)?;
+                }
+                None => {
+                    agg_hashtable =
+                        Some(payload.convert_to_aggregate_table_with_separated_arenas(
+                            self.params.group_data_types.clone(),
+                            self.params.aggregate_functions.clone(),
+                            self.params.num_states(),
+                            0,
+                            true,
+                        )?);
+                }
+            },
+            AggregateMeta::AggregatePayload(payload) => match agg_hashtable {
+                Some(mut ht) => {
+                    ht.combine_payload(&payload.payload, &mut self.flush_state)?;
+                }
+                None => {
+                    let capacity =
+                        AggregateHashTable::get_capacity_for_count(payload.payload.len());
+                    let mut hashtable = AggregateHashTable::new_with_capacity_and_separated_arenas(
+                        self.params.group_data_types.clone(),
+                        self.params.aggregate_functions.clone(),
+                        HashTableConfig::default().with_initial_radix_bits(0),
+                        capacity,
+                    );
+
+                    hashtable.combine_payload(&payload.payload, &mut self.flush_state)?;
+                    agg_hashtable = Some(hashtable);
+                }
+            },
+            _ => unexpected_meta(&meta)?,
+        }
+
+        if self.spiller.memory_settings.check_spill() {}
+
+        Ok(())
+    }
+
+    pub fn spill_out(&mut self) -> Result<()> {}
+}
+
+fn unexpected_meta(meta: &AggregateMeta) -> Result<()> {
+    Err(ErrorCode::Internal(format!(
+        "[FINAL-AGG] Unexpected AggregateMeta variant {:?}",
+        meta
+    )))
+}
