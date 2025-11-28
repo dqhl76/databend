@@ -27,6 +27,7 @@ use databend_common_pipeline::core::Event;
 use databend_common_pipeline::core::InputPort;
 use databend_common_pipeline::core::OutputPort;
 use databend_common_pipeline::core::Processor;
+use itertools::Itertools;
 
 use crate::pipelines::processors::transforms::aggregator::AggregateMeta;
 use crate::pipelines::processors::transforms::aggregator::AggregatorParams;
@@ -43,8 +44,10 @@ pub struct ExperimentalFinalAggregator {
     params: Arc<AggregatorParams>,
     flush_state: PayloadFlushState,
     spiller: NewAggregateSpiller,
+    spill_happened: bool,
 }
 
+#[async_trait::async_trait]
 impl Processor for ExperimentalFinalAggregator {
     fn name(&self) -> String {
         "ExperimentalFinalAggregateFinal".to_string()
@@ -92,11 +95,11 @@ impl Processor for ExperimentalFinalAggregator {
                 for meta in data {
                     match &meta {
                         AggregateMeta::Serialized(_) | AggregateMeta::AggregatePayload(_) => {
-                            self.final_aggregate(meta)?;
+                            self.aggregate(meta)?;
                         }
                         AggregateMeta::NewBucketSpilled(_) => {
                             let meta = self.restore(meta)?;
-                            self.final_aggregate(meta)?;
+                            self.aggregate(meta)?;
                         }
                         _ => unexpected_meta(&meta)?,
                     }
@@ -107,6 +110,7 @@ impl Processor for ExperimentalFinalAggregator {
         Ok(())
     }
 
+    #[async_backtrace::framed]
     async fn async_process(&mut self) -> Result<()> {
         todo!()
     }
@@ -137,22 +141,22 @@ impl ExperimentalFinalAggregator {
             params,
             flush_state: PayloadFlushState::default(),
             spiller,
+            spill_happened: false,
         }))
     }
 
     pub fn restore(&self, meta: AggregateMeta) -> Result<AggregateMeta> {
         let AggregateMeta::NewBucketSpilled(payload) = meta else {
-            unexpected_meta(&meta)?
+            return unexpected_meta(&meta);
         };
 
         self.spiller.restore(payload)
     }
 
-    pub fn final_aggregate(&mut self, meta: AggregateMeta) -> Result<()> {
-        let mut agg_hashtable = self.hashtable.take();
+    pub fn aggregate(&mut self, meta: AggregateMeta) -> Result<()> {
         match meta {
-            AggregateMeta::Serialized(payload) => match agg_hashtable {
-                Some(mut ht) => {
+            AggregateMeta::Serialized(payload) => {
+                if let Some(hashtable) = self.hashtable.as_mut() {
                     let payload = payload.convert_to_partitioned_payload(
                         self.params.group_data_types.clone(),
                         self.params.aggregate_functions.clone(),
@@ -160,10 +164,9 @@ impl ExperimentalFinalAggregator {
                         0,
                         Arc::new(Bump::new()),
                     )?;
-                    ht.combine_payloads(&payload, &mut self.flush_state)?;
-                }
-                None => {
-                    agg_hashtable =
+                    hashtable.combine_payloads(&payload, &mut self.flush_state)?;
+                } else {
+                    self.hashtable =
                         Some(payload.convert_to_aggregate_table_with_separated_arenas(
                             self.params.group_data_types.clone(),
                             self.params.aggregate_functions.clone(),
@@ -172,39 +175,102 @@ impl ExperimentalFinalAggregator {
                             true,
                         )?);
                 }
-            },
-            AggregateMeta::AggregatePayload(payload) => match agg_hashtable {
-                Some(mut ht) => {
-                    ht.combine_payload(&payload.payload, &mut self.flush_state)?;
-                }
-                None => {
-                    let capacity =
-                        AggregateHashTable::get_capacity_for_count(payload.payload.len());
-                    let mut hashtable = AggregateHashTable::new_with_capacity_and_separated_arenas(
+            }
+            AggregateMeta::AggregatePayload(payload) => {
+                let capacity = AggregateHashTable::get_capacity_for_count(payload.payload.len());
+                let hashtable = self.hashtable.get_or_insert_with(|| {
+                    AggregateHashTable::new_with_capacity_and_separated_arenas(
                         self.params.group_data_types.clone(),
                         self.params.aggregate_functions.clone(),
                         HashTableConfig::default().with_initial_radix_bits(0),
                         capacity,
-                    );
+                    )
+                });
 
-                    hashtable.combine_payload(&payload.payload, &mut self.flush_state)?;
-                    agg_hashtable = Some(hashtable);
-                }
-            },
+                hashtable.combine_payload(&payload.payload, &mut self.flush_state)?;
+            }
             _ => unexpected_meta(&meta)?,
         }
 
-        if self.spiller.memory_settings.check_spill() {}
+        // If spill happened once, we always need to spill when aggregating new data
+        // this is to prevent that part of payloads are spilled out but the others are kept in memory
+        if self.spill_happened || self.spiller.memory_settings.check_spill() {
+            self.spill_happened = true;
+            self.spill_out()?;
+        }
 
         Ok(())
     }
 
-    pub fn spill_out(&mut self) -> Result<()> {}
+    pub fn final_aggregate(&mut self) -> Result<()> {
+        let hashtable = self.hashtable.take();
+        if let Some(mut ht) = hashtable {
+            if self.spill_happened {
+                #[cfg(debug_assertions)]
+                {
+                    let (_, taken_payload_indices) = calculate_spill_payloads(
+                        ht.payload.payloads.len(),
+                        self.spiller.partition_count,
+                    )?;
+                    let payloads = ht.take_payloads(&taken_payload_indices)?;
+                    for payload in payloads {
+                        debug_assert_eq!(payload.total_rows, 0);
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn spill_out(&mut self) -> Result<()> {
+        let spill_chunk_count = self.spiller.partition_count;
+        if let Some(hashtable) = self.hashtable.as_mut() {
+            if hashtable.payload.payloads.len() < spill_chunk_count {
+                hashtable.repartition(spill_chunk_count);
+            }
+
+            let partition_count = hashtable.payload.payloads.len();
+            let (payload_count_per_chunk, taken_payload_indices) =
+                calculate_spill_payloads(partition_count, spill_chunk_count)?;
+
+            let spilled_payloads = hashtable.take_payloads(&taken_payload_indices)?;
+
+            for (chunk_id, chunk) in spilled_payloads
+                .into_iter()
+                .chunks(payload_count_per_chunk)
+                .into_iter()
+                .enumerate()
+            {
+                for payload in chunk {
+                    let datablock = payload.aggregate_flush_all()?.consume_convert_to_full();
+                    self.spiller.spill(chunk_id, datablock)?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn spill_finish(&mut self) -> Result {
+        let payloads = self.spiller.spill_finish()?;
+
+        Ok(())
+    }
 }
 
-fn unexpected_meta(meta: &AggregateMeta) -> Result<()> {
+fn unexpected_meta<T>(meta: &AggregateMeta) -> Result<T> {
     Err(ErrorCode::Internal(format!(
         "[FINAL-AGG] Unexpected AggregateMeta variant {:?}",
         meta
     )))
+}
+
+fn calculate_spill_payloads(
+    partition_count: usize,
+    spill_chunk_count: usize,
+) -> Result<(usize, Vec<usize>)> {
+    let payload_count_per_chunk = partition_count / spill_chunk_count;
+    let taken_payload_indices = (payload_count_per_chunk..partition_count).collect::<Vec<_>>();
+    Ok((payload_count_per_chunk, taken_payload_indices))
 }

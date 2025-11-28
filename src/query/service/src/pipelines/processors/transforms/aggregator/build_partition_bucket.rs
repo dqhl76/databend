@@ -124,8 +124,13 @@ fn build_partition_bucket_experimental(
     for id in 0..input_num {
         let input_port = InputPort::create();
         let output_port = OutputPort::create();
-        let processor =
-            ExperimentalFinalAggregator::try_create(input_port.clone(), output_port.clone(), id)?;
+        let processor = ExperimentalFinalAggregator::try_create(
+            input_port.clone(),
+            output_port.clone(),
+            id,
+            params.clone(),
+            ctx.clone(),
+        )?;
         builder.add_transform(input_port, output_port, ProcessorPtr::create(processor));
     }
     pipeline.add_pipe(builder.finalize());
