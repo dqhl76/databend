@@ -52,7 +52,7 @@ pub struct ExperimentalFinalAggregator {
     spill_happened: bool,
 
     should_finish: bool,
-    tx: Sender<AggregateMeta>,
+    tx: Option<Sender<AggregateMeta>>,
     rx: Receiver<AggregateMeta>,
 }
 
@@ -75,6 +75,10 @@ impl Processor for ExperimentalFinalAggregator {
         if !self.output.can_push() {
             self.input.set_not_need_data();
             return Ok(Event::NeedConsume);
+        }
+
+        if self.input_data.is_some() {
+            return Ok(Event::Sync);
         }
 
         if self.input.has_data() {
@@ -104,7 +108,7 @@ impl Processor for ExperimentalFinalAggregator {
         let input_data = self.input_data.take();
         if let Some(meta) = input_data {
             match meta {
-                AggregateMeta::Partitioned { data, .. } => {
+                AggregateMeta::Partitioned { data, bucket, .. } => {
                     for meta in data {
                         match &meta {
                             AggregateMeta::Serialized(_) | AggregateMeta::AggregatePayload(_) => {
@@ -117,12 +121,23 @@ impl Processor for ExperimentalFinalAggregator {
                             _ => self.unexpected_meta(&meta)?,
                         }
                     }
+
+                    info!("[FINAL-AGG-{}] Final aggregate: {}", self.id, bucket);
                 }
                 AggregateMeta::NewSpilled(spilled_metas) => {
+                    info!(
+                        "[FINAL-AGG-{}] Restore aggregate spilled data: {}",
+                        self.id,
+                        spilled_metas.len()
+                    );
                     for spilled_meta in spilled_metas {
                         let meta = self.restore(AggregateMeta::NewBucketSpilled(spilled_meta))?;
                         self.aggregate(meta, false)?;
                     }
+                    info!(
+                        "[FINAL-AGG-{}] Final aggregate after restore spilled data.",
+                        self.id,
+                    );
                 }
                 _ => self.unexpected_meta(&meta)?,
             }
@@ -135,7 +150,7 @@ impl Processor for ExperimentalFinalAggregator {
 
     #[async_backtrace::framed]
     async fn async_process(&mut self) -> Result<()> {
-        self.tx.close().await?;
+        let _ = self.tx.take();
 
         match self.rx.recv().await {
             Ok(meta) => {
@@ -183,7 +198,7 @@ impl ExperimentalFinalAggregator {
             spiller,
             spill_happened: false,
             should_finish: false,
-            tx,
+            tx: Some(tx),
             rx,
         }))
     }
@@ -246,7 +261,7 @@ impl ExperimentalFinalAggregator {
     }
 
     pub fn final_aggregate(&mut self) -> Result<()> {
-        let mut hashtable = self.hashtable.take();
+        let hashtable = self.hashtable.take();
 
         if self.spill_happened {
             // reset spill_happened flag
@@ -325,7 +340,13 @@ impl ExperimentalFinalAggregator {
     pub fn spill_finish(&mut self) -> Result<()> {
         let payloads = self.spiller.spill_finish()?;
         let meta = AggregateMeta::NewSpilled(payloads);
-        if self.tx.send_blocking(meta).is_err() {
+        if self
+            .tx
+            .as_ref()
+            .expect("Logic error: take before sending")
+            .send_blocking(meta)
+            .is_err()
+        {
             error!(
                 "[FINAL-AGG-{}] Failed to send spilled aggregate meta to async processor.",
                 self.id
