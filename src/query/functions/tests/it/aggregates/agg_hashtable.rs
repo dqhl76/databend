@@ -33,6 +33,7 @@ use bumpalo::Bump;
 use databend_common_expression::block_debug::assert_block_value_sort_eq;
 use databend_common_expression::get_states_layout;
 use databend_common_expression::types::i256;
+use databend_common_expression::types::AccessType;
 use databend_common_expression::types::ArgType;
 use databend_common_expression::types::BooleanType;
 use databend_common_expression::types::DataType;
@@ -317,4 +318,52 @@ fn test_take_payloads_and_rebuild() {
     // The arena for the taken bucket should be replaced with a new one.
     let replaced_arena = &hashtable.payload.arenas[0];
     assert!(!Arc::ptr_eq(replaced_arena, &taken[0].arena));
+}
+
+#[test]
+fn test_repartition_keeps_states_with_separated_arenas() {
+    let factory = AggregateFunctionFactory::instance();
+    let group_types = vec![Int64Type::data_type()];
+    let aggrs = vec![factory
+        .get("count", vec![], vec![Int64Type::data_type()], vec![])
+        .unwrap()];
+    let config = HashTableConfig::default().with_initial_radix_bits(2);
+
+    let mut hashtable = AggregateHashTable::new_with_separated_arenas(group_types, aggrs, config);
+
+    let rows = 4usize;
+    let column = Int64Type::from_data(vec![0, 0, 1, 1]);
+    let group_entries: Vec<BlockEntry> = vec![column.clone().into()];
+    let params = vec![vec![column.into()]];
+    let params = params.iter().map(|v| v.into()).collect_vec();
+
+    let mut probe_state = ProbeState::default();
+    hashtable
+        .add_groups(
+            &mut probe_state,
+            (&group_entries).into(),
+            &params,
+            (&[]).into(),
+            rows,
+        )
+        .unwrap();
+    println!("{}", hashtable.payload.partition_count());
+    // Repartition to mimic spill-out path; states must remain valid.
+    hashtable.repartition(4);
+
+    let mut blocks = Vec::new();
+    let mut flush_state = PayloadFlushState::default();
+    while hashtable.merge_result(&mut flush_state).unwrap() {
+        let mut entries = flush_state.take_aggregate_results();
+        entries.extend(flush_state.take_group_columns());
+        let num_rows = entries[0].len();
+        blocks.push(DataBlock::new(entries, num_rows));
+    }
+
+    let block = DataBlock::concat(&blocks).unwrap();
+    let count_col =
+        UInt64Type::try_downcast_column(&block.columns()[0].to_column()).expect("count column");
+    let total: u64 = UInt64Type::iter_column(&count_col).sum();
+
+    assert_eq!(total as usize, rows);
 }

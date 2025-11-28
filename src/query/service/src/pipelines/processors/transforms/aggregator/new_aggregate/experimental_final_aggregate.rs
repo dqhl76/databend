@@ -301,6 +301,11 @@ impl ExperimentalFinalAggregator {
             self.params.empty_result_block()
         };
 
+        info!(
+            "[FINAL-AGG-{}] Final aggregate output rows: {:?}",
+            self.id, output_block
+        );
+
         if !output_block.is_empty() {
             self.output.push_data(Ok(output_block));
         }
@@ -328,7 +333,11 @@ impl ExperimentalFinalAggregator {
                 .enumerate()
             {
                 for payload in chunk {
+                    if payload.len() == 0 {
+                        continue;
+                    }
                     let datablock = payload.aggregate_flush_all()?.consume_convert_to_full();
+                    info!("[FINAL-AGG-{}] spill out: {:?}", self.id, datablock);
                     self.spiller.spill(chunk_id, datablock)?;
                 }
             }
