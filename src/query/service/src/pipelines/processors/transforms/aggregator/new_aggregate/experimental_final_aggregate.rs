@@ -16,11 +16,14 @@ use std::any::Any;
 use std::cmp::min;
 use std::sync::Arc;
 
+use async_channel::Receiver;
+use async_channel::Sender;
 use bumpalo::Bump;
 use databend_common_exception::ErrorCode;
 use databend_common_exception::Result;
 use databend_common_expression::AggregateHashTable;
 use databend_common_expression::BlockMetaInfoDowncast;
+use databend_common_expression::DataBlock;
 use databend_common_expression::HashTableConfig;
 use databend_common_expression::PayloadFlushState;
 use databend_common_pipeline::core::Event;
@@ -28,6 +31,8 @@ use databend_common_pipeline::core::InputPort;
 use databend_common_pipeline::core::OutputPort;
 use databend_common_pipeline::core::Processor;
 use itertools::Itertools;
+use log::error;
+use log::info;
 
 use crate::pipelines::processors::transforms::aggregator::AggregateMeta;
 use crate::pipelines::processors::transforms::aggregator::AggregatorParams;
@@ -45,6 +50,10 @@ pub struct ExperimentalFinalAggregator {
     flush_state: PayloadFlushState,
     spiller: NewAggregateSpiller,
     spill_happened: bool,
+
+    should_finish: bool,
+    tx: Sender<AggregateMeta>,
+    rx: Receiver<AggregateMeta>,
 }
 
 #[async_trait::async_trait]
@@ -80,6 +89,9 @@ impl Processor for ExperimentalFinalAggregator {
         }
 
         if self.input.is_finished() {
+            if !self.should_finish {
+                return Ok(Event::Async);
+            }
             self.output.finish();
             return Ok(Event::Finished);
         }
@@ -90,21 +102,32 @@ impl Processor for ExperimentalFinalAggregator {
 
     fn process(&mut self) -> Result<()> {
         let input_data = self.input_data.take();
-        if let Some(input_data) = input_data {
-            if let AggregateMeta::Partitioned { bucket, data, .. } = input_data {
-                for meta in data {
-                    match &meta {
-                        AggregateMeta::Serialized(_) | AggregateMeta::AggregatePayload(_) => {
-                            self.aggregate(meta)?;
+        if let Some(meta) = input_data {
+            match meta {
+                AggregateMeta::Partitioned { data, .. } => {
+                    for meta in data {
+                        match &meta {
+                            AggregateMeta::Serialized(_) | AggregateMeta::AggregatePayload(_) => {
+                                self.aggregate(meta, true)?;
+                            }
+                            AggregateMeta::NewBucketSpilled(_) => {
+                                let meta = self.restore(meta)?;
+                                self.aggregate(meta, true)?;
+                            }
+                            _ => self.unexpected_meta(&meta)?,
                         }
-                        AggregateMeta::NewBucketSpilled(_) => {
-                            let meta = self.restore(meta)?;
-                            self.aggregate(meta)?;
-                        }
-                        _ => unexpected_meta(&meta)?,
                     }
                 }
+                AggregateMeta::NewSpilled(spilled_metas) => {
+                    for spilled_meta in spilled_metas {
+                        let meta = self.restore(AggregateMeta::NewBucketSpilled(spilled_meta))?;
+                        self.aggregate(meta, false)?;
+                    }
+                }
+                _ => self.unexpected_meta(&meta)?,
             }
+
+            self.final_aggregate()?;
         }
 
         Ok(())
@@ -112,7 +135,22 @@ impl Processor for ExperimentalFinalAggregator {
 
     #[async_backtrace::framed]
     async fn async_process(&mut self) -> Result<()> {
-        todo!()
+        self.tx.close().await?;
+
+        match self.rx.recv().await {
+            Ok(meta) => {
+                info!(
+                    "[FINAL-AGG-{}] Received spilled aggregate meta from spiller.",
+                    self.id
+                );
+                self.input_data = Some(meta);
+            }
+            Err(_e) => {
+                self.should_finish = true;
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -123,6 +161,8 @@ impl ExperimentalFinalAggregator {
         id: usize,
         params: Arc<AggregatorParams>,
         ctx: Arc<QueryContext>,
+        tx: Sender<AggregateMeta>,
+        rx: Receiver<AggregateMeta>,
     ) -> Result<Box<dyn Processor>> {
         let partition_count = min(128, 2_usize.pow(params.max_aggregate_spill_level as u32));
         let stream = SharedPartitionStream::new(
@@ -142,18 +182,21 @@ impl ExperimentalFinalAggregator {
             flush_state: PayloadFlushState::default(),
             spiller,
             spill_happened: false,
+            should_finish: false,
+            tx,
+            rx,
         }))
     }
 
     pub fn restore(&self, meta: AggregateMeta) -> Result<AggregateMeta> {
         let AggregateMeta::NewBucketSpilled(payload) = meta else {
-            return unexpected_meta(&meta);
+            return self.unexpected_meta(&meta);
         };
 
         self.spiller.restore(payload)
     }
 
-    pub fn aggregate(&mut self, meta: AggregateMeta) -> Result<()> {
+    pub fn aggregate(&mut self, meta: AggregateMeta, check_memory: bool) -> Result<()> {
         match meta {
             AggregateMeta::Serialized(payload) => {
                 if let Some(hashtable) = self.hashtable.as_mut() {
@@ -189,12 +232,12 @@ impl ExperimentalFinalAggregator {
 
                 hashtable.combine_payload(&payload.payload, &mut self.flush_state)?;
             }
-            _ => unexpected_meta(&meta)?,
+            _ => self.unexpected_meta(&meta)?,
         }
 
         // If spill happened once, we always need to spill when aggregating new data
         // this is to prevent that part of payloads are spilled out but the others are kept in memory
-        if self.spill_happened || self.spiller.memory_settings.check_spill() {
+        if (self.spill_happened || self.spiller.memory_settings.check_spill()) && check_memory {
             self.spill_happened = true;
             self.spill_out()?;
         }
@@ -203,21 +246,48 @@ impl ExperimentalFinalAggregator {
     }
 
     pub fn final_aggregate(&mut self) -> Result<()> {
-        let hashtable = self.hashtable.take();
-        if let Some(mut ht) = hashtable {
-            if self.spill_happened {
-                #[cfg(debug_assertions)]
-                {
-                    let (_, taken_payload_indices) = calculate_spill_payloads(
-                        ht.payload.payloads.len(),
-                        self.spiller.partition_count,
-                    )?;
-                    let payloads = ht.take_payloads(&taken_payload_indices)?;
-                    for payload in payloads {
-                        debug_assert_eq!(payload.total_rows, 0);
-                    }
+        let mut hashtable = self.hashtable.take();
+
+        if self.spill_happened {
+            // reset spill_happened flag
+            self.spill_happened = false;
+
+            self.spill_finish()?;
+            #[cfg(debug_assertions)]
+            if let Some(ht) = hashtable.as_ref() {
+                let (_, taken_payload_indices) = calculate_spill_payloads(
+                    ht.payload.payloads.len(),
+                    self.spiller.partition_count,
+                )?;
+                for idx in taken_payload_indices {
+                    debug_assert_eq!(ht.payload.payloads[idx].len(), 0);
                 }
             }
+        }
+
+        let output_block = if let Some(mut ht) = hashtable {
+            let mut blocks = vec![];
+            self.flush_state.clear();
+
+            while ht.merge_result(&mut self.flush_state)? {
+                let mut entries = self.flush_state.take_aggregate_results();
+                let group_columns = self.flush_state.take_group_columns();
+                entries.extend_from_slice(&group_columns);
+                let num_rows = entries[0].len();
+                blocks.push(DataBlock::new(entries, num_rows));
+            }
+
+            if blocks.is_empty() {
+                self.params.empty_result_block()
+            } else {
+                DataBlock::concat(&blocks)?
+            }
+        } else {
+            self.params.empty_result_block()
+        };
+
+        if !output_block.is_empty() {
+            self.output.push_data(Ok(output_block));
         }
 
         Ok(())
@@ -252,18 +322,24 @@ impl ExperimentalFinalAggregator {
         Ok(())
     }
 
-    pub fn spill_finish(&mut self) -> Result {
+    pub fn spill_finish(&mut self) -> Result<()> {
         let payloads = self.spiller.spill_finish()?;
-
+        let meta = AggregateMeta::NewSpilled(payloads);
+        if self.tx.send_blocking(meta).is_err() {
+            error!(
+                "[FINAL-AGG-{}] Failed to send spilled aggregate meta to async processor.",
+                self.id
+            );
+        }
         Ok(())
     }
-}
 
-fn unexpected_meta<T>(meta: &AggregateMeta) -> Result<T> {
-    Err(ErrorCode::Internal(format!(
-        "[FINAL-AGG] Unexpected AggregateMeta variant {:?}",
-        meta
-    )))
+    fn unexpected_meta<T>(&self, meta: &AggregateMeta) -> Result<T> {
+        Err(ErrorCode::Internal(format!(
+            "[FINAL-AGG-{}] Unexpected AggregateMeta variant {:?}",
+            self.id, meta
+        )))
+    }
 }
 
 fn calculate_spill_payloads(

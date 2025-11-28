@@ -121,6 +121,7 @@ fn build_partition_bucket_experimental(
     pipeline.try_resize(input_num)?;
 
     let mut builder = TransformPipeBuilder::create();
+    let (tx, rx) = async_channel::unbounded();
     for id in 0..input_num {
         let input_port = InputPort::create();
         let output_port = OutputPort::create();
@@ -130,6 +131,8 @@ fn build_partition_bucket_experimental(
             id,
             params.clone(),
             ctx.clone(),
+            tx.clone(),
+            rx.clone(),
         )?;
         builder.add_transform(input_port, output_port, ProcessorPtr::create(processor));
     }
