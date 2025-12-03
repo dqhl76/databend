@@ -392,7 +392,7 @@ impl AggregateHashTable {
     }
 
     // scan payload to reconstruct PointArray
-    fn resize(&mut self, new_capacity: usize) {
+    pub fn resize(&mut self, new_capacity: usize) {
         if self.config.partial_agg {
             if self.hash_index.capacity == self.config.max_partial_capacity {
                 return;

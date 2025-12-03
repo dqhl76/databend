@@ -339,11 +339,11 @@ mod tests {
             }
         }
 
-        fn get_row_ptr(&self, incoimg: bool, row: usize) -> RowPtr {
+        fn get_row_ptr(&self, incoming: bool, row: usize) -> RowPtr {
             RowPtr::new(unsafe {
                 self.pin_data
                     .as_ptr()
-                    .add(if incoimg { row + self.init_count } else { row }) as _
+                    .add(if incoming { row + self.init_count } else { row }) as _
             })
         }
 

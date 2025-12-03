@@ -95,6 +95,19 @@ impl FinalAggregateHashTable {
             }
         });
 
+        if activate_sel.len() + self.activate.hash_index.count
+            > self.activate.hash_index.resize_threshold()
+        {
+            self.activate.resize(self.activate.hash_index.capacity * 2);
+        }
+
+        if deactivate_sel.len() + self.deactivate.hash_index.count
+            > self.deactivate.hash_index.resize_threshold()
+        {
+            self.deactivate
+                .resize(self.deactivate.hash_index.capacity * 2);
+        }
+
         self.activate
             .hash_index
             .probe_and_create_selected(state, &activate_sel, AdapterImpl {
