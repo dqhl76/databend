@@ -70,7 +70,41 @@ impl FinalAggregateHashTable {
             let row_count = flush_state.row_count;
 
             let state = &mut *flush_state.probe_state;
-            let _ = self.probe_and_create(state, (&flush_state.group_columns).into(), row_count);
+            let (partitions, activate_sel, deactivate_sel) =
+                self.partition_rows(&state.group_hashes, row_count);
+            let _ = self.probe_and_create(
+                state,
+                (&flush_state.group_columns).into(),
+                &activate_sel,
+                &deactivate_sel,
+            );
+
+            let places = &mut state.state_places[..row_count];
+
+            // set state places
+            if !self.activate.payload.aggrs.is_empty() {
+                for (idx, (place, ptr)) in places
+                    .iter_mut()
+                    .zip(&state.addresses[..row_count])
+                    .enumerate()
+                {
+                    let layout = if partitions[idx] == 0 {
+                        &self.activate.payload.row_layout
+                    } else {
+                        &self.deactivate.payload.row_layout
+                    };
+
+                    *place = ptr.state_addr(layout);
+                }
+            }
+
+            if let Some(layout) = self.activate.payload.row_layout.states_layout.as_ref() {
+                let rhses = &flush_state.state_places[..row_count];
+                for (aggr, loc) in self.activate.payload.aggrs.iter().zip(layout.states_loc.iter())
+                {
+                    aggr.batch_merge_states(places, rhses, loc)?;
+                }
+            }
         }
 
         Ok(())
@@ -80,21 +114,9 @@ impl FinalAggregateHashTable {
         &mut self,
         state: &mut ProbeState,
         group_columns: ProjectedBlock,
-        row_count: usize,
+        activate_sel: &[usize],
+        deactivate_sel: &[usize],
     ) -> usize {
-        let hash = &state.group_hashes[..row_count];
-
-        let mut activate_sel = vec![];
-        let mut deactivate_sel = vec![];
-        hash.iter().enumerate().for_each(|(idx, hash)| {
-            let partition_idx = ((*hash & self.mask_v) >> self.shift_v) as usize;
-            if partition_idx == 0 {
-                activate_sel.push(idx);
-            } else {
-                deactivate_sel.push(idx);
-            }
-        });
-
         if activate_sel.len() + self.activate.hash_index.count
             > self.activate.hash_index.resize_threshold()
         {
@@ -122,6 +144,34 @@ impl FinalAggregateHashTable {
                     group_columns,
                 },
             )
+    }
+
+    fn partition_rows(
+        &self,
+        hashes: &[u64],
+        row_count: usize,
+    ) -> (Vec<usize>, Vec<usize>, Vec<usize>) {
+        let mut partitions = vec![0; row_count];
+        let mut activate_sel = Vec::with_capacity(row_count);
+        let mut deactivate_sel = Vec::with_capacity(row_count);
+
+        for (idx, hash) in hashes[..row_count].iter().copied().enumerate() {
+            let partition_idx = self.partition_idx(hash);
+            partitions[idx] = partition_idx;
+
+            if partition_idx == 0 {
+                activate_sel.push(idx);
+            } else {
+                deactivate_sel.push(idx);
+            }
+        }
+
+        (partitions, activate_sel, deactivate_sel)
+    }
+
+    #[inline]
+    fn partition_idx(&self, hash: u64) -> usize {
+        ((hash & self.mask_v) >> self.shift_v) as usize
     }
 }
 
