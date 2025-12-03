@@ -155,15 +155,47 @@ impl HashIndex {
             *row = i;
         }
 
+        self.probe_and_create_internal(state, row_count, &mut adapter)
+    }
+
+    pub fn probe_and_create_selected(
+        &mut self,
+        state: &mut ProbeState,
+        selection: &[usize],
+        mut adapter: impl TableAdapter,
+    ) -> usize {
+        state.no_match_vector[..selection.len()].copy_from_slice(selection);
+
+        self.probe_and_create_internal(state, selection.len(), &mut adapter)
+    }
+
+    fn probe_and_create_internal(
+        &mut self,
+        state: &mut ProbeState,
+        active_rows: usize,
+        adapter: &mut impl TableAdapter,
+    ) -> usize {
+        if active_rows == 0 {
+            return 0;
+        }
+
+        let max_row = state.no_match_vector[..active_rows]
+            .iter()
+            .copied()
+            .max()
+            .unwrap();
+
         let mut slots = state.get_temp();
-        slots.extend(
-            state.group_hashes[..row_count]
-                .iter()
-                .map(|hash| self.init_slot(*hash)),
-        );
+        if slots.len() <= max_row {
+            slots.resize(max_row + 1, 0);
+        }
+
+        for row in state.no_match_vector[..active_rows].iter().copied() {
+            slots[row] = self.init_slot(state.group_hashes[row]);
+        }
 
         let mut new_group_count = 0;
-        let mut remaining_entries = row_count;
+        let mut remaining_entries = active_rows;
 
         while remaining_entries > 0 {
             let mut new_entry_count = 0;
@@ -328,7 +360,8 @@ mod tests {
                 let value = key + 20;
 
                 self.payload.push((key, hash, value));
-                state.addresses[row] = self.get_row_ptr(true, row);
+                let payload_index = self.payload.len() - 1;
+                state.addresses[row] = self.get_row_ptr(false, payload_index);
             }
         }
 
@@ -424,5 +457,34 @@ mod tests {
             want: HashMap::from_iter([(1, 21), (2, 22), (3, 23), (4, 77)]),
         }
         .run_hash_index();
+    }
+
+    #[test]
+    fn test_hash_index_selected() {
+        let mut hash_index = HashIndex::with_capacity(16);
+
+        let mut adapter = TestTableAdapter::new(
+            vec![(1, 11 << 48), (2, 22 << 48), (3, 33 << 48), (4, 44 << 48)],
+            vec![(2, 22 << 48, 222)],
+        );
+
+        let mut state = adapter.init_state();
+        adapter.init_hash_index(&mut hash_index);
+
+        let selection = [0usize, 1usize, 2usize];
+        let count = hash_index.probe_and_create_selected(&mut state, &selection, &mut adapter);
+
+        assert_eq!(2, count);
+
+        let got = selection
+            .iter()
+            .map(|idx| {
+                let (key, _, value) = adapter.get_payload(state.addresses[*idx]);
+                (key, value)
+            })
+            .collect::<HashMap<_, _>>();
+
+        assert_eq!(HashMap::from_iter([(1, 21), (2, 222), (3, 23)]), got);
+        assert_eq!(RowPtr::null(), state.addresses[3]);
     }
 }

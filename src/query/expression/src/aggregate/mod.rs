@@ -18,6 +18,7 @@
 mod aggregate_function;
 mod aggregate_function_state;
 mod aggregate_hashtable;
+mod final_aggregate_hashtable;
 mod group_hash;
 mod hash_index;
 mod partitioned_payload;

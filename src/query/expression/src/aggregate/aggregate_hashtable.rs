@@ -46,7 +46,7 @@ pub struct AggregateHashTable {
     pub config: HashTableConfig,
 
     current_radix_bits: u64,
-    hash_index: HashIndex,
+    pub hash_index: HashIndex,
 }
 
 unsafe impl Send for AggregateHashTable {}
