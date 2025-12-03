@@ -17,15 +17,19 @@ use std::sync::Arc;
 use bumpalo::Bump;
 use databend_common_exception::Result;
 
+use crate::aggregate::group_hash_columns;
 use crate::aggregate::hash_index::AdapterImpl;
 use crate::types::DataType;
 use crate::AggregateFunctionRef;
 use crate::AggregateHashTable;
+use crate::BlockEntry;
 use crate::HashTableConfig;
 use crate::Payload;
 use crate::PayloadFlushState;
 use crate::ProbeState;
 use crate::ProjectedBlock;
+
+const BATCH_ADD_SIZE: usize = 2048;
 
 pub struct FinalAggregateHashTable {
     pub activate: AggregateHashTable,
@@ -40,23 +44,161 @@ impl FinalAggregateHashTable {
         offset: u64,
         group_types: Vec<DataType>,
         aggrs: Vec<AggregateFunctionRef>,
+        direct_append: bool,
     ) -> Self {
+        let mut activate = AggregateHashTable::new(
+            group_types.clone(),
+            aggrs.clone(),
+            HashTableConfig::default().with_initial_radix_bits(0),
+            Arc::new(Bump::new()),
+        );
+        let mut deactivate = AggregateHashTable::new(
+            group_types.clone(),
+            aggrs.clone(),
+            HashTableConfig::default().with_initial_radix_bits(radix_bits),
+            Arc::new(Bump::new()),
+        );
+        activate.direct_append = direct_append;
+        deactivate.direct_append = direct_append;
+
         Self {
-            activate: AggregateHashTable::new(
-                group_types.clone(),
-                aggrs.clone(),
-                HashTableConfig::default().with_initial_radix_bits(0),
-                Arc::new(Bump::new()),
-            ),
-            deactivate: AggregateHashTable::new(
-                group_types.clone(),
-                aggrs.clone(),
-                HashTableConfig::default().with_initial_radix_bits(radix_bits),
-                Arc::new(Bump::new()),
-            ),
+            activate,
+            deactivate,
             mask_v: mask(radix_bits, offset),
             shift_v: shift(radix_bits, offset),
         }
+    }
+
+    pub fn add_groups(
+        &mut self,
+        state: &mut ProbeState,
+        group_columns: ProjectedBlock,
+        params: &[ProjectedBlock],
+        agg_states: ProjectedBlock,
+        row_count: usize,
+    ) -> Result<usize> {
+        if row_count <= BATCH_ADD_SIZE {
+            self.add_groups_inner(state, group_columns, params, agg_states, row_count)
+        } else {
+            let mut new_count = 0;
+            for start in (0..row_count).step_by(BATCH_ADD_SIZE) {
+                let end = (start + BATCH_ADD_SIZE).min(row_count);
+                let step_group_columns = group_columns
+                    .iter()
+                    .map(|entry| entry.slice(start..end))
+                    .collect::<Vec<_>>();
+
+                let step_params: Vec<Vec<BlockEntry>> = params
+                    .iter()
+                    .map(|c| c.iter().map(|x| x.slice(start..end)).collect())
+                    .collect();
+                let step_params = step_params.iter().map(|v| v.into()).collect::<Vec<_>>();
+                let agg_states = agg_states
+                    .iter()
+                    .map(|c| c.slice(start..end))
+                    .collect::<Vec<_>>();
+
+                new_count += self.add_groups_inner(
+                    state,
+                    (&step_group_columns).into(),
+                    &step_params,
+                    (&agg_states).into(),
+                    end - start,
+                )?;
+            }
+            Ok(new_count)
+        }
+    }
+
+    fn add_groups_inner(
+        &mut self,
+        state: &mut ProbeState,
+        group_columns: ProjectedBlock,
+        params: &[ProjectedBlock],
+        agg_states: ProjectedBlock,
+        row_count: usize,
+    ) -> Result<usize> {
+        #[cfg(debug_assertions)]
+        {
+            for (i, group_column) in group_columns.iter().enumerate() {
+                if group_column.data_type() != self.activate.payload.group_types[i] {
+                    return Err(databend_common_exception::ErrorCode::UnknownException(format!(
+                        "group_column type not match in index {}, expect: {:?}, actual: {:?}",
+                        i,
+                        self.activate.payload.group_types[i],
+                        group_column.data_type()
+                    )));
+                }
+            }
+        }
+
+        state.row_count = row_count;
+        group_hash_columns(group_columns, &mut state.group_hashes);
+
+        let (partitions, activate_sel, deactivate_sel) =
+            self.partition_rows(&state.group_hashes, row_count);
+        let direct_append = self.activate.direct_append;
+        debug_assert_eq!(direct_append, self.deactivate.direct_append);
+        let new_group_count = if direct_append {
+            self.direct_append_rows(state, group_columns, &activate_sel, &deactivate_sel)
+        } else {
+            self.probe_and_create(
+                state,
+                group_columns,
+                &activate_sel,
+                &deactivate_sel,
+            )
+        };
+
+        if !self.activate.payload.aggrs.is_empty() {
+            for (idx, (place, ptr)) in state.state_places[..row_count]
+                .iter_mut()
+                .zip(&state.addresses[..row_count])
+                .enumerate()
+            {
+                let layout = if partitions[idx] == 0 {
+                    &self.activate.payload.row_layout
+                } else {
+                    &self.deactivate.payload.row_layout
+                };
+
+                *place = ptr.state_addr(layout);
+            }
+
+            let state_places = &state.state_places.as_slice()[0..row_count];
+            let states_layout = self
+                .activate
+                .payload
+                .row_layout
+                .states_layout
+                .as_ref()
+                .unwrap();
+            if agg_states.is_empty() {
+                for ((func, params), loc) in self
+                    .activate
+                    .payload
+                    .aggrs
+                    .iter()
+                    .zip(params.iter())
+                    .zip(states_layout.states_loc.iter())
+                {
+                    func.accumulate_keys(state_places, loc, *params, row_count)?;
+                }
+            } else {
+                for ((func, state), loc) in self
+                    .activate
+                    .payload
+                    .aggrs
+                    .iter()
+                    .zip(agg_states.iter())
+                    .zip(states_layout.states_loc.iter())
+                {
+                    func.batch_merge(state_places, loc, state, None)?;
+                }
+            }
+        }
+
+        Ok(new_group_count)
     }
 
     pub fn combine_payload(
@@ -144,6 +286,34 @@ impl FinalAggregateHashTable {
                     group_columns,
                 },
             )
+    }
+
+    fn direct_append_rows(
+        &mut self,
+        state: &mut ProbeState,
+        group_columns: ProjectedBlock,
+        activate_sel: &[usize],
+        deactivate_sel: &[usize],
+    ) -> usize {
+        if !activate_sel.is_empty() {
+            for (idx, row) in activate_sel.iter().copied().enumerate() {
+                state.empty_vector[idx] = row;
+            }
+            self.activate
+                .payload
+                .append_rows(state, activate_sel.len(), group_columns);
+        }
+
+        if !deactivate_sel.is_empty() {
+            for (idx, row) in deactivate_sel.iter().copied().enumerate() {
+                state.empty_vector[idx] = row;
+            }
+            self.deactivate
+                .payload
+                .append_rows(state, deactivate_sel.len(), group_columns);
+        }
+
+        activate_sel.len() + deactivate_sel.len()
     }
 
     fn partition_rows(
