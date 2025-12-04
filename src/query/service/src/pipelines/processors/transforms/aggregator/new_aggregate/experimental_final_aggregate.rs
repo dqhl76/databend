@@ -253,13 +253,16 @@ impl ExperimentalFinalAggregator {
                 // );
             }
             AggregateMeta::AggregatePayload(payload) => {
+                let capacity = AggregateHashTable::get_capacity_for_count(payload.payload.len());
+
                 let hashtable = self.hashtable.get_or_insert_with(|| {
-                    FinalAggregateHashTable::new(
+                    FinalAggregateHashTable::new_with_capcity(
                         radix_bits,
                         offset,
                         self.params.group_data_types.clone(),
                         self.params.aggregate_functions.clone(),
                         false,
+                        capacity,
                     )
                 });
 
@@ -362,13 +365,4 @@ impl ExperimentalFinalAggregator {
             self.id, meta
         )))
     }
-}
-
-fn calculate_spill_payloads(
-    partition_count: usize,
-    spill_chunk_count: usize,
-) -> Result<(usize, Vec<usize>)> {
-    let payload_count_per_chunk = partition_count / spill_chunk_count;
-    let taken_payload_indices = (payload_count_per_chunk..partition_count).collect::<Vec<_>>();
-    Ok((payload_count_per_chunk, taken_payload_indices))
 }

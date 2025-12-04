@@ -18,7 +18,7 @@ use super::RowPtr;
 use super::LOAD_FACTOR;
 use crate::ProjectedBlock;
 
-pub(super) struct HashIndex {
+pub struct HashIndex {
     pub entries: Vec<Entry>,
     pub count: usize,
     pub capacity: usize,

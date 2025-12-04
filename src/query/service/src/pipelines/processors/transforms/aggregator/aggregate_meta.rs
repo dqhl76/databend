@@ -102,8 +102,15 @@ impl SerializedPayload {
         let mut state = ProbeState::default();
         let group_len = group_types.len();
 
-        let mut hashtable =
-            FinalAggregateHashTable::new(radix_bits, offset, group_types, aggrs, false);
+        let capacity = AggregateHashTable::get_capacity_for_count(rows_num);
+        let mut hashtable = FinalAggregateHashTable::new_with_capcity(
+            radix_bits,
+            offset,
+            group_types,
+            aggrs,
+            false,
+            capacity,
+        );
 
         let states_index: Vec<usize> = (0..num_states).collect();
         let agg_states = ProjectedBlock::project(&states_index, &self.data_block);

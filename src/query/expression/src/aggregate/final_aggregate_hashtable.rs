@@ -72,6 +72,39 @@ impl FinalAggregateHashTable {
         }
     }
 
+    pub fn new_with_capcity(
+        radix_bits: u64,
+        offset: u64,
+        group_types: Vec<DataType>,
+        aggrs: Vec<AggregateFunctionRef>,
+        direct_append: bool,
+        capacity: usize,
+    ) -> Self {
+        let mut activate = AggregateHashTable::new_with_capacity(
+            group_types.clone(),
+            aggrs.clone(),
+            HashTableConfig::default().with_initial_radix_bits(0),
+            capacity,
+            Arc::new(Bump::new()),
+        );
+        let mut deactivate = AggregateHashTable::new_with_capacity(
+            group_types.clone(),
+            aggrs.clone(),
+            HashTableConfig::default().with_initial_radix_bits(radix_bits),
+            capacity,
+            Arc::new(Bump::new()),
+        );
+        activate.direct_append = direct_append;
+        deactivate.direct_append = direct_append;
+
+        Self {
+            activate,
+            deactivate: Some(deactivate),
+            mask_v: mask(radix_bits, offset),
+            shift_v: shift(radix_bits, offset),
+        }
+    }
+
     pub fn add_groups(
         &mut self,
         state: &mut ProbeState,
