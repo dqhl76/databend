@@ -36,7 +36,7 @@ const BATCH_ADD_SIZE: usize = 2048;
 
 pub struct FinalAggregateHashTable {
     pub activate: AggregateHashTable,
-    pub deactivate: AggregateHashTable,
+    pub deactivate: Option<AggregateHashTable>,
     pub mask_v: u64,
     pub shift_v: u64,
 }
@@ -66,7 +66,7 @@ impl FinalAggregateHashTable {
 
         Self {
             activate,
-            deactivate,
+            deactivate: Some(deactivate),
             mask_v: mask(radix_bits, offset),
             shift_v: shift(radix_bits, offset),
         }
@@ -143,7 +143,9 @@ impl FinalAggregateHashTable {
         let (partitions, activate_sel, deactivate_sel) =
             self.partition_rows(&state.group_hashes, row_count);
         let direct_append = self.activate.direct_append;
-        debug_assert_eq!(direct_append, self.deactivate.direct_append);
+        if let Some(deactivate) = self.deactivate.as_ref() {
+            debug_assert_eq!(direct_append, deactivate.direct_append);
+        }
         let new_group_count = if direct_append {
             self.direct_append_rows(state, group_columns, &activate_sel, &deactivate_sel)
         } else {
@@ -159,7 +161,7 @@ impl FinalAggregateHashTable {
                 let layout = if partitions[idx] == 0 {
                     &self.activate.payload.row_layout
                 } else {
-                    &self.deactivate.payload.row_layout
+                    &self.deactivate().payload.row_layout
                 };
 
                 *place = ptr.state_addr(layout);
@@ -233,7 +235,7 @@ impl FinalAggregateHashTable {
                     let layout = if partitions[idx] == 0 {
                         &self.activate.payload.row_layout
                     } else {
-                        &self.deactivate.payload.row_layout
+                        &self.deactivate().payload.row_layout
                     };
 
                     *place = ptr.state_addr(layout);
@@ -270,7 +272,10 @@ impl FinalAggregateHashTable {
 
     pub fn merge_result(&mut self, flush_state: &mut PayloadFlushState) -> Result<bool> {
         let activate_partition_count = self.activate.payload.payloads.len();
-        let deactivate_partition_count = self.deactivate.payload.payloads.len();
+        let Some(deactivate) = self.deactivate.as_mut() else {
+            return self.activate.merge_result(flush_state);
+        };
+        let deactivate_partition_count = deactivate.payload.payloads.len();
 
         // Drain activate hashtable first.
         if flush_state.flush_partition < activate_partition_count {
@@ -291,7 +296,7 @@ impl FinalAggregateHashTable {
             return Ok(false);
         }
 
-        let result = self.deactivate.merge_result(flush_state)?;
+        let result = deactivate.merge_result(flush_state)?;
         flush_state.flush_partition += activate_partition_count;
         Ok(result)
     }
@@ -309,27 +314,32 @@ impl FinalAggregateHashTable {
             self.activate.resize(self.activate.hash_index.capacity * 2);
         }
 
-        if deactivate_sel.len() + self.deactivate.hash_index.count
-            > self.deactivate.hash_index.resize_threshold()
+        if deactivate_sel.len() + self.deactivate().hash_index.count
+            > self.deactivate().hash_index.resize_threshold()
         {
-            self.deactivate
-                .resize(self.deactivate.hash_index.capacity * 2);
+            let new_capacity = self.deactivate().hash_index.capacity * 2;
+            self.deactivate_mut().resize(new_capacity);
         }
 
-        self.activate
-            .hash_index
-            .probe_and_create_selected(state, &activate_sel, AdapterImpl {
-                payload: &mut self.activate.payload,
-                group_columns,
-            })
-            + self.deactivate.hash_index.probe_and_create_selected(
-                state,
-                &deactivate_sel,
-                AdapterImpl {
-                    payload: &mut self.deactivate.payload,
+        let activate_new =
+            self.activate
+                .hash_index
+                .probe_and_create_selected(state, &activate_sel, AdapterImpl {
+                    payload: &mut self.activate.payload,
                     group_columns,
-                },
-            )
+                });
+
+        let deactivate_new = {
+            let deactivate = self.deactivate_mut();
+            deactivate
+                .hash_index
+                .probe_and_create_selected(state, &deactivate_sel, AdapterImpl {
+                    payload: &mut deactivate.payload,
+                    group_columns,
+                })
+        };
+
+        activate_new + deactivate_new
     }
 
     fn direct_append_rows(
@@ -349,12 +359,14 @@ impl FinalAggregateHashTable {
         }
 
         if !deactivate_sel.is_empty() {
-            for (idx, row) in deactivate_sel.iter().copied().enumerate() {
-                state.empty_vector[idx] = row;
+            if let Some(deactivate) = self.deactivate.as_mut() {
+                for (idx, row) in deactivate_sel.iter().copied().enumerate() {
+                    state.empty_vector[idx] = row;
+                }
+                deactivate
+                    .payload
+                    .append_rows(state, deactivate_sel.len(), group_columns);
             }
-            self.deactivate
-                .payload
-                .append_rows(state, deactivate_sel.len(), group_columns);
         }
 
         activate_sel.len() + deactivate_sel.len()
@@ -388,12 +400,44 @@ impl FinalAggregateHashTable {
         ((hash & self.mask_v) >> self.shift_v) as usize
     }
 
-    pub fn mark_min_cardinality(&mut self) {
-        self.activate.payload.mark_min_cardinality();
-        self.deactivate.payload.mark_min_cardinality();
+    #[inline]
+    fn deactivate(&self) -> &AggregateHashTable {
+        self.deactivate
+            .as_ref()
+            .expect("deactivate hashtable is not initialized")
     }
 
-    pub fn spill_deactivate(&mut self) {}
+    #[inline]
+    fn deactivate_mut(&mut self) -> &mut AggregateHashTable {
+        self.deactivate
+            .as_mut()
+            .expect("deactivate hashtable is not initialized")
+    }
+
+    pub fn mark_min_cardinality(&mut self) {
+        self.activate.payload.mark_min_cardinality();
+        if let Some(deactivate) = self.deactivate.as_mut() {
+            deactivate.payload.mark_min_cardinality();
+        }
+    }
+
+    pub fn spill_deactivate(&mut self) -> Vec<Payload> {
+        let Some(deactivate) = self.deactivate.take() else {
+            unreachable!("logic error: deactivate hashtable is not initialized")
+        };
+
+        let group_types = deactivate.payload.group_types.clone();
+        let aggrs = deactivate.payload.aggrs.clone();
+        let config = deactivate.config.clone();
+
+        let payloads = deactivate.payload.payloads;
+
+        let new_deactivate =
+            AggregateHashTable::new(group_types, aggrs, config, Arc::new(Bump::new()));
+        self.deactivate = Some(new_deactivate);
+
+        payloads
+    }
 }
 
 #[inline]
@@ -484,7 +528,11 @@ impl Debug for FinalAggregateHashTable {
         }
 
         let activate = partitions_debug_info(&self.activate.payload);
-        let deactivate = partitions_debug_info(&self.deactivate.payload);
+        let deactivate = self
+            .deactivate
+            .as_ref()
+            .map(|table| partitions_debug_info(&table.payload))
+            .unwrap_or_default();
 
         f.debug_struct("FinalAggregateHashTable")
             .field("activate", &activate)
