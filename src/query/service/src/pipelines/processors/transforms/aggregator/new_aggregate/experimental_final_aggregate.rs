@@ -24,6 +24,7 @@ use databend_common_exception::Result;
 use databend_common_expression::AggregateHashTable;
 use databend_common_expression::BlockMetaInfoDowncast;
 use databend_common_expression::DataBlock;
+use databend_common_expression::FinalAggregateHashTable;
 use databend_common_expression::HashTableConfig;
 use databend_common_expression::PayloadFlushState;
 use databend_common_pipeline::core::Event;
@@ -45,7 +46,7 @@ pub struct ExperimentalFinalAggregator {
     output: Arc<OutputPort>,
     id: usize,
     input_data: Option<AggregateMeta>,
-    hashtable: Option<AggregateHashTable>,
+    hashtable: Option<FinalAggregateHashTable>,
     params: Arc<AggregatorParams>,
     flush_state: PayloadFlushState,
     spiller: NewAggregateSpiller,
@@ -108,15 +109,19 @@ impl Processor for ExperimentalFinalAggregator {
         let input_data = self.input_data.take();
         if let Some(meta) = input_data {
             match meta {
-                AggregateMeta::Partitioned { data, bucket, .. } => {
+                AggregateMeta::Partitioned {
+                    data,
+                    bucket,
+                    activate_worker,
+                } => {
                     for meta in data {
                         match &meta {
                             AggregateMeta::Serialized(_) | AggregateMeta::AggregatePayload(_) => {
-                                self.aggregate(meta, true)?;
+                                self.aggregate(meta, activate_worker, true)?;
                             }
                             AggregateMeta::NewBucketSpilled(_) => {
                                 let meta = self.restore(meta)?;
-                                self.aggregate(meta, true)?;
+                                self.aggregate(meta, activate_worker, true)?;
                             }
                             _ => self.unexpected_meta(&meta)?,
                         }
@@ -132,7 +137,7 @@ impl Processor for ExperimentalFinalAggregator {
                     );
                     for spilled_meta in spilled_metas {
                         let meta = self.restore(AggregateMeta::NewBucketSpilled(spilled_meta))?;
-                        self.aggregate(meta, false)?;
+                        self.aggregate(meta, None, false)?;
                     }
                     info!(
                         "[FINAL-AGG-{}] Final aggregate after restore spilled data.",
@@ -211,7 +216,17 @@ impl ExperimentalFinalAggregator {
         self.spiller.restore(payload)
     }
 
-    pub fn aggregate(&mut self, meta: AggregateMeta, check_memory: bool) -> Result<()> {
+    pub fn aggregate(
+        &mut self,
+        meta: AggregateMeta,
+        max_partition_count: Option<usize>,
+        check_memory: bool,
+    ) -> Result<()> {
+        let radix_bits = self.params.max_aggregate_spill_level as u64;
+        let offset = max_partition_count.map_or(0, |count| {
+            debug_assert!(count.is_power_of_two());
+            count.ilog2() as u64
+        });
         match meta {
             AggregateMeta::Serialized(payload) => {
                 if let Some(hashtable) = self.hashtable.as_mut() {
@@ -224,28 +239,23 @@ impl ExperimentalFinalAggregator {
                     )?;
                     hashtable.combine_payloads(&payload, &mut self.flush_state)?;
                 } else {
-                    self.hashtable =
-                        Some(payload.convert_to_aggregate_table_with_separated_arenas(
-                            self.params.group_data_types.clone(),
-                            self.params.aggregate_functions.clone(),
-                            self.params.num_states(),
-                            0,
-                            true,
-                        )?);
+                    todo!();
                 }
             }
             AggregateMeta::AggregatePayload(payload) => {
-                let capacity = AggregateHashTable::get_capacity_for_count(payload.payload.len());
                 let hashtable = self.hashtable.get_or_insert_with(|| {
-                    AggregateHashTable::new_with_capacity_and_separated_arenas(
+                    FinalAggregateHashTable::new(
+                        radix_bits,
+                        offset,
                         self.params.group_data_types.clone(),
                         self.params.aggregate_functions.clone(),
-                        HashTableConfig::default().with_initial_radix_bits(0),
-                        capacity,
+                        false,
                     )
                 });
 
                 hashtable.combine_payload(&payload.payload, &mut self.flush_state)?;
+
+                info!("[FINAL-AGG-{}] {:?}", self.id, hashtable);
             }
             _ => self.unexpected_meta(&meta)?,
         }
@@ -267,17 +277,17 @@ impl ExperimentalFinalAggregator {
             // reset spill_happened flag
             self.spill_happened = false;
 
-            self.spill_finish()?;
-            #[cfg(debug_assertions)]
-            if let Some(ht) = hashtable.as_ref() {
-                let (_, taken_payload_indices) = calculate_spill_payloads(
-                    ht.payload.payloads.len(),
-                    self.spiller.partition_count,
-                )?;
-                for idx in taken_payload_indices {
-                    debug_assert_eq!(ht.payload.payloads[idx].len(), 0);
-                }
-            }
+            // self.spill_finish()?;
+            // #[cfg(debug_assertions)]
+            // if let Some(ht) = hashtable.as_ref() {
+            //     let (_, taken_payload_indices) = calculate_spill_payloads(
+            //         ht.payload.payloads.len(),
+            //         self.spiller.partition_count,
+            //     )?;
+            //     for idx in taken_payload_indices {
+            //         debug_assert_eq!(ht.payload.payloads[idx].len(), 0);
+            //     }
+            // }
         }
 
         let output_block = if let Some(mut ht) = hashtable {
@@ -314,34 +324,34 @@ impl ExperimentalFinalAggregator {
     }
 
     pub fn spill_out(&mut self) -> Result<()> {
-        let spill_chunk_count = self.spiller.partition_count;
-        if let Some(hashtable) = self.hashtable.as_mut() {
-            if hashtable.payload.payloads.len() < spill_chunk_count {
-                hashtable.repartition(spill_chunk_count);
-            }
-
-            let partition_count = hashtable.payload.payloads.len();
-            let (payload_count_per_chunk, taken_payload_indices) =
-                calculate_spill_payloads(partition_count, spill_chunk_count)?;
-
-            let spilled_payloads = hashtable.take_payloads(&taken_payload_indices)?;
-
-            for (chunk_id, chunk) in spilled_payloads
-                .into_iter()
-                .chunks(payload_count_per_chunk)
-                .into_iter()
-                .enumerate()
-            {
-                for payload in chunk {
-                    if payload.len() == 0 {
-                        continue;
-                    }
-                    let datablock = payload.aggregate_flush_all()?.consume_convert_to_full();
-                    info!("[FINAL-AGG-{}] spill out: {:?}", self.id, datablock);
-                    self.spiller.spill(chunk_id, datablock)?;
-                }
-            }
-        }
+        // let spill_chunk_count = self.spiller.partition_count;
+        // if let Some(hashtable) = self.hashtable.as_mut() {
+        //     if hashtable.payload.payloads.len() < spill_chunk_count {
+        //         hashtable.repartition(spill_chunk_count);
+        //     }
+        //
+        //     let partition_count = hashtable.payload.payloads.len();
+        //     let (payload_count_per_chunk, taken_payload_indices) =
+        //         calculate_spill_payloads(partition_count, spill_chunk_count)?;
+        //
+        //     let spilled_payloads = hashtable.take_payloads(&taken_payload_indices)?;
+        //
+        //     for (chunk_id, chunk) in spilled_payloads
+        //         .into_iter()
+        //         .chunks(payload_count_per_chunk)
+        //         .into_iter()
+        //         .enumerate()
+        //     {
+        //         for payload in chunk {
+        //             if payload.len() == 0 {
+        //                 continue;
+        //             }
+        //             let datablock = payload.aggregate_flush_all()?.consume_convert_to_full();
+        //             info!("[FINAL-AGG-{}] spill out: {:?}", self.id, datablock);
+        //             self.spiller.spill(chunk_id, datablock)?;
+        //         }
+        //     }
+        // }
 
         Ok(())
     }

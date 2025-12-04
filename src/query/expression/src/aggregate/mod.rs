@@ -35,6 +35,7 @@ use std::sync::Arc;
 pub use aggregate_function::*;
 pub use aggregate_function_state::*;
 pub use aggregate_hashtable::*;
+pub use final_aggregate_hashtable::*;
 pub use group_hash::*;
 use hash_index::Entry;
 pub use partitioned_payload::*;

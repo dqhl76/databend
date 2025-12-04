@@ -380,7 +380,7 @@ impl TransformPartitionBucket {
     fn try_push_data_block(&mut self) -> bool {
         while self.pushing_bucket < self.working_bucket {
             if let Some(bucket_blocks) = self.buckets_blocks.remove(&self.pushing_bucket) {
-                let data_block = Self::convert_blocks(self.pushing_bucket, bucket_blocks);
+                let data_block = self.convert_blocks(self.pushing_bucket, bucket_blocks);
                 self.output.push_data(Ok(data_block));
                 self.pushing_bucket += 1;
                 return true;
@@ -481,7 +481,7 @@ impl TransformPartitionBucket {
         Ok(blocks)
     }
 
-    fn convert_blocks(bucket: isize, data_blocks: Vec<DataBlock>) -> DataBlock {
+    fn convert_blocks(&self, bucket: isize, data_blocks: Vec<DataBlock>) -> DataBlock {
         let mut data = Vec::with_capacity(data_blocks.len());
         for mut data_block in data_blocks.into_iter() {
             if let Some(block_meta) = data_block.take_meta() {
@@ -490,7 +490,11 @@ impl TransformPartitionBucket {
                 }
             }
         }
-        DataBlock::empty_with_meta(AggregateMeta::create_partitioned(bucket, data, None))
+        DataBlock::empty_with_meta(AggregateMeta::create_partitioned(
+            bucket,
+            data,
+            Some(self.max_partition_count),
+        ))
     }
 }
 
@@ -579,7 +583,7 @@ impl Processor for TransformPartitionBucket {
         }
 
         if let Some((bucket, bucket_blocks)) = self.buckets_blocks.pop_first() {
-            let data_block = Self::convert_blocks(bucket, bucket_blocks);
+            let data_block = self.convert_blocks(bucket, bucket_blocks);
             self.output.push_data(Ok(data_block));
             return Ok(Event::NeedConsume);
         }

@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::fmt::Debug;
+use std::fmt::Formatter;
 use std::sync::Arc;
 
 use bumpalo::Bump;
@@ -24,6 +26,7 @@ use crate::AggregateFunctionRef;
 use crate::AggregateHashTable;
 use crate::BlockEntry;
 use crate::HashTableConfig;
+use crate::PartitionedPayload;
 use crate::Payload;
 use crate::PayloadFlushState;
 use crate::ProbeState;
@@ -122,12 +125,14 @@ impl FinalAggregateHashTable {
         {
             for (i, group_column) in group_columns.iter().enumerate() {
                 if group_column.data_type() != self.activate.payload.group_types[i] {
-                    return Err(databend_common_exception::ErrorCode::UnknownException(format!(
-                        "group_column type not match in index {}, expect: {:?}, actual: {:?}",
-                        i,
-                        self.activate.payload.group_types[i],
-                        group_column.data_type()
-                    )));
+                    return Err(databend_common_exception::ErrorCode::UnknownException(
+                        format!(
+                            "group_column type not match in index {}, expect: {:?}, actual: {:?}",
+                            i,
+                            self.activate.payload.group_types[i],
+                            group_column.data_type()
+                        ),
+                    ));
                 }
             }
         }
@@ -142,12 +147,7 @@ impl FinalAggregateHashTable {
         let new_group_count = if direct_append {
             self.direct_append_rows(state, group_columns, &activate_sel, &deactivate_sel)
         } else {
-            self.probe_and_create(
-                state,
-                group_columns,
-                &activate_sel,
-                &deactivate_sel,
-            )
+            self.probe_and_create(state, group_columns, &activate_sel, &deactivate_sel)
         };
 
         if !self.activate.payload.aggrs.is_empty() {
@@ -242,7 +242,12 @@ impl FinalAggregateHashTable {
 
             if let Some(layout) = self.activate.payload.row_layout.states_layout.as_ref() {
                 let rhses = &flush_state.state_places[..row_count];
-                for (aggr, loc) in self.activate.payload.aggrs.iter().zip(layout.states_loc.iter())
+                for (aggr, loc) in self
+                    .activate
+                    .payload
+                    .aggrs
+                    .iter()
+                    .zip(layout.states_loc.iter())
                 {
                     aggr.batch_merge_states(places, rhses, loc)?;
                 }
@@ -250,6 +255,45 @@ impl FinalAggregateHashTable {
         }
 
         Ok(())
+    }
+
+    pub fn combine_payloads(
+        &mut self,
+        payloads: &PartitionedPayload,
+        flush_state: &mut PayloadFlushState,
+    ) -> Result<()> {
+        for payload in payloads.payloads.iter() {
+            self.combine_payload(payload, flush_state)?;
+        }
+        Ok(())
+    }
+
+    pub fn merge_result(&mut self, flush_state: &mut PayloadFlushState) -> Result<bool> {
+        let activate_partition_count = self.activate.payload.payloads.len();
+        let deactivate_partition_count = self.deactivate.payload.payloads.len();
+
+        // Drain activate hashtable first.
+        if flush_state.flush_partition < activate_partition_count {
+            if self.activate.merge_result(flush_state)? {
+                return Ok(true);
+            }
+            // Switch to deactivate hashtable.
+            flush_state.flush_partition = 0;
+        } else {
+            // Already in deactivate hashtable, adjust partition index.
+            flush_state.flush_partition = flush_state
+                .flush_partition
+                .saturating_sub(activate_partition_count);
+        }
+
+        if flush_state.flush_partition >= deactivate_partition_count {
+            flush_state.flush_partition = activate_partition_count + deactivate_partition_count;
+            return Ok(false);
+        }
+
+        let result = self.deactivate.merge_result(flush_state)?;
+        flush_state.flush_partition += activate_partition_count;
+        Ok(result)
     }
 
     fn probe_and_create(
@@ -354,4 +398,90 @@ fn shift(radix_bits: u64, offset: u64) -> u64 {
 #[inline]
 fn mask(radix_bits: u64, offset: u64) -> u64 {
     ((1 << radix_bits) - 1) << shift(radix_bits, offset)
+}
+
+impl Debug for FinalAggregateHashTable {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        #[derive(Debug)]
+        struct DebugRow {
+            hash: u64,
+            groups: Vec<String>,
+        }
+
+        #[derive(Debug)]
+        struct DebugPage {
+            page_index: usize,
+            rows: Vec<DebugRow>,
+        }
+
+        #[derive(Debug)]
+        struct DebugPartition {
+            partition: usize,
+            pages: Vec<DebugPage>,
+        }
+
+        fn payload_debug_info(payload: &Payload) -> Vec<DebugPage> {
+            let mut pages = Vec::new();
+            let mut state = PayloadFlushState::default();
+
+            while payload.flush(&mut state) {
+                let page_index = state.flush_page;
+                if pages
+                    .last()
+                    .map(|page: &DebugPage| page.page_index != page_index)
+                    .unwrap_or(true)
+                {
+                    pages.push(DebugPage {
+                        page_index,
+                        rows: Vec::new(),
+                    });
+                }
+
+                if let Some(page) = pages.last_mut() {
+                    let hashes = &state.probe_state.group_hashes[..state.row_count];
+                    for row in 0..state.row_count {
+                        let groups = state
+                            .group_columns
+                            .iter()
+                            .map(|entry| match entry.index(row) {
+                                Some(value) => format!("{value:?}"),
+                                None => "None".to_string(),
+                            })
+                            .collect();
+
+                        page.rows.push(DebugRow {
+                            hash: hashes[row],
+                            groups,
+                        });
+                    }
+                }
+            }
+
+            pages
+        }
+
+        fn partitions_debug_info(payloads: &PartitionedPayload) -> Vec<DebugPartition> {
+            payloads
+                .payloads
+                .iter()
+                .enumerate()
+                .filter_map(|(partition, payload)| {
+                    let pages = payload_debug_info(payload);
+                    if pages.is_empty() {
+                        None
+                    } else {
+                        Some(DebugPartition { partition, pages })
+                    }
+                })
+                .collect()
+        }
+
+        let activate = partitions_debug_info(&self.activate.payload);
+        let deactivate = partitions_debug_info(&self.deactivate.payload);
+
+        f.debug_struct("FinalAggregateHashTable")
+            .field("activate", &activate)
+            .field("deactivate", &deactivate)
+            .finish()
+    }
 }
