@@ -387,6 +387,13 @@ impl FinalAggregateHashTable {
     fn partition_idx(&self, hash: u64) -> usize {
         ((hash & self.mask_v) >> self.shift_v) as usize
     }
+
+    pub fn mark_min_cardinality(&mut self) {
+        self.activate.payload.mark_min_cardinality();
+        self.deactivate.payload.mark_min_cardinality();
+    }
+
+    pub fn spill_deactivate(&mut self) {}
 }
 
 #[inline]

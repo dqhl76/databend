@@ -239,8 +239,18 @@ impl ExperimentalFinalAggregator {
                     )?;
                     hashtable.combine_payloads(&payload, &mut self.flush_state)?;
                 } else {
-                    todo!();
+                    self.hashtable = Some(payload.convert_to_final_aggregate_hashtable(
+                        self.params.group_data_types.clone(),
+                        self.params.aggregate_functions.clone(),
+                        self.params.num_states(),
+                        radix_bits,
+                        offset,
+                    )?);
                 }
+                info!(
+                    "[FINAL-AGG-{}] aggregate payload {:?}",
+                    self.id, self.hashtable
+                );
             }
             AggregateMeta::AggregatePayload(payload) => {
                 let hashtable = self.hashtable.get_or_insert_with(|| {
@@ -254,8 +264,7 @@ impl ExperimentalFinalAggregator {
                 });
 
                 hashtable.combine_payload(&payload.payload, &mut self.flush_state)?;
-
-                info!("[FINAL-AGG-{}] {:?}", self.id, hashtable);
+                info!("[FINAL-AGG-{}] aggregate payload {:?}", self.id, hashtable);
             }
             _ => self.unexpected_meta(&meta)?,
         }
@@ -324,34 +333,8 @@ impl ExperimentalFinalAggregator {
     }
 
     pub fn spill_out(&mut self) -> Result<()> {
-        // let spill_chunk_count = self.spiller.partition_count;
-        // if let Some(hashtable) = self.hashtable.as_mut() {
-        //     if hashtable.payload.payloads.len() < spill_chunk_count {
-        //         hashtable.repartition(spill_chunk_count);
-        //     }
-        //
-        //     let partition_count = hashtable.payload.payloads.len();
-        //     let (payload_count_per_chunk, taken_payload_indices) =
-        //         calculate_spill_payloads(partition_count, spill_chunk_count)?;
-        //
-        //     let spilled_payloads = hashtable.take_payloads(&taken_payload_indices)?;
-        //
-        //     for (chunk_id, chunk) in spilled_payloads
-        //         .into_iter()
-        //         .chunks(payload_count_per_chunk)
-        //         .into_iter()
-        //         .enumerate()
-        //     {
-        //         for payload in chunk {
-        //             if payload.len() == 0 {
-        //                 continue;
-        //             }
-        //             let datablock = payload.aggregate_flush_all()?.consume_convert_to_full();
-        //             info!("[FINAL-AGG-{}] spill out: {:?}", self.id, datablock);
-        //             self.spiller.spill(chunk_id, datablock)?;
-        //         }
-        //     }
-        // }
+        let spill_chunk_count = self.spiller.partition_count;
+        if let Some(hashtable) = self.hashtable.as_mut() {}
 
         Ok(())
     }

@@ -26,6 +26,7 @@ use databend_common_expression::BlockMetaInfo;
 use databend_common_expression::BlockMetaInfoPtr;
 use databend_common_expression::Column;
 use databend_common_expression::DataBlock;
+use databend_common_expression::FinalAggregateHashTable;
 use databend_common_expression::HashTableConfig;
 use databend_common_expression::PartitionedPayload;
 use databend_common_expression::Payload;
@@ -85,6 +86,40 @@ impl SerializedPayload {
         )?;
 
         hashtable.payload.mark_min_cardinality();
+        Ok(hashtable)
+    }
+
+    #[fastrace::trace(name = "SerializedPayload::convert_to_final_aggregate_hashtable")]
+    pub fn convert_to_final_aggregate_hashtable(
+        &self,
+        group_types: Vec<DataType>,
+        aggrs: Vec<Arc<dyn AggregateFunction>>,
+        num_states: usize,
+        radix_bits: u64,
+        offset: u64,
+    ) -> Result<FinalAggregateHashTable> {
+        let rows_num = self.data_block.num_rows();
+        let mut state = ProbeState::default();
+        let group_len = group_types.len();
+
+        let mut hashtable =
+            FinalAggregateHashTable::new(radix_bits, offset, group_types, aggrs, false);
+
+        let states_index: Vec<usize> = (0..num_states).collect();
+        let agg_states = ProjectedBlock::project(&states_index, &self.data_block);
+
+        let group_index: Vec<usize> = (num_states..(num_states + group_len)).collect();
+        let group_columns = ProjectedBlock::project(&group_index, &self.data_block);
+
+        let _ = hashtable.add_groups(
+            &mut state,
+            group_columns,
+            &[(&[]).into()],
+            agg_states,
+            rows_num,
+        )?;
+
+        hashtable.mark_min_cardinality();
         Ok(hashtable)
     }
 
