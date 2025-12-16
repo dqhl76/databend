@@ -42,6 +42,7 @@ use crate::clusters::ClusterHelper;
 use crate::physical_plans::explain::PlanStatsInfo;
 use crate::physical_plans::format::AggregatePartialFormatter;
 use crate::physical_plans::format::PhysicalFormat;
+use crate::physical_plans::physical_aggregate_final::AggregateShuffleMode;
 use crate::physical_plans::physical_plan::IPhysicalPlan;
 use crate::physical_plans::physical_plan::PhysicalPlan;
 use crate::physical_plans::physical_plan::PhysicalPlanMeta;
@@ -65,6 +66,9 @@ pub struct AggregatePartial {
     pub rank_limit: Option<(Vec<SortDesc>, usize)>,
     // Only used for explain
     pub stat_info: Option<PlanStatsInfo>,
+
+    // Only used when enable_experiment_aggregate is true
+    pub shuffle_mode: AggregateShuffleMode,
 }
 
 #[typetag::serde]
@@ -165,6 +169,7 @@ impl IPhysicalPlan for AggregatePartial {
             group_by_display: self.group_by_display.clone(),
             rank_limit: self.rank_limit.clone(),
             stat_info: self.stat_info.clone(),
+            shuffle_mode: self.shuffle_mode,
         })
     }
 
@@ -198,11 +203,15 @@ impl IPhysicalPlan for AggregatePartial {
         let schema_before_group_by = params.input_schema.clone();
 
         // Need a global atomic to read the max current radix bits hint
-        let partial_agg_config = if !builder.is_exchange_parent() {
-            HashTableConfig::default().with_partial(true, max_threads as usize)
-        } else {
+        let partial_agg_config = if enable_experiment_aggregate {
             HashTableConfig::default()
-                .cluster_with_partial(true, builder.ctx.get_cluster().nodes.len())
+        } else {
+            if !builder.is_exchange_parent() {
+                HashTableConfig::default().with_partial(true, max_threads as usize)
+            } else {
+                HashTableConfig::default()
+                    .cluster_with_partial(true, builder.ctx.get_cluster().nodes.len())
+            }
         };
 
         // For rank limit, we can filter data using sort with rank before partial.
