@@ -14,28 +14,17 @@
 
 use std::sync::Arc;
 
-use databend_common_catalog::table_context::TableContext;
 use databend_common_exception::Result;
-use databend_common_pipeline::core::InputPort;
-use databend_common_pipeline::core::OutputPort;
 use databend_common_pipeline::core::Pipe;
 use databend_common_pipeline::core::PipeItem;
 use databend_common_pipeline::core::Pipeline;
 use databend_common_pipeline::core::ProcessorPtr;
-use databend_common_pipeline::core::TransformPipeBuilder;
 use databend_common_storage::DataOperator;
-use parking_lot::Mutex;
-use tokio::sync::Barrier;
 use tokio::sync::Semaphore;
 
 use crate::pipelines::processors::transforms::aggregator::AggregatorParams;
 use crate::pipelines::processors::transforms::aggregator::TransformAggregateSpillReader;
 use crate::pipelines::processors::transforms::aggregator::TransformFinalAggregate;
-use crate::pipelines::processors::transforms::aggregator::new_aggregate::FinalAggregateSharedState;
-use crate::pipelines::processors::transforms::aggregator::new_aggregate::NewAggregateSpiller;
-use crate::pipelines::processors::transforms::aggregator::new_aggregate::NewFinalAggregateTransform;
-use crate::pipelines::processors::transforms::aggregator::new_aggregate::SharedPartitionStream;
-use crate::pipelines::processors::transforms::aggregator::new_aggregate::TransformPartitionBucketScatter;
 use crate::pipelines::processors::transforms::aggregator::transform_partition_bucket::TransformPartitionBucket;
 use crate::sessions::QueryContext;
 
@@ -47,62 +36,15 @@ fn build_partition_bucket_experimental(
 ) -> Result<()> {
     // PartitionedPayload only accept power of two partitions
     let mut output_num = after_worker.next_power_of_two();
-    const MAX_PARTITION_COUNT: usize = 128;
-    if output_num > MAX_PARTITION_COUNT {
-        output_num = MAX_PARTITION_COUNT;
-    }
 
-    let input_num = pipeline.output_len();
-    let scatter = TransformPartitionBucketScatter::create(input_num, output_num, params.clone())?;
-    let scatter_inputs = scatter.get_inputs();
-    let scatter_outputs = scatter.get_outputs();
-
-    pipeline.add_pipe(Pipe::create(
-        scatter_inputs.len(),
-        scatter_outputs.len(),
-        vec![PipeItem::create(
-            ProcessorPtr::create(Box::new(scatter)),
-            scatter_inputs,
-            scatter_outputs,
-        )],
-    ));
-
-    let mut builder = TransformPipeBuilder::create();
-    let barrier = Arc::new(Barrier::new(output_num));
-    let shared_state = Arc::new(Mutex::new(FinalAggregateSharedState::new(output_num)));
-
-    let settings = ctx.get_settings();
-    let max_rows = settings.get_max_block_size()? as usize;
-    let max_bytes = settings.get_max_block_bytes()? as usize;
-    let max_aggregate_spill_level = settings.get_max_aggregate_spill_level()? as usize;
-
-    let shared_partition_stream =
-        SharedPartitionStream::new(output_num, max_rows, max_bytes, output_num);
-
-    for id in 0..output_num {
-        let spiller = NewAggregateSpiller::try_create(
-            ctx.clone(),
-            output_num,
-            shared_partition_stream.clone(),
-            true,
-        )?;
-        let input_port = InputPort::create();
-        let output_port = OutputPort::create();
-        let processor = NewFinalAggregateTransform::try_create(
-            input_port.clone(),
-            output_port.clone(),
-            id,
+    pipeline.add_transform(|input, output| {
+        Ok(ProcessorPtr::create(TransformFinalAggregate::try_create(
+            input,
+            output,
             params.clone(),
-            output_num,
-            barrier.clone(),
-            shared_state.clone(),
-            spiller,
-            max_aggregate_spill_level,
-        )?;
-        builder.add_transform(input_port, output_port, ProcessorPtr::create(processor));
-    }
+        )?))
+    })?;
 
-    pipeline.add_pipe(builder.finalize());
     pipeline.resize(after_worker, true)?;
 
     Ok(())

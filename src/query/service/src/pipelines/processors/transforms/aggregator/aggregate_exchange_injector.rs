@@ -76,8 +76,8 @@ impl ExchangeSorting for AggregateExchangeSorting {
     }
 }
 
-struct HashTableHashScatter {
-    buckets: usize,
+pub struct HashTableHashScatter {
+    pub buckets: usize,
 }
 
 fn scatter_payload(mut payload: Payload, buckets: usize) -> Result<Vec<Payload>> {

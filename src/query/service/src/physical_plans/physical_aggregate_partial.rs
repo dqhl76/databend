@@ -29,6 +29,8 @@ use databend_common_expression::MAX_AGGREGATE_HASHTABLE_BUCKETS_NUM;
 use databend_common_expression::SortColumnDescription;
 use databend_common_expression::types::DataType;
 use databend_common_functions::aggregates::AggregateFunctionFactory;
+use databend_common_pipeline::core::Pipe;
+use databend_common_pipeline::core::PipeItem;
 use databend_common_pipeline::core::ProcessorPtr;
 use databend_common_pipeline_transforms::TransformPipelineHelper;
 use databend_common_pipeline_transforms::sorts::TransformSortPartial;
@@ -42,16 +44,20 @@ use crate::clusters::ClusterHelper;
 use crate::physical_plans::explain::PlanStatsInfo;
 use crate::physical_plans::format::AggregatePartialFormatter;
 use crate::physical_plans::format::PhysicalFormat;
+use crate::physical_plans::physical_aggregate_final::AggregateShuffleMode;
 use crate::physical_plans::physical_plan::IPhysicalPlan;
 use crate::physical_plans::physical_plan::PhysicalPlan;
 use crate::physical_plans::physical_plan::PhysicalPlanMeta;
 use crate::pipelines::PipelineBuilder;
 use crate::pipelines::processors::transforms::aggregator::AggregateInjector;
+use crate::pipelines::processors::transforms::aggregator::HashTableHashScatter;
 use crate::pipelines::processors::transforms::aggregator::NewTransformPartialAggregate;
 use crate::pipelines::processors::transforms::aggregator::PartialSingleStateAggregator;
 use crate::pipelines::processors::transforms::aggregator::SharedPartitionStream;
 use crate::pipelines::processors::transforms::aggregator::TransformAggregateSpillWriter;
 use crate::pipelines::processors::transforms::aggregator::TransformPartialAggregate;
+use crate::servers::flight::v1::exchange::ExchangeShuffleTransform;
+use crate::servers::flight::v1::exchange::ScatterTransform;
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
 pub struct AggregatePartial {
@@ -65,6 +71,9 @@ pub struct AggregatePartial {
     pub rank_limit: Option<(Vec<SortDesc>, usize)>,
     // Only used for explain
     pub stat_info: Option<PlanStatsInfo>,
+
+    // Only used when enable_experiment_aggregate is true
+    pub shuffle_mode: AggregateShuffleMode,
 }
 
 #[typetag::serde]
@@ -165,6 +174,7 @@ impl IPhysicalPlan for AggregatePartial {
             group_by_display: self.group_by_display.clone(),
             rank_limit: self.rank_limit.clone(),
             stat_info: self.stat_info.clone(),
+            shuffle_mode: self.shuffle_mode,
         })
     }
 
@@ -175,8 +185,8 @@ impl IPhysicalPlan for AggregatePartial {
         let max_block_bytes = builder.settings.get_max_block_bytes()? as usize;
         let max_threads = builder.settings.get_max_threads()?;
         let max_spill_io_requests = builder.settings.get_max_spill_io_requests()?;
-
         let enable_experiment_aggregate = builder.settings.get_enable_experiment_aggregate()?;
+        let cluster = &builder.ctx.get_cluster();
 
         let params = PipelineBuilder::build_aggregator_params(
             self.input.output_schema()?,
@@ -197,12 +207,30 @@ impl IPhysicalPlan for AggregatePartial {
 
         let schema_before_group_by = params.input_schema.clone();
 
-        // Need a global atomic to read the max current radix bits hint
-        let partial_agg_config = if !builder.is_exchange_parent() {
-            HashTableConfig::default().with_partial(true, max_threads as usize)
+        let partial_agg_config = if enable_experiment_aggregate {
+            match self.shuffle_mode {
+                AggregateShuffleMode::Row => HashTableConfig::new_experiment_partial(
+                    0,
+                    cluster.nodes.len(),
+                    max_threads as usize,
+                ),
+                AggregateShuffleMode::Bucket(payload_number) => {
+                    let radix_bits = payload_number.trailing_zeros() as u64;
+                    HashTableConfig::new_experiment_partial(
+                        radix_bits,
+                        cluster.nodes.len(),
+                        max_threads as usize,
+                    )
+                }
+            }
         } else {
-            HashTableConfig::default()
-                .cluster_with_partial(true, builder.ctx.get_cluster().nodes.len())
+            // Need a global atomic to read the max current radix bits hint
+            if !builder.is_exchange_parent() {
+                HashTableConfig::default().with_partial(true, max_threads as usize)
+            } else {
+                HashTableConfig::default()
+                    .cluster_with_partial(true, builder.ctx.get_cluster().nodes.len())
+            }
         };
 
         // For rank limit, we can filter data using sort with rank before partial.
@@ -215,7 +243,6 @@ impl IPhysicalPlan for AggregatePartial {
         }
 
         if params.enable_experiment_aggregate {
-            let cluster = &builder.ctx.get_cluster();
             let streams_num = if !builder.is_exchange_parent() {
                 1
             } else {
@@ -246,6 +273,35 @@ impl IPhysicalPlan for AggregatePartial {
                     )?,
                 ))
             })?;
+
+            if !builder.is_exchange_parent() {
+                let output_len = builder.main_pipeline.output_len();
+                if matches!(self.shuffle_mode, AggregateShuffleMode::Row) {
+                    builder.main_pipeline.add_transform(|input, output| {
+                        Ok(ScatterTransform::create(
+                            input,
+                            output,
+                            Arc::new(Box::new(HashTableHashScatter {
+                                buckets: output_len,
+                            })),
+                        ))
+                    })?;
+                }
+
+                let transform =
+                    ExchangeShuffleTransform::create(output_len, output_len, output_len);
+                let inputs = transform.get_inputs();
+                let outputs = transform.get_outputs();
+                builder
+                    .main_pipeline
+                    .add_pipe(Pipe::create(output_len, output_len, vec![
+                        PipeItem::create(
+                            ProcessorPtr::create(Box::new(transform)),
+                            inputs,
+                            outputs,
+                        ),
+                    ]));
+            }
         } else {
             builder.main_pipeline.add_transform(|input, output| {
                 Ok(ProcessorPtr::create(TransformPartialAggregate::try_create(

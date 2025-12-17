@@ -14,7 +14,9 @@
 
 use std::any::Any;
 use std::collections::HashMap;
+use std::sync::Arc;
 
+use databend_common_catalog::table_context::TableContext;
 use databend_common_exception::ErrorCode;
 use databend_common_exception::Result;
 use databend_common_expression::DataField;
@@ -269,6 +271,8 @@ impl PhysicalPlanBuilder {
                     group_by_shuffle_mode = "before_merge".to_string();
                 }
 
+                let shuffle_mode = determine_shuffle_mode(self.ctx.clone())?;
+
                 if let Some(grouping_sets) = agg.grouping_sets.as_ref() {
                     // ignore `_grouping_id`.
                     // If the aggregation function argument if a group item,
@@ -320,6 +324,7 @@ impl PhysicalPlanBuilder {
                             stat_info: Some(stat_info),
                             rank_limit: None,
                             meta: PhysicalPlanMeta::new("AggregatePartial"),
+                            shuffle_mode,
                         }
                     } else {
                         AggregatePartial {
@@ -330,6 +335,7 @@ impl PhysicalPlanBuilder {
                             group_by: group_items,
                             stat_info: Some(stat_info),
                             meta: PhysicalPlanMeta::new("AggregatePartial"),
+                            shuffle_mode,
                         }
                     };
 
@@ -372,6 +378,7 @@ impl PhysicalPlanBuilder {
                         input: PhysicalPlan::new(expand),
                         stat_info: Some(stat_info),
                         meta: PhysicalPlanMeta::new("AggregatePartial"),
+                        shuffle_mode,
                     })
                 } else {
                     PhysicalPlan::new(AggregatePartial {
@@ -382,6 +389,7 @@ impl PhysicalPlanBuilder {
                         stat_info: Some(stat_info),
                         rank_limit,
                         meta: PhysicalPlanMeta::new("AggregatePartial"),
+                        shuffle_mode,
                     })
                 }
             }
@@ -470,6 +478,27 @@ impl PhysicalPlanBuilder {
 
         Ok(result)
     }
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Copy, Clone, Debug)]
+pub enum AggregateShuffleMode {
+    // calculate shuffle destination based on hash of rows
+    Row,
+    // calculate shuffle destination based on id of bucket
+    Bucket(u64),
+}
+
+fn determine_shuffle_mode(ctx: Arc<dyn TableContext>) -> Result<AggregateShuffleMode> {
+    let max_threads = ctx.get_settings().get_max_threads()?;
+    let nodes_num = ctx.get_cluster().nodes.len();
+    let parallelism = max_threads * nodes_num as u64;
+    let shuffle_mode = if parallelism > 128 {
+        AggregateShuffleMode::Row
+    } else {
+        let parallelism = parallelism.next_power_of_two();
+        AggregateShuffleMode::Bucket(parallelism)
+    };
+    Ok(shuffle_mode)
 }
 
 fn build_aggregate_function(
