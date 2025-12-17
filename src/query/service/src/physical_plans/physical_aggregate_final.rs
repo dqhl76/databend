@@ -485,7 +485,7 @@ pub enum AggregateShuffleMode {
     // calculate shuffle destination based on hash of rows
     Row,
     // calculate shuffle destination based on id of bucket
-    Bucket(u64),
+    Bucket,
 }
 
 fn determine_shuffle_mode(ctx: Arc<dyn TableContext>) -> Result<AggregateShuffleMode> {
@@ -495,8 +495,7 @@ fn determine_shuffle_mode(ctx: Arc<dyn TableContext>) -> Result<AggregateShuffle
     let shuffle_mode = if parallelism > 128 {
         AggregateShuffleMode::Row
     } else {
-        let parallelism = parallelism.next_power_of_two();
-        AggregateShuffleMode::Bucket(parallelism)
+        AggregateShuffleMode::Bucket
     };
     Ok(shuffle_mode)
 }

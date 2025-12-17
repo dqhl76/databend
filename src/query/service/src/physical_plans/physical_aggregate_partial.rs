@@ -214,8 +214,10 @@ impl IPhysicalPlan for AggregatePartial {
                     cluster.nodes.len(),
                     max_threads as usize,
                 ),
-                AggregateShuffleMode::Bucket(payload_number) => {
-                    let radix_bits = payload_number.trailing_zeros() as u64;
+                AggregateShuffleMode::Bucket => {
+                    let output_len = builder.main_pipeline.output_len().next_power_of_two();
+                    let radix_bits = output_len.trailing_zeros() as u64;
+                    dbg!(output_len, radix_bits);
                     HashTableConfig::new_experiment_partial(
                         radix_bits,
                         cluster.nodes.len(),

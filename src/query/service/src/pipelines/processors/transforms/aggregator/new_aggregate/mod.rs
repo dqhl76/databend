@@ -18,3 +18,4 @@ mod new_transform_final_aggregate;
 pub use new_aggregate_spiller::NewAggregateSpiller;
 pub use new_aggregate_spiller::SharedPartitionStream;
 pub use new_transform_aggregate_partial::NewTransformPartialAggregate;
+pub use new_transform_final_aggregate::NewTransformFinalAggregate;

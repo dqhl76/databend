@@ -53,6 +53,7 @@ use crate::pipelines::processors::transforms::aggregator::aggregate_exchange_inj
 use crate::pipelines::processors::transforms::aggregator::aggregate_meta::AggregateMeta;
 use crate::pipelines::processors::transforms::aggregator::exchange_defines;
 use crate::servers::flight::v1::exchange::serde::serialize_block;
+use crate::servers::flight::v1::exchange::ExchangeShuffleMeta;
 use crate::sessions::QueryContext;
 
 #[allow(clippy::enum_variant_names)]
@@ -287,6 +288,7 @@ impl NewTransformPartialAggregate {
         let spillers = Spiller::create(ctx.clone(), partition_streams, local_pos)?;
 
         let arena = Arc::new(Bump::new());
+        dbg!(&config.initial_radix_bits);
         let hash_table = HashTable::AggregateHashTable(AggregateHashTable::new(
             params.group_data_types.clone(),
             params.aggregate_functions.clone(),
@@ -441,7 +443,7 @@ impl AccumulatingTransform for NewTransformPartialAggregate {
                 let mut memory_blocks = Vec::with_capacity(partition_count);
 
                 self.statistics.log_finish_statistics(&hashtable);
-
+                dbg!(&hashtable.payload.payloads.len());
                 for (bucket, payload) in hashtable.payload.payloads.into_iter().enumerate() {
                     if payload.len() != 0 {
                         memory_blocks.push(DataBlock::empty_with_meta(
@@ -455,7 +457,10 @@ impl AccumulatingTransform for NewTransformPartialAggregate {
                 }
 
                 blocks.extend(memory_blocks);
-                blocks
+
+                vec![DataBlock::empty_with_meta(ExchangeShuffleMeta::create(
+                    blocks,
+                ))]
             }
         })
     }

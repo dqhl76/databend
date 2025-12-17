@@ -23,6 +23,7 @@ use databend_common_storage::DataOperator;
 use tokio::sync::Semaphore;
 
 use crate::pipelines::processors::transforms::aggregator::AggregatorParams;
+use crate::pipelines::processors::transforms::aggregator::NewTransformFinalAggregate;
 use crate::pipelines::processors::transforms::aggregator::TransformAggregateSpillReader;
 use crate::pipelines::processors::transforms::aggregator::TransformFinalAggregate;
 use crate::pipelines::processors::transforms::aggregator::transform_partition_bucket::TransformPartitionBucket;
@@ -38,11 +39,9 @@ fn build_partition_bucket_experimental(
     let mut output_num = after_worker.next_power_of_two();
 
     pipeline.add_transform(|input, output| {
-        Ok(ProcessorPtr::create(TransformFinalAggregate::try_create(
-            input,
-            output,
-            params.clone(),
-        )?))
+        Ok(ProcessorPtr::create(
+            NewTransformFinalAggregate::try_create(input, output, params.clone())?,
+        ))
     })?;
 
     pipeline.resize(after_worker, true)?;
