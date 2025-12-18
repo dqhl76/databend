@@ -324,7 +324,7 @@ impl PhysicalPlanBuilder {
                             stat_info: Some(stat_info),
                             rank_limit: None,
                             meta: PhysicalPlanMeta::new("AggregatePartial"),
-                            shuffle_mode,
+                            shuffle_mode: shuffle_mode.clone(),
                         }
                     } else {
                         AggregatePartial {
@@ -335,7 +335,7 @@ impl PhysicalPlanBuilder {
                             group_by: group_items,
                             stat_info: Some(stat_info),
                             meta: PhysicalPlanMeta::new("AggregatePartial"),
-                            shuffle_mode,
+                            shuffle_mode: shuffle_mode.clone(),
                         }
                     };
 
@@ -378,7 +378,7 @@ impl PhysicalPlanBuilder {
                         input: PhysicalPlan::new(expand),
                         stat_info: Some(stat_info),
                         meta: PhysicalPlanMeta::new("AggregatePartial"),
-                        shuffle_mode,
+                        shuffle_mode: shuffle_mode.clone(),
                     })
                 } else {
                     PhysicalPlan::new(AggregatePartial {
@@ -389,7 +389,7 @@ impl PhysicalPlanBuilder {
                         stat_info: Some(stat_info),
                         rank_limit,
                         meta: PhysicalPlanMeta::new("AggregatePartial"),
-                        shuffle_mode,
+                        shuffle_mode: shuffle_mode.clone(),
                     })
                 }
             }
@@ -480,23 +480,53 @@ impl PhysicalPlanBuilder {
     }
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Copy, Clone, Debug)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
 pub enum AggregateShuffleMode {
     // calculate shuffle destination based on hash of rows
     Row,
     // calculate shuffle destination based on id of bucket
-    Bucket,
+    // cpu_nums in cluster stored in it
+    Bucket(Vec<(String, u64)>),
 }
 
 fn determine_shuffle_mode(ctx: Arc<dyn TableContext>) -> Result<AggregateShuffleMode> {
-    let max_threads = ctx.get_settings().get_max_threads()?;
-    let nodes_num = ctx.get_cluster().nodes.len();
-    let parallelism = max_threads * nodes_num as u64;
-    let shuffle_mode = if parallelism > 128 {
-        AggregateShuffleMode::Row
-    } else {
-        AggregateShuffleMode::Bucket
+    let settings = ctx.get_settings();
+    let force_shuffle_mode = settings.get_force_aggregate_shuffle_mode()?;
+    let mut cpu_nums = ctx
+        .get_cluster()
+        .nodes
+        .iter()
+        .map(|n| (n.id.clone(), n.cpu_nums))
+        .collect::<Vec<_>>();
+    let parallelism = cpu_nums
+        .iter()
+        .map(|(_, v)| *v)
+        .sum::<u64>()
+        .next_power_of_two();
+
+    let use_bucket = match force_shuffle_mode.as_str() {
+        "row" => false,
+        "bucket" => true,
+        "auto" => parallelism <= 128, // TODO: this may need to be find
+        _ => false,
     };
+
+    let shuffle_mode = if use_bucket {
+        if !cpu_nums.is_empty() {
+            let node_count = cpu_nums.len() as u64;
+            let base = parallelism / node_count;
+            let remainder = parallelism % node_count;
+            for (idx, (_, cpu_num)) in cpu_nums.iter_mut().enumerate() {
+                *cpu_num = base + if (idx as u64) < remainder { 1 } else { 0 };
+            }
+        }
+
+        debug_assert_eq!(cpu_nums.iter().map(|(_, v)| *v).sum::<u64>(), parallelism);
+        AggregateShuffleMode::Bucket(cpu_nums)
+    } else {
+        AggregateShuffleMode::Row
+    };
+
     Ok(shuffle_mode)
 }
 

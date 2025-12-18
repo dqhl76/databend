@@ -44,6 +44,7 @@ impl NewTransformFinalAggregate {
         output: Arc<OutputPort>,
         params: Arc<AggregatorParams>,
     ) -> Result<Box<dyn Processor>> {
+        // TODO: the initial capacity is too small, can be optimized here
         let hashtable = AggregateHashTable::new(
             params.group_data_types.clone(),
             params.aggregate_functions.clone(),
@@ -96,14 +97,32 @@ impl AccumulatingTransform for NewTransformFinalAggregate {
     fn transform(&mut self, mut data: DataBlock) -> Result<Vec<DataBlock>> {
         if let Some(meta) = data.take_meta() {
             if let Some(meta) = AggregateMeta::downcast_from(meta) {
-                if let AggregateMeta::AggregatePayload(payload) = meta {
-                    if let HashTable::AggregateHashTable(ht) = &mut self.hashtable {
-                        ht.combine_payload(&payload.payload, &mut self.flush_state)?;
+                if let HashTable::AggregateHashTable(ht) = &mut self.hashtable {
+                    match meta {
+                        AggregateMeta::Serialized(payload) => {
+                            let payload = payload.convert_to_partitioned_payload(
+                                self.params.group_data_types.clone(),
+                                self.params.aggregate_functions.clone(),
+                                self.params.num_states(),
+                                0,
+                                Arc::new(Bump::new()),
+                            )?;
+                            ht.combine_payloads(&payload, &mut self.flush_state)?;
+                        }
+                        AggregateMeta::AggregatePayload(payload) => {
+                            if let HashTable::AggregateHashTable(ht) = &mut self.hashtable {
+                                ht.combine_payload(&payload.payload, &mut self.flush_state)?;
+                            }
+                        }
+                        _ => {
+                            return unreachable!("unexpected aggregate meta");
+                        }
                     }
                 }
+                return Ok(vec![]);
             }
         }
-        Ok(vec![])
+        unreachable!("unexpected datablock")
     }
 
     fn on_finish(&mut self, _output: bool) -> Result<Vec<DataBlock>> {

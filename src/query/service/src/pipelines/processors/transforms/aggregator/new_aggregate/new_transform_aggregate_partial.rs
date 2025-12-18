@@ -273,6 +273,7 @@ pub struct NewTransformPartialAggregate {
     statistics: PartialAggregationStatistics,
     settings: MemorySettings,
     spillers: Spiller,
+    is_row_shuffle: bool,
 }
 
 impl NewTransformPartialAggregate {
@@ -284,6 +285,7 @@ impl NewTransformPartialAggregate {
         config: HashTableConfig,
         partition_streams: Vec<SharedPartitionStream>,
         local_pos: usize,
+        is_row_shuffle: bool,
     ) -> Result<Box<dyn Processor>> {
         let spillers = Spiller::create(ctx.clone(), partition_streams, local_pos)?;
 
@@ -306,6 +308,7 @@ impl NewTransformPartialAggregate {
                 settings: MemorySettings::from_aggregate_settings(&ctx)?,
                 statistics: PartialAggregationStatistics::new(),
                 spillers,
+                is_row_shuffle,
             },
         ))
     }
@@ -458,9 +461,13 @@ impl AccumulatingTransform for NewTransformPartialAggregate {
 
                 blocks.extend(memory_blocks);
 
-                vec![DataBlock::empty_with_meta(ExchangeShuffleMeta::create(
-                    blocks,
-                ))]
+                if self.is_row_shuffle {
+                    blocks
+                } else {
+                    vec![DataBlock::empty_with_meta(ExchangeShuffleMeta::create(
+                        blocks,
+                    ))]
+                }
             }
         })
     }

@@ -174,7 +174,7 @@ impl IPhysicalPlan for AggregatePartial {
             group_by_display: self.group_by_display.clone(),
             rank_limit: self.rank_limit.clone(),
             stat_info: self.stat_info.clone(),
-            shuffle_mode: self.shuffle_mode,
+            shuffle_mode: self.shuffle_mode.clone(),
         })
     }
 
@@ -208,16 +208,22 @@ impl IPhysicalPlan for AggregatePartial {
         let schema_before_group_by = params.input_schema.clone();
 
         let partial_agg_config = if enable_experiment_aggregate {
-            match self.shuffle_mode {
+            match &self.shuffle_mode {
                 AggregateShuffleMode::Row => HashTableConfig::new_experiment_partial(
                     0,
                     cluster.nodes.len(),
                     max_threads as usize,
                 ),
-                AggregateShuffleMode::Bucket => {
-                    let output_len = builder.main_pipeline.output_len().next_power_of_two();
-                    let radix_bits = output_len.trailing_zeros() as u64;
-                    dbg!(output_len, radix_bits);
+                AggregateShuffleMode::Bucket(cpu_nums) => {
+                    let final_agg_nums = if cpu_nums.len() == 1 {
+                        // standalone mode
+                        builder.main_pipeline.output_len().next_power_of_two()
+                    } else {
+                        // cluster mode
+                        cpu_nums.iter().map(|(_, num)| *num).sum::<u64>() as usize
+                    };
+                    let radix_bits = final_agg_nums.trailing_zeros() as u64;
+                    dbg!(final_agg_nums, radix_bits);
                     HashTableConfig::new_experiment_partial(
                         radix_bits,
                         cluster.nodes.len(),
@@ -261,7 +267,7 @@ impl IPhysicalPlan for AggregatePartial {
                     )
                 })
                 .collect::<Vec<_>>();
-
+            let is_row_shuffle = matches!(self.shuffle_mode, AggregateShuffleMode::Row);
             builder.main_pipeline.add_transform(|input, output| {
                 Ok(ProcessorPtr::create(
                     NewTransformPartialAggregate::try_create(
@@ -272,37 +278,40 @@ impl IPhysicalPlan for AggregatePartial {
                         partial_agg_config.clone(),
                         shared_partition_streams.clone(),
                         local_pos,
+                        is_row_shuffle,
                     )?,
                 ))
             })?;
 
             if !builder.is_exchange_parent() {
-                let output_len = builder.main_pipeline.output_len();
+                let input_len = builder.main_pipeline.output_len();
                 if matches!(self.shuffle_mode, AggregateShuffleMode::Row) {
                     builder.main_pipeline.add_transform(|input, output| {
                         Ok(ScatterTransform::create(
                             input,
                             output,
-                            Arc::new(Box::new(HashTableHashScatter {
-                                buckets: output_len,
-                            })),
+                            Arc::new(Box::new(HashTableHashScatter { buckets: input_len })),
                         ))
                     })?;
                 }
 
-                let transform =
-                    ExchangeShuffleTransform::create(output_len, output_len, output_len);
+                let output_len = if matches!(self.shuffle_mode, AggregateShuffleMode::Bucket(_)) {
+                    let adjust_parallelism =
+                        2_usize.pow(partial_agg_config.initial_radix_bits as u32);
+                    adjust_parallelism
+                } else {
+                    input_len
+                };
+                let transform = ExchangeShuffleTransform::create(input_len, output_len, output_len);
                 let inputs = transform.get_inputs();
                 let outputs = transform.get_outputs();
                 builder
                     .main_pipeline
-                    .add_pipe(Pipe::create(output_len, output_len, vec![
-                        PipeItem::create(
-                            ProcessorPtr::create(Box::new(transform)),
-                            inputs,
-                            outputs,
-                        ),
-                    ]));
+                    .add_pipe(Pipe::create(input_len, output_len, vec![PipeItem::create(
+                        ProcessorPtr::create(Box::new(transform)),
+                        inputs,
+                        outputs,
+                    )]));
             }
         } else {
             builder.main_pipeline.add_transform(|input, output| {
