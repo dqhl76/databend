@@ -24,9 +24,6 @@ use databend_common_expression::DataSchemaRef;
 use databend_common_expression::DataSchemaRefExt;
 use databend_common_expression::RemoteExpr;
 use databend_common_pipeline::core::ProcessorPtr;
-use databend_common_sql::ColumnSet;
-use databend_common_sql::IndexType;
-use databend_common_sql::ScalarExpr;
 use databend_common_sql::executor::physical_plans::AggregateFunctionDesc;
 use databend_common_sql::executor::physical_plans::AggregateFunctionSignature;
 use databend_common_sql::executor::physical_plans::SortDesc;
@@ -35,6 +32,9 @@ use databend_common_sql::plans::Aggregate;
 use databend_common_sql::plans::AggregateMode;
 use databend_common_sql::plans::ConstantTableScan;
 use databend_common_sql::plans::ScalarItem;
+use databend_common_sql::ColumnSet;
+use databend_common_sql::IndexType;
+use databend_common_sql::ScalarExpr;
 use itertools::Itertools;
 
 use super::AggregateExpand;
@@ -49,10 +49,10 @@ use crate::physical_plans::physical_plan::IPhysicalPlan;
 use crate::physical_plans::physical_plan::PhysicalPlan;
 use crate::physical_plans::physical_plan::PhysicalPlanMeta;
 use crate::physical_plans::physical_plan_builder::PhysicalPlanBuilder;
-use crate::pipelines::PipelineBuilder;
+use crate::pipelines::processors::transforms::aggregator::build_partition_bucket;
 use crate::pipelines::processors::transforms::aggregator::AggregateInjector;
 use crate::pipelines::processors::transforms::aggregator::FinalSingleStateAggregator;
-use crate::pipelines::processors::transforms::aggregator::build_partition_bucket;
+use crate::pipelines::PipelineBuilder;
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
 pub struct AggregateFinal {
@@ -65,6 +65,7 @@ pub struct AggregateFinal {
 
     // Only used for explain
     pub stat_info: Option<PlanStatsInfo>,
+    pub shuffle_mode: AggregateShuffleMode,
 }
 
 #[typetag::serde]
@@ -141,6 +142,7 @@ impl IPhysicalPlan for AggregateFinal {
             before_group_by_schema: self.before_group_by_schema.clone(),
             group_by_display: self.group_by_display.clone(),
             stat_info: self.stat_info.clone(),
+            shuffle_mode: self.shuffle_mode.clone(),
         })
     }
 
@@ -184,8 +186,11 @@ impl IPhysicalPlan for AggregateFinal {
         let old_inject = builder.exchange_injector.clone();
 
         if ExchangeSource::check_physical_plan(&self.input) {
-            builder.exchange_injector =
-                AggregateInjector::create(builder.ctx.clone(), params.clone());
+            builder.exchange_injector = AggregateInjector::create(
+                builder.ctx.clone(),
+                params.clone(),
+                self.shuffle_mode.clone(),
+            );
         }
 
         self.input.build_pipeline(builder)?;
@@ -440,6 +445,7 @@ impl PhysicalPlanBuilder {
                         group_by: group_items,
                         stat_info: Some(stat_info),
                         meta: PhysicalPlanMeta::new("AggregateFinal"),
+                        shuffle_mode: partial.shuffle_mode.clone(),
                     })
                 } else {
                     let Some(exchange) = Exchange::from_physical_plan(&input) else {
@@ -468,6 +474,7 @@ impl PhysicalPlanBuilder {
                         group_by: group_items,
                         stat_info: Some(stat_info),
                         meta: PhysicalPlanMeta::new("AggregateFinal"),
+                        shuffle_mode: partial.shuffle_mode.clone(),
                     })
                 }
             }
@@ -486,7 +493,7 @@ pub enum AggregateShuffleMode {
     Row,
     // calculate shuffle destination based on id of bucket
     // cpu_nums in cluster stored in it
-    Bucket(Vec<(String, u64)>),
+    Bucket(Arc<Vec<(String, u64)>>),
 }
 
 fn determine_shuffle_mode(ctx: Arc<dyn TableContext>) -> Result<AggregateShuffleMode> {
@@ -522,7 +529,7 @@ fn determine_shuffle_mode(ctx: Arc<dyn TableContext>) -> Result<AggregateShuffle
         }
 
         debug_assert_eq!(cpu_nums.iter().map(|(_, v)| *v).sum::<u64>(), parallelism);
-        AggregateShuffleMode::Bucket(cpu_nums)
+        AggregateShuffleMode::Bucket(Arc::new(cpu_nums))
     } else {
         AggregateShuffleMode::Row
     };

@@ -27,13 +27,14 @@ use databend_common_pipeline::core::ProcessorPtr;
 use databend_common_settings::FlightCompression;
 use databend_common_storage::DataOperator;
 
+use crate::physical_plans::AggregateShuffleMode;
+use crate::pipelines::processors::transforms::aggregator::aggregate_meta::AggregateMeta;
+use crate::pipelines::processors::transforms::aggregator::serde::TransformExchangeAggregateSerializer;
+use crate::pipelines::processors::transforms::aggregator::serde::TransformExchangeAsyncBarrier;
 use crate::pipelines::processors::transforms::aggregator::AggregatorParams;
 use crate::pipelines::processors::transforms::aggregator::TransformAggregateDeserializer;
 use crate::pipelines::processors::transforms::aggregator::TransformAggregateSerializer;
 use crate::pipelines::processors::transforms::aggregator::TransformAggregateSpillWriter;
-use crate::pipelines::processors::transforms::aggregator::aggregate_meta::AggregateMeta;
-use crate::pipelines::processors::transforms::aggregator::serde::TransformExchangeAggregateSerializer;
-use crate::pipelines::processors::transforms::aggregator::serde::TransformExchangeAsyncBarrier;
 use crate::servers::flight::v1::exchange::DataExchange;
 use crate::servers::flight::v1::exchange::ExchangeInjector;
 use crate::servers::flight::v1::exchange::ExchangeSorting;
@@ -216,16 +217,19 @@ impl FlightScatter for HashTableHashScatter {
 pub struct AggregateInjector {
     ctx: Arc<QueryContext>,
     aggregator_params: Arc<AggregatorParams>,
+    shuffle_mode: AggregateShuffleMode,
 }
 
 impl AggregateInjector {
     pub fn create(
         ctx: Arc<QueryContext>,
         params: Arc<AggregatorParams>,
+        shuffle_mode: AggregateShuffleMode,
     ) -> Arc<dyn ExchangeInjector> {
         Arc::new(AggregateInjector {
             ctx,
             aggregator_params: params,
+            shuffle_mode,
         })
     }
 }

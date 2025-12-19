@@ -31,11 +31,13 @@ use databend_common_pipeline_transforms::AccumulatingTransformer;
 use crate::pipelines::processors::transforms::aggregator::transform_aggregate_partial::HashTable;
 use crate::pipelines::processors::transforms::aggregator::AggregateMeta;
 use crate::pipelines::processors::transforms::aggregator::AggregatorParams;
+use crate::pipelines::processors::transforms::aggregator::statistics::AggregationStatistics;
 
 pub struct NewTransformFinalAggregate {
     hashtable: HashTable,
     params: Arc<AggregatorParams>,
     flush_state: PayloadFlushState,
+    statistics: AggregationStatistics,
 }
 
 impl NewTransformFinalAggregate {
@@ -60,12 +62,14 @@ impl NewTransformFinalAggregate {
                 hashtable: HashTable::AggregateHashTable(hashtable),
                 params,
                 flush_state,
+                statistics: AggregationStatistics::new("NewFinalAggregate"),
             },
         ))
     }
 
     pub fn finish(&mut self) -> Result<DataBlock> {
         if let HashTable::AggregateHashTable(mut ht) = mem::take(&mut self.hashtable) {
+            self.statistics.log_finish_statistics(&ht);
             let mut blocks = vec![];
             self.flush_state.clear();
 
@@ -100,6 +104,9 @@ impl AccumulatingTransform for NewTransformFinalAggregate {
                 if let HashTable::AggregateHashTable(ht) = &mut self.hashtable {
                     match meta {
                         AggregateMeta::Serialized(payload) => {
+                            let rows = payload.data_block.num_rows();
+                            let bytes = payload.data_block.memory_size();
+                            self.statistics.record_block(rows, bytes);
                             let payload = payload.convert_to_partitioned_payload(
                                 self.params.group_data_types.clone(),
                                 self.params.aggregate_functions.clone(),
@@ -110,6 +117,9 @@ impl AccumulatingTransform for NewTransformFinalAggregate {
                             ht.combine_payloads(&payload, &mut self.flush_state)?;
                         }
                         AggregateMeta::AggregatePayload(payload) => {
+                            let rows = payload.payload.len();
+                            let bytes = payload.payload.memory_size();
+                            self.statistics.record_block(rows, bytes);
                             if let HashTable::AggregateHashTable(ht) = &mut self.hashtable {
                                 ht.combine_payload(&payload.payload, &mut self.flush_state)?;
                             }
