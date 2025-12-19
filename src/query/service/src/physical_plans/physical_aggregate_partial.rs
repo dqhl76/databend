@@ -267,8 +267,9 @@ impl IPhysicalPlan for AggregatePartial {
                     )
                 })
                 .collect::<Vec<_>>();
-            let is_row_shuffle = matches!(self.shuffle_mode, AggregateShuffleMode::Row);
+            let shuffle_mode = self.shuffle_mode.clone();
             builder.main_pipeline.add_transform(|input, output| {
+                let shuffle_mode = shuffle_mode.clone();
                 Ok(ProcessorPtr::create(
                     NewTransformPartialAggregate::try_create(
                         builder.ctx.clone(),
@@ -278,7 +279,7 @@ impl IPhysicalPlan for AggregatePartial {
                         partial_agg_config.clone(),
                         shared_partition_streams.clone(),
                         local_pos,
-                        is_row_shuffle,
+                        shuffle_mode,
                     )?,
                 ))
             })?;

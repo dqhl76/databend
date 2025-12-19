@@ -42,6 +42,7 @@ use super::AggregatePartial;
 use super::Exchange;
 use super::ExchangeSource;
 use super::PhysicalPlanCast;
+use crate::clusters::ClusterHelper;
 use crate::physical_plans::explain::PlanStatsInfo;
 use crate::physical_plans::format::AggregateFinalFormatter;
 use crate::physical_plans::format::PhysicalFormat;
@@ -436,6 +437,7 @@ impl PhysicalPlanBuilder {
                 if let Some(partial) = AggregatePartial::from_physical_plan(&input) {
                     let group_by_display = partial.group_by_display.clone();
                     let before_group_by_schema = partial.input.output_schema()?;
+                    let shuffle_mode = partial.shuffle_mode.clone();
 
                     PhysicalPlan::new(AggregateFinal {
                         input,
@@ -445,7 +447,7 @@ impl PhysicalPlanBuilder {
                         group_by: group_items,
                         stat_info: Some(stat_info),
                         meta: PhysicalPlanMeta::new("AggregateFinal"),
-                        shuffle_mode: partial.shuffle_mode.clone(),
+                        shuffle_mode,
                     })
                 } else {
                     let Some(exchange) = Exchange::from_physical_plan(&input) else {
@@ -465,6 +467,7 @@ impl PhysicalPlanBuilder {
 
                     let group_by_display = partial.group_by_display.clone();
                     let before_group_by_schema = partial.input.output_schema()?;
+                    let shuffle_mode = partial.shuffle_mode.clone();
 
                     PhysicalPlan::new(AggregateFinal {
                         input,
@@ -474,7 +477,7 @@ impl PhysicalPlanBuilder {
                         group_by: group_items,
                         stat_info: Some(stat_info),
                         meta: PhysicalPlanMeta::new("AggregateFinal"),
-                        shuffle_mode: partial.shuffle_mode.clone(),
+                        shuffle_mode,
                     })
                 }
             }

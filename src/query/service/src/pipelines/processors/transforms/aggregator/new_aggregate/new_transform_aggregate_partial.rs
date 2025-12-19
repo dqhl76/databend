@@ -14,42 +14,44 @@
 
 use std::sync::Arc;
 use std::vec;
+use std::collections::VecDeque;
 
 use bumpalo::Bump;
 use databend_common_catalog::plan::AggIndexMeta;
 use databend_common_exception::Result;
+use databend_common_expression::types::BinaryType;
+use databend_common_expression::types::Int64Type;
+use databend_common_expression::types::StringType;
 use databend_common_expression::AggregateHashTable;
 use databend_common_expression::BlockMetaInfoDowncast;
 use databend_common_expression::DataBlock;
 use databend_common_expression::FromData;
 use databend_common_expression::HashTableConfig;
-use databend_common_expression::MAX_AGGREGATE_HASHTABLE_BUCKETS_NUM;
 use databend_common_expression::PartitionedPayload;
 use databend_common_expression::PayloadFlushState;
 use databend_common_expression::ProbeState;
 use databend_common_expression::ProjectedBlock;
-use databend_common_expression::types::BinaryType;
-use databend_common_expression::types::Int64Type;
-use databend_common_expression::types::StringType;
+use databend_common_expression::MAX_AGGREGATE_HASHTABLE_BUCKETS_NUM;
 use databend_common_pipeline::core::InputPort;
 use databend_common_pipeline::core::OutputPort;
 use databend_common_pipeline::core::Processor;
-use databend_common_pipeline_transforms::MemorySettings;
 use databend_common_pipeline_transforms::processors::AccumulatingTransform;
 use databend_common_pipeline_transforms::processors::AccumulatingTransformer;
+use databend_common_pipeline_transforms::MemorySettings;
 use databend_common_storages_parquet::serialize_row_group_meta_to_bytes;
 
+use crate::physical_plans::AggregateShuffleMode;
 use crate::pipelines::memory_settings::MemorySettingsExt;
+use crate::pipelines::processors::transforms::aggregator::aggregate_exchange_injector::scatter_partitioned_payload;
+use crate::pipelines::processors::transforms::aggregator::aggregate_meta::AggregateMeta;
+use crate::pipelines::processors::transforms::aggregator::exchange_defines;
+use crate::pipelines::processors::transforms::aggregator::statistics::AggregationStatistics;
 use crate::pipelines::processors::transforms::aggregator::AggregateSerdeMeta;
 use crate::pipelines::processors::transforms::aggregator::AggregatorParams;
 use crate::pipelines::processors::transforms::aggregator::FlightSerialized;
 use crate::pipelines::processors::transforms::aggregator::FlightSerializedMeta;
 use crate::pipelines::processors::transforms::aggregator::NewAggregateSpiller;
 use crate::pipelines::processors::transforms::aggregator::SharedPartitionStream;
-use crate::pipelines::processors::transforms::aggregator::statistics::AggregationStatistics;
-use crate::pipelines::processors::transforms::aggregator::aggregate_exchange_injector::scatter_partitioned_payload;
-use crate::pipelines::processors::transforms::aggregator::aggregate_meta::AggregateMeta;
-use crate::pipelines::processors::transforms::aggregator::exchange_defines;
 use crate::servers::flight::v1::exchange::serde::serialize_block;
 use crate::servers::flight::v1::exchange::ExchangeShuffleMeta;
 use crate::sessions::QueryContext;
@@ -225,7 +227,7 @@ pub struct NewTransformPartialAggregate {
     statistics: AggregationStatistics,
     settings: MemorySettings,
     spillers: Spiller,
-    is_row_shuffle: bool,
+    shuffle_mode: AggregateShuffleMode,
 }
 
 impl NewTransformPartialAggregate {
@@ -237,7 +239,7 @@ impl NewTransformPartialAggregate {
         config: HashTableConfig,
         partition_streams: Vec<SharedPartitionStream>,
         local_pos: usize,
-        is_row_shuffle: bool,
+        shuffle_mode: AggregateShuffleMode,
     ) -> Result<Box<dyn Processor>> {
         let spillers = Spiller::create(ctx.clone(), partition_streams, local_pos)?;
 
@@ -260,7 +262,7 @@ impl NewTransformPartialAggregate {
                 settings: MemorySettings::from_aggregate_settings(&ctx)?,
                 statistics: AggregationStatistics::new("NewPartialAggregate"),
                 spillers,
-                is_row_shuffle,
+                shuffle_mode,
             },
         ))
     }
@@ -392,33 +394,74 @@ impl AccumulatingTransform for NewTransformPartialAggregate {
                 }
             },
             HashTable::AggregateHashTable(hashtable) => {
-                let mut blocks = self.spillers.finish()?;
-
                 let partition_count = hashtable.payload.partition_count();
-                let mut memory_blocks = Vec::with_capacity(partition_count);
+                let mut payloads = Vec::with_capacity(partition_count);
 
                 self.statistics.log_finish_statistics(&hashtable);
                 dbg!(&hashtable.payload.payloads.len());
                 for (bucket, payload) in hashtable.payload.payloads.into_iter().enumerate() {
-                    if payload.len() != 0 {
-                        memory_blocks.push(DataBlock::empty_with_meta(
-                            AggregateMeta::create_agg_payload(
-                                bucket as isize,
-                                payload,
-                                partition_count,
-                            ),
-                        ));
-                    }
+                    payloads.push(AggregateMeta::create_agg_payload(
+                        bucket as isize,
+                        payload,
+                        partition_count,
+                    ));
                 }
 
-                blocks.extend(memory_blocks);
+                match &self.shuffle_mode {
+                    AggregateShuffleMode::Row => payloads
+                        .into_iter()
+                        .map(DataBlock::empty_with_meta)
+                        .collect(),
+                    AggregateShuffleMode::Bucket(hint) => {
+                        if hint.len() == 1 {
+                            vec![DataBlock::empty_with_meta(ExchangeShuffleMeta::create(
+                                payloads
+                                    .into_iter()
+                                    .map(DataBlock::empty_with_meta)
+                                    .collect(),
+                            ))]
+                        } else {
+                            let mut chunks = Vec::with_capacity(hint.len());
+                            for (_node_id, bucket_num) in hint.iter() {
+                                let chunk: Vec<AggregateMeta> = payloads
+                                    .drain(0..*bucket_num as usize)
+                                    .map(|payload| {
+                                        AggregateMeta::downcast_from(payload)
+                                            .expect("AggregateMeta is expected")
+                                    })
+                                    .collect();
+                                chunks.push(chunk);
+                            }
 
-                if self.is_row_shuffle {
-                    blocks
-                } else {
-                    vec![DataBlock::empty_with_meta(ExchangeShuffleMeta::create(
-                        blocks,
-                    ))]
+                            let mut chunk_deques: Vec<VecDeque<AggregateMeta>> = chunks
+                                .into_iter()
+                                .map(VecDeque::from)
+                                .collect();
+
+                            let max_bucket_num = chunk_deques
+                                .iter()
+                                .map(|chunk| chunk.len())
+                                .max()
+                                .unwrap_or_default();
+
+                            let mut res = Vec::with_capacity(max_bucket_num);
+                            for _ in 0..max_bucket_num {
+                                let mut round_blocks = Vec::with_capacity(chunk_deques.len());
+                                for chunk in chunk_deques.iter_mut() {
+                                    if let Some(meta) = chunk.pop_front() {
+                                        round_blocks.push(DataBlock::empty_with_meta(Box::new(meta)));
+                                    } else {
+                                        round_blocks.push(DataBlock::empty());
+                                    }
+                                }
+                                res.push(DataBlock::empty_with_meta(ExchangeShuffleMeta::create(
+                                    round_blocks,
+                                )));
+                            }
+
+                            res
+                        }
+                    }
                 }
             }
         })
