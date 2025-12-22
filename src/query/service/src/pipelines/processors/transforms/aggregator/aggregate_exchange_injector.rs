@@ -345,7 +345,7 @@ impl ExchangeInjector for AggregateInjector {
             TransformAggregateDeserializer::try_create(input, output, &params.schema)
         })?;
 
-        let output_len = match self.shuffle_mode {
+        let output_len = match &self.shuffle_mode {
             AggregateShuffleMode::Row => {
                 let max_threads = self.ctx.get_settings().get_max_threads()? as usize;
                 pipeline.add_transform(|input, output| {
@@ -360,10 +360,10 @@ impl ExchangeInjector for AggregateInjector {
                 max_threads
             }
             AggregateShuffleMode::Bucket(hint) => {
-                let cluster = self.ctx.get_cluster().local_id;
+                let local_id = self.ctx.get_cluster().local_id.clone();
                 let thread_hint = hint
                     .iter()
-                    .find(|(id, _)| *id == &cluster)
+                    .find(|(id, _)| *id == local_id)
                     .expect("this node not in hint")
                     .1 as usize;
                 thread_hint

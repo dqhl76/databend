@@ -19,6 +19,7 @@ use std::sync::Arc;
 
 use bumpalo::Bump;
 use databend_common_exception::Result;
+use databend_common_expression::types::DataType;
 use databend_common_expression::AggregateFunction;
 use databend_common_expression::AggregateHashTable;
 use databend_common_expression::BlockMetaInfo;
@@ -30,7 +31,6 @@ use databend_common_expression::PartitionedPayload;
 use databend_common_expression::Payload;
 use databend_common_expression::ProbeState;
 use databend_common_expression::ProjectedBlock;
-use databend_common_expression::types::DataType;
 use parquet::file::metadata::RowGroupMetaData;
 
 pub struct SerializedPayload {
@@ -138,9 +138,8 @@ pub enum AggregateMeta {
     Spilled(Vec<BucketSpilledPayload>),
 
     Partitioned {
-        bucket: isize,
+        bucket: Option<isize>,
         data: Vec<Self>,
-        activate_worker: Option<usize>,
     },
 
     NewBucketSpilled(NewSpilledPayload),
@@ -184,16 +183,8 @@ impl AggregateMeta {
         Box::new(AggregateMeta::BucketSpilled(payload))
     }
 
-    pub fn create_partitioned(
-        bucket: isize,
-        data: Vec<Self>,
-        activate_worker: Option<usize>,
-    ) -> BlockMetaInfoPtr {
-        Box::new(AggregateMeta::Partitioned {
-            data,
-            bucket,
-            activate_worker,
-        })
+    pub fn create_partitioned(bucket: Option<isize>, data: Vec<Self>) -> BlockMetaInfoPtr {
+        Box::new(AggregateMeta::Partitioned { data, bucket })
     }
 
     pub fn create_new_bucket_spilled(payload: NewSpilledPayload) -> BlockMetaInfoPtr {

@@ -429,7 +429,7 @@ impl AccumulatingTransform for NewTransformPartialAggregate {
                                             .expect("AggregateMeta is expected")
                                     })
                                     .collect();
-                                chunks.push(AggregateMeta::create_partitioned(0, chunk, None));
+                                chunks.push(AggregateMeta::create_partitioned(None, chunk));
                             }
                             vec![DataBlock::empty_with_meta(ExchangeShuffleMeta::create(
                                 chunks.into_iter().map(DataBlock::empty_with_meta).collect(),
