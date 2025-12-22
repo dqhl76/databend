@@ -167,7 +167,14 @@ impl BlockMetaTransform<ExchangeShuffleMeta> for TransformExchangeAggregateSeria
                     let c = serialize_block(block_number, c, &self.options)?;
                     serialized_blocks.push(FlightSerialized::DataBlock(c));
                 }
-                Some(AggregateMeta::Partitioned { data, .. }) => {}
+                Some(AggregateMeta::Partitioned { data, .. }) => {
+                    if index == self.local_pos {
+                        serialized_blocks.push(FlightSerialized::DataBlock(
+                            block.add_meta(Some(AggregateMeta::create_partitioned(None, data)))?,
+                        ));
+                        continue;
+                    }
+                }
 
                 _ => unreachable!(),
             };
