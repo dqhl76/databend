@@ -15,6 +15,7 @@
 use std::sync::Arc;
 
 use bumpalo::Bump;
+use databend_common_catalog::table_context::TableContext;
 use databend_common_exception::ErrorCode;
 use databend_common_exception::Result;
 use databend_common_expression::BlockMetaInfoDowncast;
@@ -22,11 +23,14 @@ use databend_common_expression::DataBlock;
 use databend_common_expression::PartitionedPayload;
 use databend_common_expression::Payload;
 use databend_common_expression::PayloadFlushState;
+use databend_common_pipeline::core::Pipe;
+use databend_common_pipeline::core::PipeItem;
 use databend_common_pipeline::core::Pipeline;
 use databend_common_pipeline::core::ProcessorPtr;
 use databend_common_settings::FlightCompression;
 use databend_common_storage::DataOperator;
 
+use crate::clusters::ClusterHelper;
 use crate::physical_plans::AggregateShuffleMode;
 use crate::pipelines::processors::transforms::aggregator::aggregate_meta::AggregateMeta;
 use crate::pipelines::processors::transforms::aggregator::serde::TransformExchangeAggregateSerializer;
@@ -37,8 +41,10 @@ use crate::pipelines::processors::transforms::aggregator::TransformAggregateSeri
 use crate::pipelines::processors::transforms::aggregator::TransformAggregateSpillWriter;
 use crate::servers::flight::v1::exchange::DataExchange;
 use crate::servers::flight::v1::exchange::ExchangeInjector;
+use crate::servers::flight::v1::exchange::ExchangeShuffleTransform;
 use crate::servers::flight::v1::exchange::ExchangeSorting;
 use crate::servers::flight::v1::exchange::MergeExchangeParams;
+use crate::servers::flight::v1::exchange::ScatterTransform;
 use crate::servers::flight::v1::exchange::ShuffleExchangeParams;
 use crate::servers::flight::v1::scatter::FlightScatter;
 use crate::sessions::QueryContext;
@@ -337,6 +343,41 @@ impl ExchangeInjector for AggregateInjector {
     ) -> Result<()> {
         pipeline.add_transform(|input, output| {
             TransformAggregateDeserializer::try_create(input, output, &params.schema)
-        })
+        })?;
+
+        let output_len = match self.shuffle_mode {
+            AggregateShuffleMode::Row => {
+                let max_threads = self.ctx.get_settings().get_max_threads()? as usize;
+                pipeline.add_transform(|input, output| {
+                    Ok(ScatterTransform::create(
+                        input,
+                        output,
+                        Arc::new(Box::new(HashTableHashScatter {
+                            buckets: max_threads,
+                        })),
+                    ))
+                })?;
+                max_threads
+            }
+            AggregateShuffleMode::Bucket(hint) => {
+                let cluster = self.ctx.get_cluster().local_id;
+                let thread_hint = hint
+                    .iter()
+                    .find(|(id, _)| *id == &cluster)
+                    .expect("this node not in hint")
+                    .1 as usize;
+                thread_hint
+            }
+        };
+        let input_len = pipeline.output_len();
+        let transform = ExchangeShuffleTransform::create(input_len, output_len, output_len);
+        let inputs = transform.get_inputs();
+        let outputs = transform.get_outputs();
+        pipeline.add_pipe(Pipe::create(input_len, output_len, vec![PipeItem::create(
+            ProcessorPtr::create(Box::new(transform)),
+            inputs,
+            outputs,
+        )]));
+        Ok(())
     }
 }

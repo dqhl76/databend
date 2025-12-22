@@ -35,9 +35,6 @@ fn build_partition_bucket_experimental(
     after_worker: usize,
     ctx: Arc<QueryContext>,
 ) -> Result<()> {
-    // PartitionedPayload only accept power of two partitions
-    let mut output_num = after_worker.next_power_of_two();
-
     pipeline.add_transform(|input, output| {
         Ok(ProcessorPtr::create(
             NewTransformFinalAggregate::try_create(input, output, params.clone())?,

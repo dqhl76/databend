@@ -14,7 +14,6 @@
 
 use std::sync::Arc;
 use std::vec;
-use std::collections::VecDeque;
 
 use bumpalo::Bump;
 use databend_common_catalog::plan::AggIndexMeta;
@@ -430,36 +429,11 @@ impl AccumulatingTransform for NewTransformPartialAggregate {
                                             .expect("AggregateMeta is expected")
                                     })
                                     .collect();
-                                chunks.push(chunk);
+                                chunks.push(AggregateMeta::create_partitioned(0, chunk, None));
                             }
-
-                            let mut chunk_deques: Vec<VecDeque<AggregateMeta>> = chunks
-                                .into_iter()
-                                .map(VecDeque::from)
-                                .collect();
-
-                            let max_bucket_num = chunk_deques
-                                .iter()
-                                .map(|chunk| chunk.len())
-                                .max()
-                                .unwrap_or_default();
-
-                            let mut res = Vec::with_capacity(max_bucket_num);
-                            for _ in 0..max_bucket_num {
-                                let mut round_blocks = Vec::with_capacity(chunk_deques.len());
-                                for chunk in chunk_deques.iter_mut() {
-                                    if let Some(meta) = chunk.pop_front() {
-                                        round_blocks.push(DataBlock::empty_with_meta(Box::new(meta)));
-                                    } else {
-                                        round_blocks.push(DataBlock::empty());
-                                    }
-                                }
-                                res.push(DataBlock::empty_with_meta(ExchangeShuffleMeta::create(
-                                    round_blocks,
-                                )));
-                            }
-
-                            res
+                            vec![DataBlock::empty_with_meta(ExchangeShuffleMeta::create(
+                                chunks.into_iter().map(DataBlock::empty_with_meta).collect(),
+                            ))]
                         }
                     }
                 }

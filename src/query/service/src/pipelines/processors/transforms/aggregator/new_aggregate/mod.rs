@@ -11,7 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-mod local_shuffle_transform;
 mod new_aggregate_spiller;
 mod new_transform_aggregate_partial;
 mod new_transform_final_aggregate;
