@@ -42,10 +42,12 @@ use crate::pipelines::processors::transforms::aggregator::BUCKET_TYPE;
 use crate::pipelines::processors::transforms::aggregator::BucketSpilledPayload;
 use crate::pipelines::processors::transforms::aggregator::NEW_SPILLED_TYPE;
 use crate::pipelines::processors::transforms::aggregator::NewSpilledPayload;
+use crate::pipelines::processors::transforms::aggregator::PARTITIONED_AGGREGATE_TYPE;
 use crate::pipelines::processors::transforms::aggregator::SPILLED_TYPE;
 use crate::pipelines::processors::transforms::aggregator::exchange_defines;
 use crate::servers::flight::v1::exchange::serde::ExchangeDeserializeMeta;
 use crate::servers::flight::v1::exchange::serde::deserialize_block;
+use crate::servers::flight::v1::exchange::ExchangeShuffleMeta;
 use crate::servers::flight::v1::packets::DataPacket;
 use crate::servers::flight::v1::packets::FragmentData;
 
@@ -113,6 +115,55 @@ impl TransformDeserializer {
                 Ok(DataBlock::empty_with_meta(
                     AggregateMeta::create_serialized(meta.bucket, block, meta.max_partition_count),
                 ))
+            }
+            PARTITIONED_AGGREGATE_TYPE => {
+                let data_block = deserialize_block(
+                    dict,
+                    fragment_data,
+                    &self.schema,
+                    self.arrow_schema.clone(),
+                )?;
+
+                if meta.buckets.len() != meta.payload_row_counts.len() {
+                    return Err(ErrorCode::Internal(
+                        "Invalid partitioned aggregate serde meta".to_string(),
+                    ));
+                }
+
+                let mut offset = 0;
+                let mut blocks = Vec::with_capacity(meta.buckets.len());
+                for (bucket, rows) in meta
+                    .buckets
+                    .iter()
+                    .zip(meta.payload_row_counts.iter())
+                {
+                    let rows = *rows;
+                    let start = offset;
+                    offset += rows;
+                    if offset > data_block.num_rows() {
+                        return Err(ErrorCode::Internal(
+                            "Partitioned aggregate payload rows exceed block rows".to_string(),
+                        ));
+                    }
+
+                    let payload_block = if rows == 0 {
+                        DataBlock::empty()
+                    } else {
+                        data_block.slice(start..offset)
+                    };
+
+                    blocks.push(DataBlock::empty_with_meta(
+                        AggregateMeta::create_serialized(*bucket, payload_block, 0),
+                    ));
+                }
+
+                if offset != data_block.num_rows() {
+                    return Err(ErrorCode::Internal(
+                        "Partitioned aggregate payload rows do not match block rows".to_string(),
+                    ));
+                }
+
+                Ok(DataBlock::empty_with_meta(ExchangeShuffleMeta::create(blocks)))
             }
             SPILLED_TYPE => {
                 let data_schema = Arc::new(exchange_defines::spilled_schema());

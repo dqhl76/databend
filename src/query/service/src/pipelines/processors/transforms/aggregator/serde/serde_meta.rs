@@ -21,6 +21,7 @@ use databend_common_expression::BlockMetaInfoPtr;
 pub const BUCKET_TYPE: usize = 1;
 pub const SPILLED_TYPE: usize = 2;
 pub const NEW_SPILLED_TYPE: usize = 3;
+pub const PARTITIONED_AGGREGATE_TYPE: usize = 4;
 
 // Cannot change to enum, because bincode cannot deserialize custom enum
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
@@ -33,6 +34,8 @@ pub struct AggregateSerdeMeta {
     // use for new agg hashtable
     pub max_partition_count: usize,
     pub is_empty: bool,
+    pub buckets: Vec<isize>,
+    pub payload_row_counts: Vec<usize>,
 }
 
 impl AggregateSerdeMeta {
@@ -49,6 +52,8 @@ impl AggregateSerdeMeta {
             columns_layout: vec![],
             max_partition_count,
             is_empty,
+            buckets: vec![],
+            payload_row_counts: vec![],
         })
     }
 
@@ -67,6 +72,8 @@ impl AggregateSerdeMeta {
             data_range: Some(data_range),
             max_partition_count: 0,
             is_empty,
+            buckets: vec![],
+            payload_row_counts: vec![],
         })
     }
 
@@ -85,6 +92,8 @@ impl AggregateSerdeMeta {
             data_range: Some(data_range),
             max_partition_count,
             is_empty: false,
+            buckets: vec![],
+            payload_row_counts: vec![],
         })
     }
 
@@ -97,6 +106,25 @@ impl AggregateSerdeMeta {
             data_range: None,
             max_partition_count: 0,
             is_empty: false,
+            buckets: vec![],
+            payload_row_counts: vec![],
+        })
+    }
+
+    pub fn create_partitioned_payload(
+        buckets: Vec<isize>,
+        payload_row_counts: Vec<usize>,
+    ) -> BlockMetaInfoPtr {
+        Box::new(AggregateSerdeMeta {
+            typ: PARTITIONED_AGGREGATE_TYPE,
+            bucket: 0,
+            columns_layout: vec![],
+            location: None,
+            data_range: None,
+            max_partition_count: 0,
+            is_empty: false,
+            buckets,
+            payload_row_counts,
         })
     }
 }
