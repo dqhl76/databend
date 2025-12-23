@@ -131,7 +131,10 @@ impl AccumulatingTransform for NewTransformFinalAggregate {
                             }
                         }
                         _ => {
-                            return unreachable!("unexpected aggregate meta");
+                            return unreachable!(
+                                "unexpected aggregate meta, found type: {:?}",
+                                meta
+                            );
                         }
                     }
                 }

@@ -215,8 +215,8 @@ impl IPhysicalPlan for AggregatePartial {
                     max_threads as usize,
                 ),
                 AggregateShuffleMode::Bucket(cpu_nums) => {
-                    let final_agg_nums = if cpu_nums.len() == 1 {
-                        // standalone mode
+                    let final_agg_nums = if cpu_nums.len() == 1 || !builder.is_exchange_parent() {
+                        // standalone or aggregation only is processed on a single node
                         builder.main_pipeline.output_len().next_power_of_two()
                     } else {
                         // cluster mode
@@ -268,6 +268,7 @@ impl IPhysicalPlan for AggregatePartial {
                 })
                 .collect::<Vec<_>>();
             let shuffle_mode = self.shuffle_mode.clone();
+            let is_cluster = builder.is_exchange_parent();
             builder.main_pipeline.add_transform(|input, output| {
                 let shuffle_mode = shuffle_mode.clone();
                 Ok(ProcessorPtr::create(
@@ -280,6 +281,7 @@ impl IPhysicalPlan for AggregatePartial {
                         shared_partition_streams.clone(),
                         local_pos,
                         shuffle_mode,
+                        is_cluster,
                     )?,
                 ))
             })?;
@@ -291,7 +293,10 @@ impl IPhysicalPlan for AggregatePartial {
                         Ok(ScatterTransform::create(
                             input,
                             output,
-                            Arc::new(Box::new(HashTableHashScatter { buckets: input_len })),
+                            Arc::new(Box::new(HashTableHashScatter {
+                                buckets: input_len,
+                                aggregate_params: params.clone(),
+                            })),
                         ))
                     })?;
                 }

@@ -227,6 +227,7 @@ pub struct NewTransformPartialAggregate {
     settings: MemorySettings,
     spillers: Spiller,
     shuffle_mode: AggregateShuffleMode,
+    is_cluster: bool,
 }
 
 impl NewTransformPartialAggregate {
@@ -239,6 +240,7 @@ impl NewTransformPartialAggregate {
         partition_streams: Vec<SharedPartitionStream>,
         local_pos: usize,
         shuffle_mode: AggregateShuffleMode,
+        is_cluster: bool,
     ) -> Result<Box<dyn Processor>> {
         let spillers = Spiller::create(ctx.clone(), partition_streams, local_pos)?;
 
@@ -262,6 +264,7 @@ impl NewTransformPartialAggregate {
                 statistics: AggregationStatistics::new("NewPartialAggregate"),
                 spillers,
                 shuffle_mode,
+                is_cluster,
             },
         ))
     }
@@ -412,7 +415,7 @@ impl AccumulatingTransform for NewTransformPartialAggregate {
                         .map(DataBlock::empty_with_meta)
                         .collect(),
                     AggregateShuffleMode::Bucket(hint) => {
-                        if hint.len() == 1 {
+                        if !self.is_cluster {
                             vec![DataBlock::empty_with_meta(ExchangeShuffleMeta::create(
                                 payloads
                                     .into_iter()

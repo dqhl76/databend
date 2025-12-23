@@ -23,6 +23,7 @@ use databend_common_expression::DataBlock;
 use databend_common_expression::PartitionedPayload;
 use databend_common_expression::Payload;
 use databend_common_expression::PayloadFlushState;
+use databend_common_expression::MAX_AGGREGATE_HASHTABLE_BUCKETS_NUM;
 use databend_common_pipeline::core::Pipe;
 use databend_common_pipeline::core::PipeItem;
 use databend_common_pipeline::core::Pipeline;
@@ -85,6 +86,7 @@ impl ExchangeSorting for AggregateExchangeSorting {
 
 pub struct HashTableHashScatter {
     pub buckets: usize,
+    pub(crate) aggregate_params: Arc<AggregatorParams>,
 }
 
 fn scatter_payload(mut payload: Payload, buckets: usize) -> Result<Vec<Payload>> {
@@ -186,7 +188,30 @@ impl FlightScatter for HashTableHashScatter {
                 match block_meta {
                     AggregateMeta::Spilled(_) => unreachable!(),
                     AggregateMeta::BucketSpilled(_) => unreachable!(),
-                    AggregateMeta::Serialized(_) => unreachable!(),
+                    AggregateMeta::Serialized(payload) => {
+                        let mut partition = payload.convert_to_partitioned_payload(
+                            self.aggregate_params.group_data_types.clone(),
+                            self.aggregate_params.aggregate_functions.clone(),
+                            self.aggregate_params.num_states(),
+                            0,
+                            Arc::new(Bump::new()),
+                        )?;
+                        let payload = partition.payloads.pop();
+                        if let Some(payload) = payload {
+                            for (bucket, payload) in scatter_payload(payload, self.buckets)?
+                                .into_iter()
+                                .enumerate()
+                            {
+                                blocks.push(DataBlock::empty_with_meta(
+                                    AggregateMeta::create_agg_payload(
+                                        bucket as isize,
+                                        payload,
+                                        MAX_AGGREGATE_HASHTABLE_BUCKETS_NUM as usize,
+                                    ),
+                                ));
+                            }
+                        }
+                    }
                     AggregateMeta::Partitioned { .. } => unreachable!(),
                     AggregateMeta::NewBucketSpilled(_) => unreachable!(),
                     AggregateMeta::NewSpilled(_) => unreachable!(),
@@ -252,6 +277,7 @@ impl ExchangeInjector for AggregateInjector {
             DataExchange::NodeToNodeExchange(exchange) => {
                 Ok(Arc::new(Box::new(HashTableHashScatter {
                     buckets: exchange.destination_ids.len(),
+                    aggregate_params: self.aggregator_params.clone(),
                 })))
             }
         }
@@ -358,6 +384,7 @@ impl ExchangeInjector for AggregateInjector {
                             output,
                             Arc::new(Box::new(HashTableHashScatter {
                                 buckets: max_threads,
+                                aggregate_params: self.aggregator_params.clone(),
                             })),
                         ))
                     })?;
