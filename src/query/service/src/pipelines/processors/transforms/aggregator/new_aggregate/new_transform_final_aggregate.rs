@@ -28,16 +28,17 @@ use databend_common_pipeline::core::Processor;
 use databend_common_pipeline_transforms::AccumulatingTransform;
 use databend_common_pipeline_transforms::AccumulatingTransformer;
 
+use crate::pipelines::processors::transforms::aggregator::statistics::AggregationStatistics;
 use crate::pipelines::processors::transforms::aggregator::transform_aggregate_partial::HashTable;
 use crate::pipelines::processors::transforms::aggregator::AggregateMeta;
 use crate::pipelines::processors::transforms::aggregator::AggregatorParams;
-use crate::pipelines::processors::transforms::aggregator::statistics::AggregationStatistics;
 
 pub struct NewTransformFinalAggregate {
     hashtable: HashTable,
     params: Arc<AggregatorParams>,
     flush_state: PayloadFlushState,
     statistics: AggregationStatistics,
+    id: usize,
 }
 
 impl NewTransformFinalAggregate {
@@ -45,6 +46,7 @@ impl NewTransformFinalAggregate {
         input: Arc<InputPort>,
         output: Arc<OutputPort>,
         params: Arc<AggregatorParams>,
+        id: usize,
     ) -> Result<Box<dyn Processor>> {
         // TODO: the initial capacity is too small, can be optimized here
         let hashtable = AggregateHashTable::new(
@@ -63,6 +65,7 @@ impl NewTransformFinalAggregate {
                 params,
                 flush_state,
                 statistics: AggregationStatistics::new("NewFinalAggregate"),
+                id,
             },
         ))
     }
@@ -104,6 +107,9 @@ impl AccumulatingTransform for NewTransformFinalAggregate {
                 if let HashTable::AggregateHashTable(ht) = &mut self.hashtable {
                     match meta {
                         AggregateMeta::Serialized(payload) => {
+                            if payload.data_block.is_empty() {
+                                return Ok(vec![]);
+                            }
                             let rows = payload.data_block.num_rows();
                             let bytes = payload.data_block.memory_size();
                             self.statistics.record_block(rows, bytes);

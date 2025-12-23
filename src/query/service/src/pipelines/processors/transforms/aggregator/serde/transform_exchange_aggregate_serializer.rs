@@ -40,6 +40,7 @@ use databend_common_pipeline_transforms::processors::BlockMetaTransformer;
 use databend_common_pipeline_transforms::UnknownMode;
 use databend_common_settings::FlightCompression;
 use futures_util::future::BoxFuture;
+use itertools::Itertools;
 use log::info;
 use opendal::Operator;
 
@@ -169,8 +170,13 @@ impl BlockMetaTransform<ExchangeShuffleMeta> for TransformExchangeAggregateSeria
                 }
                 Some(AggregateMeta::Partitioned { data, .. }) => {
                     if index == self.local_pos {
+                        let blocks = data
+                            .into_iter()
+                            .map(|meta| DataBlock::empty_with_meta(Box::new(meta)))
+                            .collect::<Vec<_>>();
+
                         serialized_blocks.push(FlightSerialized::DataBlock(
-                            block.add_meta(Some(AggregateMeta::create_partitioned(None, data)))?,
+                            block.add_meta(Some(ExchangeShuffleMeta::create(blocks)))?,
                         ));
                         continue;
                     }
@@ -196,10 +202,7 @@ impl BlockMetaTransform<ExchangeShuffleMeta> for TransformExchangeAggregateSeria
 
                     let mut merged_block = DataBlock::concat(&payload_blocks)?;
                     merged_block = merged_block.add_meta(Some(
-                        AggregateSerdeMeta::create_partitioned_payload(
-                            buckets,
-                            payload_row_counts,
-                        ),
+                        AggregateSerdeMeta::create_partitioned_payload(buckets, payload_row_counts),
                     ))?;
 
                     let serialized = serialize_block(-1, merged_block, &self.options)?;

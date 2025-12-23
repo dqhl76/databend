@@ -15,10 +15,13 @@
 use std::sync::Arc;
 
 use databend_common_exception::Result;
+use databend_common_pipeline::core::InputPort;
+use databend_common_pipeline::core::OutputPort;
 use databend_common_pipeline::core::Pipe;
 use databend_common_pipeline::core::PipeItem;
 use databend_common_pipeline::core::Pipeline;
 use databend_common_pipeline::core::ProcessorPtr;
+use databend_common_pipeline::core::TransformPipeBuilder;
 use databend_common_storage::DataOperator;
 use tokio::sync::Semaphore;
 
@@ -35,11 +38,21 @@ fn build_partition_bucket_experimental(
     after_worker: usize,
     ctx: Arc<QueryContext>,
 ) -> Result<()> {
-    pipeline.add_transform(|input, output| {
-        Ok(ProcessorPtr::create(
-            NewTransformFinalAggregate::try_create(input, output, params.clone())?,
-        ))
-    })?;
+    let mut builder = TransformPipeBuilder::create();
+
+    for id in 0..pipeline.output_len() {
+        let input_port = InputPort::create();
+        let output_port = OutputPort::create();
+        let processor = NewTransformFinalAggregate::try_create(
+            input_port.clone(),
+            output_port.clone(),
+            params.clone(),
+            id,
+        )?;
+        builder.add_transform(input_port, output_port, ProcessorPtr::create(processor));
+    }
+
+    pipeline.add_pipe(builder.finalize());
 
     pipeline.resize(after_worker, true)?;
 

@@ -258,7 +258,11 @@ impl ExchangeInjector for AggregateInjector {
     }
 
     fn exchange_sorting(&self) -> Option<Arc<dyn ExchangeSorting>> {
-        Some(Arc::new(AggregateExchangeSorting {}))
+        if self.aggregator_params.enable_experiment_aggregate {
+            None
+        } else {
+            Some(Arc::new(AggregateExchangeSorting {}))
+        }
     }
 
     fn apply_merge_serializer(
@@ -344,40 +348,41 @@ impl ExchangeInjector for AggregateInjector {
         pipeline.add_transform(|input, output| {
             TransformAggregateDeserializer::try_create(input, output, &params.schema)
         })?;
-
-        let output_len = match &self.shuffle_mode {
-            AggregateShuffleMode::Row => {
-                let max_threads = self.ctx.get_settings().get_max_threads()? as usize;
-                pipeline.add_transform(|input, output| {
-                    Ok(ScatterTransform::create(
-                        input,
-                        output,
-                        Arc::new(Box::new(HashTableHashScatter {
-                            buckets: max_threads,
-                        })),
-                    ))
-                })?;
-                max_threads
-            }
-            AggregateShuffleMode::Bucket(hint) => {
-                let local_id = self.ctx.get_cluster().local_id.clone();
-                let thread_hint = hint
-                    .iter()
-                    .find(|(id, _)| *id == local_id)
-                    .expect("this node not in hint")
-                    .1 as usize;
-                thread_hint
-            }
-        };
-        let input_len = pipeline.output_len();
-        let transform = ExchangeShuffleTransform::create(input_len, output_len, output_len);
-        let inputs = transform.get_inputs();
-        let outputs = transform.get_outputs();
-        pipeline.add_pipe(Pipe::create(input_len, output_len, vec![PipeItem::create(
-            ProcessorPtr::create(Box::new(transform)),
-            inputs,
-            outputs,
-        )]));
+        if self.aggregator_params.enable_experiment_aggregate {
+            let output_len = match &self.shuffle_mode {
+                AggregateShuffleMode::Row => {
+                    let max_threads = self.ctx.get_settings().get_max_threads()? as usize;
+                    pipeline.add_transform(|input, output| {
+                        Ok(ScatterTransform::create(
+                            input,
+                            output,
+                            Arc::new(Box::new(HashTableHashScatter {
+                                buckets: max_threads,
+                            })),
+                        ))
+                    })?;
+                    max_threads
+                }
+                AggregateShuffleMode::Bucket(hint) => {
+                    let local_id = self.ctx.get_cluster().local_id.clone();
+                    let thread_hint = hint
+                        .iter()
+                        .find(|(id, _)| *id == local_id)
+                        .expect("this node not in hint")
+                        .1 as usize;
+                    thread_hint
+                }
+            };
+            let input_len = pipeline.output_len();
+            let transform = ExchangeShuffleTransform::create(input_len, output_len, output_len);
+            let inputs = transform.get_inputs();
+            let outputs = transform.get_outputs();
+            pipeline.add_pipe(Pipe::create(input_len, output_len, vec![PipeItem::create(
+                ProcessorPtr::create(Box::new(transform)),
+                inputs,
+                outputs,
+            )]));
+        }
         Ok(())
     }
 }
