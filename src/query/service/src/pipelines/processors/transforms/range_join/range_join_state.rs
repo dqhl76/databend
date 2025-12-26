@@ -208,9 +208,11 @@ impl RangeJoinState {
 
     pub(crate) fn partition(&self) -> Result<()> {
         let max_threads = self.ctx.get_settings().get_max_threads()? as usize;
-        let left_table = self.left_table.read();
+        let mut left_table = self.left_table.write();
+        left_table.retain(|b| b.num_rows() > 0);
         // Right table is bigger than left table
         let mut right_table = self.right_table.write();
+        right_table.retain(|b| b.num_rows() > 0);
         if !left_table.is_empty()
             && !right_table.is_empty()
             && left_table.len() * right_table.len() < max_threads
@@ -236,6 +238,9 @@ impl RangeJoinState {
 
         let mut current_rows = 0;
         for left_block in left_table.iter() {
+            if left_block.num_rows() == 0 {
+                continue;
+            }
             // Generate keys block by join keys
             // For example, if join keys are [t1.a + t2.b, t1.c], then key blocks will contain two columns: [t1.a + t2.b, t1.c]
             // We can get the key blocks by evaluating the join keys expressions on the block
@@ -266,6 +271,9 @@ impl RangeJoinState {
 
         current_rows = 0;
         for right_block in right_table.iter() {
+            if right_block.num_rows() == 0 {
+                continue;
+            }
             // Generate keys block by join keys
             // For example, if join keys are [t1.a + t2.b, t1.c], then key blocks will contain two columns: [t1.a + t2.b, t1.c]
             // We can get the key blocks by evaluating the join keys expressions on the block
