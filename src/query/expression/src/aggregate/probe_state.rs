@@ -35,6 +35,7 @@ pub struct ProbeState {
     pub(super) group_compare_vector: [RowID; BATCH_SIZE],
     pub(super) no_match_vector: [RowID; BATCH_SIZE],
     pub(super) slots: [usize; BATCH_SIZE],
+    pub(super) probe_distances: [usize; BATCH_SIZE],
     pub(super) row_count: usize,
 
     pub partition_entries: Vec<(u16, SelectVector)>,
@@ -51,6 +52,7 @@ impl Default for ProbeState {
             no_match_vector: [RowID::default(); BATCH_SIZE],
             empty_vector: [RowID::default(); BATCH_SIZE],
             slots: [0; BATCH_SIZE],
+            probe_distances: [0; BATCH_SIZE],
 
             row_count: 0,
             partition_entries: vec![],

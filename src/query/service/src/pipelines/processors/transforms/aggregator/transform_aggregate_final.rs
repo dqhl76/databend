@@ -20,11 +20,13 @@ use databend_common_expression::AggregateHashTable;
 use databend_common_expression::DataBlock;
 use databend_common_expression::HashTableConfig;
 use databend_common_expression::PayloadFlushState;
+use databend_common_expression::ProbeBatchStat;
 use databend_common_pipeline::core::InputPort;
 use databend_common_pipeline::core::OutputPort;
 use databend_common_pipeline::core::Processor;
 use databend_common_pipeline_transforms::processors::BlockMetaTransform;
 use databend_common_pipeline_transforms::processors::BlockMetaTransformer;
+use log::info;
 
 use crate::pipelines::processors::transforms::aggregator::AggregatorParams;
 use crate::pipelines::processors::transforms::aggregator::aggregate_meta::AggregateMeta;
@@ -112,6 +114,9 @@ impl TransformFinalAggregate {
             let mut blocks = vec![];
             self.flush_state.clear();
 
+            let probe_stats = ht.take_probe_batch_stats();
+            log_probe_batch_stats(&probe_stats);
+
             loop {
                 if ht.merge_result(&mut self.flush_state)? {
                     let mut entries = self.flush_state.take_aggregate_results();
@@ -131,6 +136,23 @@ impl TransformFinalAggregate {
         }
 
         Ok(self.params.empty_result_block())
+    }
+}
+
+fn log_probe_batch_stats(stats: &[ProbeBatchStat]) {
+    if stats.is_empty() {
+        return;
+    }
+
+    info!(
+        "hash_index probe_distance batches: total_batches={}",
+        stats.len()
+    );
+    for stat in stats {
+        info!(
+            "hash_index probe_distance batch={} count={} avg={:.3} median={:.3}",
+            stat.batch_index, stat.row_count, stat.avg_probe_distance, stat.median_probe_distance
+        );
     }
 }
 

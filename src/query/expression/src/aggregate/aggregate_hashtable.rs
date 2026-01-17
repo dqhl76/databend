@@ -26,6 +26,7 @@ use super::HashTableConfig;
 use super::LOAD_FACTOR;
 use super::MAX_PAGE_SIZE;
 use super::Payload;
+use super::ProbeBatchStat;
 use super::group_hash_entries;
 use super::hash_index::AdapterImpl;
 use super::hash_index::HashIndex;
@@ -113,6 +114,8 @@ impl AggregateHashTable {
                 count: 0,
                 capacity,
                 capacity_mask: capacity - 1,
+                probe_batch_stats: Vec::new(),
+                probe_batch_index: 0,
             },
             config,
             hash_index_resize_count: 0,
@@ -402,7 +405,10 @@ impl AggregateHashTable {
                 return;
             }
             self.hash_index_resize_count += 1;
-            self.hash_index = HashIndex::with_capacity(new_capacity);
+            let mut hash_index = HashIndex::with_capacity(new_capacity);
+            hash_index.probe_batch_stats = std::mem::take(&mut self.hash_index.probe_batch_stats);
+            hash_index.probe_batch_index = self.hash_index.probe_batch_index;
+            self.hash_index = hash_index;
             return;
         }
 
@@ -433,6 +439,8 @@ impl AggregateHashTable {
             }
         }
 
+        hash_index.probe_batch_stats = std::mem::take(&mut self.hash_index.probe_batch_stats);
+        hash_index.probe_batch_index = self.hash_index.probe_batch_index;
         self.hash_index = hash_index
     }
 
@@ -462,5 +470,9 @@ impl AggregateHashTable {
 
     pub fn hash_index_resize_count(&self) -> usize {
         self.hash_index_resize_count
+    }
+
+    pub fn take_probe_batch_stats(&mut self) -> Vec<ProbeBatchStat> {
+        self.hash_index.take_probe_batch_stats()
     }
 }

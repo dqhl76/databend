@@ -36,6 +36,7 @@ pub use aggregate_function_state::*;
 pub use aggregate_hashtable::*;
 pub use group_hash::*;
 use hash_index::Entry;
+pub use hash_index::ProbeBatchStat;
 pub use partitioned_payload::*;
 pub use payload::*;
 pub use payload_flush::*;

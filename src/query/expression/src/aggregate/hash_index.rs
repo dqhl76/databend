@@ -26,9 +26,19 @@ pub(super) struct HashIndex {
     pub count: usize,
     pub capacity: usize,
     pub capacity_mask: usize,
+    pub probe_batch_stats: Vec<ProbeBatchStat>,
+    pub probe_batch_index: usize,
 }
 
 const INCREMENT_BITS: usize = 5;
+
+#[derive(Clone, Debug)]
+pub struct ProbeBatchStat {
+    pub batch_index: usize,
+    pub row_count: usize,
+    pub avg_probe_distance: f64,
+    pub median_probe_distance: f64,
+}
 
 /// Derive an odd probing step from the high bits of the hash so the walk spans all slots.
 ///
@@ -60,26 +70,30 @@ impl HashIndex {
             count: 0,
             capacity,
             capacity_mask,
+            probe_batch_stats: Vec::new(),
+            probe_batch_index: 0,
         }
     }
 
-    fn find_or_insert(&mut self, mut slot: usize, hash: u64) -> (usize, bool) {
+    fn find_or_insert(&mut self, mut slot: usize, hash: u64) -> (usize, bool, usize) {
         let salt = Entry::hash_to_salt(hash);
         let entries = self.entries.as_mut_slice();
+        let mut probe_distance = 0;
         loop {
             debug_assert!(entries.get(slot).is_some());
             // SAFETY: slot is always in range
             let entry = unsafe { entries.get_unchecked_mut(slot) };
             if entry.is_occupied() {
                 if entry.get_salt() == salt {
-                    return (slot, false);
+                    return (slot, false, probe_distance);
                 } else {
                     slot = next_slot(slot, hash, self.capacity_mask);
+                    probe_distance += 1;
                     continue;
                 }
             } else {
                 entry.set_salt(salt);
-                return (slot, true);
+                return (slot, true, probe_distance);
             }
         }
     }
@@ -186,6 +200,7 @@ impl HashIndex {
         for (i, row) in state.no_match_vector[..row_count].iter_mut().enumerate() {
             *row = i.into();
             state.slots[i] = init_slot(state.group_hashes[i], self.capacity_mask);
+            state.probe_distances[i] = 0;
         }
 
         let mut new_group_count = 0;
@@ -199,9 +214,10 @@ impl HashIndex {
             // 1. inject new_group_count, new_entry_count, need_compare_count, no_match_count
             for row in state.no_match_vector[..remaining_entries].iter().copied() {
                 let slot = &mut state.slots[row];
-                let is_new;
-
-                (*slot, is_new) = self.find_or_insert(*slot, state.group_hashes[row]);
+                let (new_slot, is_new, probe_distance) =
+                    self.find_or_insert(*slot, state.group_hashes[row]);
+                *slot = new_slot;
+                state.probe_distances[row.to_usize()] += probe_distance;
                 if is_new {
                     state.empty_vector[new_entry_count] = row;
                     new_entry_count += 1;
@@ -246,13 +262,45 @@ impl HashIndex {
                 let slot = &mut state.slots[row];
                 let hash = state.group_hashes[row];
                 *slot = next_slot(*slot, hash, self.capacity_mask);
+                state.probe_distances[row.to_usize()] += 1;
             }
             remaining_entries = no_match_count;
         }
 
+        self.record_probe_batch_stats(&state.probe_distances[..row_count]);
         self.count += new_group_count;
 
         new_group_count
+    }
+
+    fn record_probe_batch_stats(&mut self, probe_distances: &[usize]) {
+        if probe_distances.is_empty() {
+            return;
+        }
+
+        let mut distances = probe_distances.to_vec();
+        let count = distances.len();
+        let sum: u64 = distances.iter().map(|value| *value as u64).sum();
+        let avg = sum as f64 / count as f64;
+
+        distances.sort_unstable();
+        let median = if count % 2 == 1 {
+            distances[count / 2] as f64
+        } else {
+            (distances[count / 2 - 1] as f64 + distances[count / 2] as f64) / 2.0
+        };
+
+        self.probe_batch_stats.push(ProbeBatchStat {
+            batch_index: self.probe_batch_index,
+            row_count: count,
+            avg_probe_distance: avg,
+            median_probe_distance: median,
+        });
+        self.probe_batch_index += 1;
+    }
+
+    pub fn take_probe_batch_stats(&mut self) -> Vec<ProbeBatchStat> {
+        std::mem::take(&mut self.probe_batch_stats)
     }
 }
 
