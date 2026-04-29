@@ -39,6 +39,7 @@ fn run_hooks(query_ctx: Arc<QueryContext>) -> Result<()> {
 /// create temporary artifacts (e.g. EXPLAIN ANALYZE, EXPLAIN PERF inner pipelines),
 /// and [`QueryFinishHooks::nested`] for lightweight internal pipelines that don't
 /// need cleanup (e.g. recursive CTE inner pipeline).
+#[derive(Clone, Copy)]
 pub struct QueryFinishHooks {
     /// Collect pipeline execution profiles into the query context.
     pub collect_profiles: bool,
