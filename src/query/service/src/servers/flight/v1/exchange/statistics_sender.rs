@@ -35,6 +35,7 @@ use crate::servers::flight::FlightExchange;
 use crate::servers::flight::FlightSender;
 use crate::servers::flight::v1::packets::DataPacket;
 use crate::servers::flight::v1::packets::ProgressInfo;
+use crate::servers::flight::v1::packets::QueryProfilesPacket;
 use crate::sessions::QueryContext;
 use crate::sessions::TableContext;
 use crate::sessions::TableContextPartitionStats;
@@ -116,7 +117,10 @@ impl StatisticsSender {
                         }
                     }
 
-                    if let Err(error) = Self::send_final_profile(profile_rx, &tx).await {
+                    if let Err(error) =
+                        Self::send_final_profile(executor.profile_execution_id(), profile_rx, &tx)
+                            .await
+                    {
                         warn!("Final profiles send has error, cause: {:?}.", error);
                     }
 
@@ -233,7 +237,10 @@ impl StatisticsSender {
         let plans_profile = executor.fetch_profiling(collect_metrics);
 
         if !plans_profile.is_empty() {
-            let data_packet = DataPacket::QueryProfiles(plans_profile);
+            let data_packet = DataPacket::QueryProfiles(QueryProfilesPacket {
+                profile_execution_id: executor.profile_execution_id().to_string(),
+                profiles: plans_profile,
+            });
             tx.send(data_packet).await?;
         }
 
@@ -254,6 +261,7 @@ impl StatisticsSender {
 
     #[async_backtrace::framed]
     async fn send_final_profile(
+        profile_execution_id: &str,
         mut rx: oneshot::Receiver<HashMap<u32, PlanProfile>>,
         tx: &FlightSender,
     ) -> Result<()> {
@@ -262,7 +270,10 @@ impl StatisticsSender {
         // guarantees that on_finish is called before the statistics sender shuts down.
         if let Ok(plans_profile) = rx.try_recv() {
             if !plans_profile.is_empty() {
-                let data_packet = DataPacket::QueryProfiles(plans_profile);
+                let data_packet = DataPacket::QueryProfiles(QueryProfilesPacket {
+                    profile_execution_id: profile_execution_id.to_string(),
+                    profiles: plans_profile,
+                });
                 tx.send(data_packet).await?;
             }
         }
