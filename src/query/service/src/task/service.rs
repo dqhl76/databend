@@ -1123,7 +1123,9 @@ WHERE ta.task_name = '{task_name}'
         );
         let (plan, _) = planner.plan_sql(sql).await?;
         let executor = InterpreterFactory::get(context.clone(), &plan).await?;
-        let stream = executor.execute_with_hooks(context, QueryFinishHooks::nested()).await?;
+        let stream = executor
+            .execute_with_hooks(context, QueryFinishHooks::nested())
+            .await?;
         stream.try_collect::<Vec<DataBlock>>().await
     }
 

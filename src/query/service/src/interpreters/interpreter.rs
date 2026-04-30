@@ -91,7 +91,6 @@ pub trait Interpreter: Sync + Send {
             .await
     }
 
-
     /// Build and run the pipeline with the given lifecycle hooks.
     /// All logging (start/finish) is handled here based on `hooks.log_finished`.
     async fn execute_with_hooks(

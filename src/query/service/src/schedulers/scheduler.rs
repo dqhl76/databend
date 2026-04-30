@@ -171,7 +171,9 @@ impl QueryExecutor for ServiceQueryExecutor {
             let mut planner = Planner::new(self.ctx.clone());
             let (plan, _) = planner.plan_sql(query_sql).await?;
             let interpreter = InterpreterFactory::get(self.ctx.clone(), &plan).await?;
-            let stream = interpreter.execute_with_hooks(self.ctx.clone(), QueryFinishHooks::nested()).await?;
+            let stream = interpreter
+                .execute_with_hooks(self.ctx.clone(), QueryFinishHooks::nested())
+                .await?;
             let blocks = stream.try_collect::<Vec<_>>().await?;
             Ok(blocks)
         }

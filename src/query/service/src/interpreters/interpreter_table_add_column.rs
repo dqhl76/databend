@@ -245,7 +245,9 @@ impl Interpreter for AddTableColumnInterpreter {
                     schema,
                     mutation.metadata.clone(),
                 )?;
-                let _ = interpreter.execute_with_hooks(self.ctx.clone(), QueryFinishHooks::nested()).await?;
+                let _ = interpreter
+                    .execute_with_hooks(self.ctx.clone(), QueryFinishHooks::nested())
+                    .await?;
                 return Ok(PipelineBuildResult::create());
             }
         }
