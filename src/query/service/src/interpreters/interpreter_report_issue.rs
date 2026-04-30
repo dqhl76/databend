@@ -144,7 +144,10 @@ impl ReportIssueInterpreter {
             }
         };
 
-        let mut data_stream = match interpreter.execute_with_hooks(self.ctx.clone(), QueryFinishHooks::nested()).await {
+        let mut data_stream = match interpreter
+            .execute_with_hooks(self.ctx.clone(), QueryFinishHooks::nested())
+            .await
+        {
             Ok(data_stream) => data_stream,
             Err(error) => {
                 report_context.add_report_error(error);

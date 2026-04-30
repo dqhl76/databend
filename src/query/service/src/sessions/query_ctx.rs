@@ -509,6 +509,27 @@ impl QueryContext {
         self.shared.set_executor(weak_ptr)
     }
 
+    pub fn add_query_profiles(&self, profiles: &HashMap<u32, PlanProfile>) {
+        self.shared.add_query_profiles(profiles);
+    }
+
+    pub fn add_query_profiles_with_execution(
+        &self,
+        profile_execution_id: &str,
+        profiles: &HashMap<u32, PlanProfile>,
+    ) {
+        self.shared
+            .add_query_profiles_with_execution(profile_execution_id, profiles);
+    }
+
+    pub fn get_query_profiles_for_execution(
+        &self,
+        profile_execution_id: &str,
+    ) -> HashMap<u32, PlanProfile> {
+        self.shared
+            .get_query_profiles_for_execution(profile_execution_id)
+    }
+
     pub fn attach_stage(&self, attachment: StageAttachment) {
         self.shared.attach_stage(attachment);
     }

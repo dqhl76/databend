@@ -63,12 +63,18 @@ impl Debug for FragmentData {
     }
 }
 
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct QueryProfilesPacket {
+    pub profile_execution_id: String,
+    pub profiles: HashMap<u32, PlanProfile>,
+}
+
 #[derive(Debug)]
 pub enum DataPacket {
     ErrorCode(ErrorCode),
     Dictionary(FlightData),
     FragmentData(FragmentData),
-    QueryProfiles(HashMap<u32, PlanProfile>),
+    QueryProfiles(QueryProfilesPacket),
     SerializeProgress(Vec<ProgressInfo>),
     CopyStatus(CopyStatus),
     MutationStatus(MutationStatus),
@@ -205,8 +211,7 @@ impl TryFrom<FlightData> for DataPacket {
             )?)),
             0x02 => Ok(DataPacket::ErrorCode(ErrorCode::try_from(flight_data)?)),
             0x03 => {
-                let status =
-                    serde_json::from_slice::<HashMap<u32, PlanProfile>>(&flight_data.data_body)?;
+                let status = serde_json::from_slice::<QueryProfilesPacket>(&flight_data.data_body)?;
                 Ok(DataPacket::QueryProfiles(status))
             }
             0x04 => {

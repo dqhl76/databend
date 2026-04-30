@@ -37,11 +37,28 @@ pub enum CallbackType {
 pub struct ExecutionInfo {
     pub res: Result<()>,
     pub profiling: HashMap<u32, PlanProfile>,
+    pub profile_execution_id: Option<String>,
 }
 
 impl ExecutionInfo {
     pub fn create(res: Result<()>, profiling: HashMap<u32, PlanProfile>) -> ExecutionInfo {
-        ExecutionInfo { res, profiling }
+        ExecutionInfo {
+            res,
+            profiling,
+            profile_execution_id: None,
+        }
+    }
+
+    pub fn create_with_profile_execution_id(
+        res: Result<()>,
+        profiling: HashMap<u32, PlanProfile>,
+        profile_execution_id: String,
+    ) -> ExecutionInfo {
+        ExecutionInfo {
+            res,
+            profiling,
+            profile_execution_id: Some(profile_execution_id),
+        }
     }
 }
 

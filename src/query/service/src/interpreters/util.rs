@@ -161,7 +161,9 @@ impl Client for ScriptClient {
         let plan = planner.plan_stmt(&extras.statement, false).await?;
 
         let interpreter = InterpreterFactory::get(ctx.clone(), &plan).await?;
-        let stream = interpreter.execute_with_hooks(ctx.clone(), QueryFinishHooks::nested()).await?;
+        let stream = interpreter
+            .execute_with_hooks(ctx.clone(), QueryFinishHooks::nested())
+            .await?;
         let blocks = stream.try_collect::<Vec<_>>().await?;
         let mut schema = plan.schema();
         if let Some(real_schema) = interpreter.get_dynamic_schema().await {

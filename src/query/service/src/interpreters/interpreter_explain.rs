@@ -67,7 +67,6 @@ use crate::sessions::QueryContext;
 use crate::sessions::TableContext;
 use crate::sessions::TableContextPartitionStats;
 use crate::sessions::TableContextQueryIdentity;
-use crate::sessions::TableContextQueryProfile;
 use crate::sessions::TableContextRuntimeFilter;
 use crate::sessions::TableContextSettings;
 use crate::sql::optimizer::ir::SExpr;
@@ -545,6 +544,7 @@ impl ExplainInterpreter {
         let settings = self.ctx.get_settings();
         build_res.set_max_threads(settings.get_max_threads()? as usize);
         let settings = ExecutorSettings::try_create(self.ctx.clone())?;
+        let profile_execution_id = settings.profile_execution_id.clone();
         let ctx = self.ctx.clone();
         build_res.main_pipeline.set_on_finished(always_callback(
             QueryFinishHooks::nested_with_hooks().into_callback(ctx.clone()),
@@ -565,11 +565,7 @@ impl ExplainInterpreter {
         }
         Ok(self
             .ctx
-            .get_query_profiles()
-            .into_iter()
-            .filter(|x| x.id.is_some())
-            .map(|x| (x.id.unwrap(), x))
-            .collect::<HashMap<_, _>>())
+            .get_query_profiles_for_execution(&profile_execution_id))
     }
 
     async fn explain_query(

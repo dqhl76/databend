@@ -32,7 +32,6 @@ use crate::sessions::QueryContext;
 use crate::sessions::TableContext;
 use crate::sessions::TableContextPartitionStats;
 use crate::sessions::TableContextPerf;
-use crate::sessions::TableContextQueryProfile;
 use crate::sessions::TableContextTelemetry;
 
 pub struct StatisticsReceiver {
@@ -166,8 +165,11 @@ impl StatisticsReceiver {
 
                 Ok(false)
             }
-            Ok(Some(DataPacket::QueryProfiles(profiles))) => {
-                ctx.add_query_profiles(&profiles);
+            Ok(Some(DataPacket::QueryProfiles(packet))) => {
+                ctx.add_query_profiles_with_execution(
+                    &packet.profile_execution_id,
+                    &packet.profiles,
+                );
                 Ok(false)
             }
             Ok(Some(DataPacket::CopyStatus(status))) => {

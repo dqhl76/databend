@@ -221,7 +221,9 @@ impl GlobalHistoryLog {
         let mut planner = Planner::new(context.clone());
         let (plan, _) = planner.plan_sql(sql).await?;
         let executor = InterpreterFactory::get(context.clone(), &plan).await?;
-        let stream = executor.execute_with_hooks(context, QueryFinishHooks::nested()).await?;
+        let stream = executor
+            .execute_with_hooks(context, QueryFinishHooks::nested())
+            .await?;
         let _: Vec<DataBlock> = stream.try_collect::<Vec<_>>().await?;
         Ok(())
     }

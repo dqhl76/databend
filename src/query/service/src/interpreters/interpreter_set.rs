@@ -205,7 +205,9 @@ impl Interpreter for SetInterpreter {
                     false,
                 )?;
 
-                let stream = select_interpreter.execute_with_hooks(self.ctx.clone(), QueryFinishHooks::nested()).await?;
+                let stream = select_interpreter
+                    .execute_with_hooks(self.ctx.clone(), QueryFinishHooks::nested())
+                    .await?;
                 let datablocks: Vec<DataBlock> = stream.try_collect::<Vec<_>>().await?;
                 let datablock = DataBlock::concat(&datablocks)?;
 

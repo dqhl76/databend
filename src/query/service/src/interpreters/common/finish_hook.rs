@@ -24,7 +24,6 @@ use crate::interpreters::hook::vacuum_hook::hook_disk_temp_dir;
 use crate::interpreters::hook::vacuum_hook::hook_vacuum_temp_files;
 use crate::sessions::QueryContext;
 use crate::sessions::TableContextPerf;
-use crate::sessions::TableContextQueryProfile;
 
 fn run_hooks(query_ctx: Arc<QueryContext>) -> Result<()> {
     hook_clear_m_cte_temp_table(&query_ctx)?;
@@ -94,7 +93,12 @@ impl QueryFinishHooks {
                 ctx.collect_local_perf_counters(node_id);
             }
             if self.collect_profiles {
-                ctx.add_query_profiles(&info.profiling);
+                match info.profile_execution_id.as_deref() {
+                    Some(profile_execution_id) => {
+                        ctx.add_query_profiles_with_execution(profile_execution_id, &info.profiling)
+                    }
+                    None => ctx.add_query_profiles(&info.profiling),
+                }
             }
             let hooks_res = if self.run_hooks {
                 run_hooks(ctx.clone())
