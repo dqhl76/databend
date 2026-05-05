@@ -102,15 +102,20 @@ pub trait Interpreter: Sync + Send {
             log_query_start(&ctx);
         }
 
-        match build_and_run_pipeline(self, ctx.clone(), hooks).await {
-            Ok(stream) => Ok(stream),
+        // `on_finished` is installed during build_pipeline_before_execute.
+        // Failures before that need finish logging here; later execution
+        // failures are logged by the pipeline callback.
+        let built_pipeline = match build_pipeline_before_execute(self, ctx.clone(), hooks).await {
+            Ok(built_pipeline) => built_pipeline,
             Err(err) => {
                 if hooks.log_finished {
                     log_query_finished(&ctx, Some(err.clone()));
                 }
-                Err(err)
+                return Err(err);
             }
-        }
+        };
+
+        execute_built_pipeline(self, ctx, built_pipeline).await
     }
 
     async fn get_dynamic_schema(&self) -> Option<DataSchemaRef> {
@@ -134,11 +139,17 @@ pub trait Interpreter: Sync + Send {
 
 pub type InterpreterPtr = Arc<dyn Interpreter>;
 
-async fn build_and_run_pipeline(
+enum BuiltPipeline {
+    Finished(SendableDataBlockStream),
+    Complete(Arc<PipelineCompleteExecutor>),
+    Pulling(PipelinePullingExecutor),
+}
+
+async fn build_pipeline_before_execute(
     interpreter: &(impl Interpreter + ?Sized),
     ctx: Arc<QueryContext>,
     hooks: QueryFinishHooks,
-) -> Result<SendableDataBlockStream> {
+) -> Result<BuiltPipeline> {
     {
         let mutation_status = ctx.mutation_state().mutation_status();
         let mut mutation_status = mutation_status.write().unwrap();
@@ -177,7 +188,10 @@ async fn build_and_run_pipeline(
         if hooks.log_finished {
             log_query_finished(&ctx, None);
         }
-        return Ok(Box::pin(DataBlockStream::create(None, vec![])));
+        return Ok(BuiltPipeline::Finished(Box::pin(DataBlockStream::create(
+            None,
+            vec![],
+        ))));
     }
 
     let query_ctx = ctx.clone();
@@ -198,16 +212,30 @@ async fn build_and_run_pipeline(
         let complete_executor = PipelineCompleteExecutor::from_pipelines(pipelines, settings)?;
 
         ctx.set_executor(complete_executor.get_inner())?;
-        complete_executor.execute()?;
-        interpreter.inject_result()
+        Ok(BuiltPipeline::Complete(complete_executor))
     } else {
         let pulling_executor = PipelinePullingExecutor::from_pipelines(build_res, settings)?;
 
         ctx.set_executor(pulling_executor.get_inner())?;
-        Ok(Box::pin(ProgressStream::try_create(
+        Ok(BuiltPipeline::Pulling(pulling_executor))
+    }
+}
+
+async fn execute_built_pipeline(
+    interpreter: &(impl Interpreter + ?Sized),
+    ctx: Arc<QueryContext>,
+    built_pipeline: BuiltPipeline,
+) -> Result<SendableDataBlockStream> {
+    match built_pipeline {
+        BuiltPipeline::Finished(stream) => Ok(stream),
+        BuiltPipeline::Complete(complete_executor) => {
+            complete_executor.execute()?;
+            interpreter.inject_result()
+        }
+        BuiltPipeline::Pulling(pulling_executor) => Ok(Box::pin(ProgressStream::try_create(
             Box::pin(PullingExecutorStream::create(pulling_executor)?),
             ctx.get_result_progress(),
-        )?))
+        )?)),
     }
 }
 
