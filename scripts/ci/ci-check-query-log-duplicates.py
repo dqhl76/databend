@@ -17,6 +17,9 @@ LOG_TYPE_FINISH = 2
 LOG_TYPE_ERROR = 3
 LOG_TYPE_ABORTED = 4
 
+DEFAULT_LOG_DIR = ".databend/logs_1/query-details"
+
+
 def scan_log_files(log_dir):
     counts = defaultdict(lambda: {"start": 0, "terminal": 0})
     total_lines = 0
@@ -72,5 +75,5 @@ def scan_log_files(log_dir):
 
 
 if __name__ == "__main__":
-    log_dir = sys.argv[1] if len(sys.argv) > 1 else ".databend/query-details"
+    log_dir = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_LOG_DIR
     sys.exit(scan_log_files(log_dir))
