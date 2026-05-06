@@ -80,12 +80,14 @@ struct ApplyState {
 
 pub struct FinishedCallbackChain {
     chain: VecDeque<(&'static Location<'static>, Box<dyn Callback>)>,
+    applied: bool,
 }
 
 impl FinishedCallbackChain {
     pub fn create() -> FinishedCallbackChain {
         FinishedCallbackChain {
             chain: VecDeque::new(),
+            applied: false,
         }
     }
 
@@ -98,6 +100,11 @@ impl FinishedCallbackChain {
     }
 
     pub fn apply(&mut self, mut info: ExecutionInfo) -> Result<()> {
+        if self.applied {
+            return Ok(());
+        }
+        self.applied = true;
+
         let chain = std::mem::take(&mut self.chain);
 
         let mut states = Vec::with_capacity(chain.len());
@@ -533,6 +540,44 @@ mod tests {
         );
 
         assert_eq!(seq.load(Ordering::SeqCst), 13);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_finished_callback_chain_apply_exactly_once() -> Result<()> {
+        let mut chain = FinishedCallbackChain::create();
+
+        let seq = Arc::new(AtomicUsize::new(0));
+        chain.push_back(
+            Location::caller(),
+            Box::new({
+                let seq = seq.clone();
+                move |_info: &ExecutionInfo| {
+                    seq.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }
+            }),
+        );
+
+        chain.apply(ExecutionInfo::create(Ok(()), HashMap::new()))?;
+        chain.apply(ExecutionInfo::create(Ok(()), HashMap::new()))?;
+
+        let mut other = FinishedCallbackChain::create();
+        other.push_back(
+            Location::caller(),
+            Box::new({
+                let seq = seq.clone();
+                move |_info: &ExecutionInfo| {
+                    seq.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }
+            }),
+        );
+        chain.extend(other);
+        chain.apply(ExecutionInfo::create(Ok(()), HashMap::new()))?;
+
+        assert_eq!(seq.load(Ordering::SeqCst), 1);
 
         Ok(())
     }

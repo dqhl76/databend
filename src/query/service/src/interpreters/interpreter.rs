@@ -103,12 +103,20 @@ pub trait Interpreter: Sync + Send {
         }
 
         // `on_finished` is installed during build_pipeline_before_execute.
-        // Failures before that need finish logging here; later execution
-        // failures are logged by the pipeline callback.
-        let built_pipeline = match build_pipeline_before_execute(self, ctx.clone(), hooks).await {
+        // Failures before that need finish logging here; after that, even
+        // build/start failures are owned by the pipeline callback/drop path.
+        let mut finish_hook_installed = false;
+        let built_pipeline = match build_pipeline_before_execute(
+            self,
+            ctx.clone(),
+            hooks,
+            &mut finish_hook_installed,
+        )
+        .await
+        {
             Ok(built_pipeline) => built_pipeline,
             Err(err) => {
-                if hooks.log_finished {
+                if hooks.log_finished && !finish_hook_installed {
                     log_query_finished(&ctx, Some(err.clone()));
                 }
                 return Err(err);
@@ -149,6 +157,7 @@ async fn build_pipeline_before_execute(
     interpreter: &(impl Interpreter + ?Sized),
     ctx: Arc<QueryContext>,
     hooks: QueryFinishHooks,
+    finish_hook_installed: &mut bool,
 ) -> Result<BuiltPipeline> {
     {
         let mutation_status = ctx.mutation_state().mutation_status();
@@ -198,6 +207,7 @@ async fn build_pipeline_before_execute(
     build_res
         .main_pipeline
         .set_on_finished(always_callback(hooks.into_callback(query_ctx)));
+    *finish_hook_installed = true;
 
     ctx.set_status_info("Executing pipeline");
 

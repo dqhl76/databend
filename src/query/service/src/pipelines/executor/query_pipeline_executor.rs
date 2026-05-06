@@ -545,18 +545,13 @@ impl Drop for QueryPipelineExecutor {
             None => ErrorCode::Internal("Pipeline illegal state: not successfully shutdown"),
         };
 
-        let mut on_finished_chain = self.on_finished_chain.lock();
-
-        // untracking for on finished
-        let tracking_payload = ThreadTracker::new_tracking_payload();
-        let _guard = ThreadTracker::tracking(tracking_payload);
         let profiling = self.fetch_plans_profile(true);
         let info = ExecutionInfo::create_with_profile_execution_id(
             Err(cause),
             profiling,
             self.profile_execution_id().to_string(),
         );
-        if let Err(cause) = on_finished_chain.apply(info) {
+        if let Err(cause) = self.on_finished(info) {
             warn!("Shutdown failure: {:?}", cause);
         }
     }
