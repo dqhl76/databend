@@ -16,12 +16,13 @@ use std::sync::Arc;
 use std::sync::PoisonError;
 
 use databend_common_base::base::ProgressValues;
+use databend_common_base::runtime::ThreadTracker;
+use databend_common_exception::ErrorCode;
 use databend_common_exception::Result;
 use databend_common_expression::BlockEntry;
 use databend_common_expression::Column;
 use databend_common_expression::DataBlock;
 use databend_common_expression::SELECTIVITY_THRESHOLD;
-use databend_common_pipeline::core::check_interrupt;
 
 use crate::pipelines::processors::transforms::BasicHashJoinState;
 use crate::pipelines::processors::transforms::GraceMemoryJoin;
@@ -257,9 +258,7 @@ impl<'a> NestedLoopJoinStream<'a> {
 
 impl<'a> JoinStream for NestedLoopJoinStream<'a> {
     fn next(&mut self) -> Result<Option<DataBlock>> {
-        loop {
-            check_interrupt()?;
-
+        while !ThreadTracker::is_interrupted() {
             if self.matches.len() >= self.max_block_size {
                 return Ok(Some(self.emit_block(self.max_block_size)?));
             }
@@ -274,5 +273,7 @@ impl<'a> JoinStream for NestedLoopJoinStream<'a> {
 
             self.process_next_row()?;
         }
+
+        Err(ErrorCode::aborting())
     }
 }

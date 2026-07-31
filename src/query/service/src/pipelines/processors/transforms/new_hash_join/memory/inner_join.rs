@@ -17,6 +17,7 @@ use std::sync::Arc;
 use std::sync::PoisonError;
 
 use databend_common_base::base::ProgressValues;
+use databend_common_base::runtime::ThreadTracker;
 use databend_common_column::bitmap::Bitmap;
 use databend_common_exception::ErrorCode;
 use databend_common_exception::Result;
@@ -27,7 +28,6 @@ use databend_common_expression::FunctionContext;
 use databend_common_expression::HashMethodKind;
 use databend_common_expression::types::NullableColumn;
 use databend_common_expression::with_join_hash_method;
-use databend_common_pipeline::core::check_interrupt;
 use databend_common_settings::Settings;
 
 use super::basic::BasicHashJoin;
@@ -292,9 +292,7 @@ impl<'a> InnerHashJoinFilterStream<'a> {
 
 impl<'a> JoinStream for InnerHashJoinFilterStream<'a> {
     fn next(&mut self) -> Result<Option<DataBlock>> {
-        loop {
-            check_interrupt()?;
-
+        while !ThreadTracker::is_interrupted() {
             let Some(data_block) = self.inner.next()? else {
                 return Ok(None);
             };
@@ -311,5 +309,7 @@ impl<'a> JoinStream for InnerHashJoinFilterStream<'a> {
 
             return Ok(Some(data_block));
         }
+
+        Err(ErrorCode::aborting())
     }
 }

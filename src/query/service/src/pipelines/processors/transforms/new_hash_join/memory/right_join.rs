@@ -18,6 +18,7 @@ use std::sync::PoisonError;
 
 use databend_common_base::base::ProgressValues;
 use databend_common_base::hints::assume;
+use databend_common_base::runtime::ThreadTracker;
 use databend_common_exception::ErrorCode;
 use databend_common_exception::Result;
 use databend_common_expression::DataBlock;
@@ -26,7 +27,6 @@ use databend_common_expression::FunctionContext;
 use databend_common_expression::HashMethodKind;
 use databend_common_expression::types::DataType;
 use databend_common_expression::with_join_hash_method;
-use databend_common_pipeline::core::check_interrupt;
 
 use crate::pipelines::processors::HashJoinDesc;
 use crate::pipelines::processors::transforms::BasicHashJoinState;
@@ -211,9 +211,7 @@ unsafe impl<'a, const CONJUNCT: bool> Sync for OuterRightHashJoinStream<'a, CONJ
 
 impl<'a, const CONJUNCT: bool> JoinStream for OuterRightHashJoinStream<'a, CONJUNCT> {
     fn next(&mut self) -> Result<Option<DataBlock>> {
-        loop {
-            check_interrupt()?;
-
+        while !ThreadTracker::is_interrupted() {
             self.probed_rows.clear();
             let max_rows = self.probed_rows.matched_probe.capacity();
             self.probe_keys_stream.advance(self.probed_rows, max_rows)?;
@@ -293,6 +291,8 @@ impl<'a, const CONJUNCT: bool> JoinStream for OuterRightHashJoinStream<'a, CONJU
                 return Ok(Some(filter_executor.take(data_block, num_rows, res_rows)?));
             }
         }
+
+        Err(ErrorCode::aborting())
     }
 }
 
@@ -328,8 +328,10 @@ struct OuterRightHashJoinFinalStream<'a> {
 
 impl<'a> JoinStream for OuterRightHashJoinFinalStream<'a> {
     fn next(&mut self) -> Result<Option<DataBlock>> {
-        while let Some((chunk_idx, row_idx)) = self.scan_progress.take() {
-            check_interrupt()?;
+        while !ThreadTracker::is_interrupted() {
+            let Some((chunk_idx, row_idx)) = self.scan_progress.take() else {
+                break;
+            };
 
             let scan_map = &self.join_state.scan_map[chunk_idx];
             let remain_rows = self.max_rows - self.scan_idx.len();
@@ -356,6 +358,10 @@ impl<'a> JoinStream for OuterRightHashJoinFinalStream<'a> {
             if self.scan_idx.len() >= self.max_rows {
                 break;
             }
+        }
+
+        if ThreadTracker::is_interrupted() {
+            return Err(ErrorCode::aborting());
         }
 
         if self.scan_idx.is_empty() {

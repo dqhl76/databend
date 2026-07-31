@@ -18,6 +18,7 @@ use std::sync::PoisonError;
 
 use databend_common_base::base::ProgressValues;
 use databend_common_base::hints::assume;
+use databend_common_base::runtime::ThreadTracker;
 use databend_common_column::bitmap::Bitmap;
 use databend_common_exception::ErrorCode;
 use databend_common_exception::Result;
@@ -28,7 +29,6 @@ use databend_common_expression::FunctionContext;
 use databend_common_expression::HashMethodKind;
 use databend_common_expression::types::NullableColumn;
 use databend_common_expression::with_join_hash_method;
-use databend_common_pipeline::core::check_interrupt;
 
 use crate::pipelines::processors::HashJoinDesc;
 use crate::pipelines::processors::transforms::BasicHashJoinState;
@@ -260,9 +260,7 @@ impl<'a> JoinStream for LeftSemiFilterHashJoinStream<'a> {
         let num_rows = probe_data_block.num_rows();
         let mut selected = vec![false; num_rows];
 
-        loop {
-            check_interrupt()?;
-
+        while !ThreadTracker::is_interrupted() {
             self.probed_rows.clear();
             let max_rows = self.probed_rows.matched_probe.capacity();
             self.probe_keys_stream.advance(self.probed_rows, max_rows)?;
@@ -348,6 +346,10 @@ impl<'a> JoinStream for LeftSemiFilterHashJoinStream<'a> {
                     selected[idx as usize] = true;
                 }
             }
+        }
+
+        if ThreadTracker::is_interrupted() {
+            return Err(ErrorCode::aborting());
         }
 
         let bitmap = Bitmap::from_trusted_len_iter(selected.into_iter());
