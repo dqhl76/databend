@@ -44,6 +44,8 @@ pub struct HybridHashJoinState {
     // Once set, it should never be cleared, so runtime filters stay disabled
     // for the lifetime of this join.
     pub ever_spilled: AtomicBool,
+    // This tracks logical build input independently of in-memory state, which is reset on spill.
+    has_build_input_rows: AtomicBool,
 
     pub transition_queue: ConcurrentQueue<DataBlock>,
 }
@@ -71,6 +73,7 @@ impl HybridHashJoinState {
             factory,
             spilled: AtomicBool::new(false),
             ever_spilled: AtomicBool::new(false),
+            has_build_input_rows: AtomicBool::new(false),
             transition_queue: ConcurrentQueue::unbounded(),
         }))
     }
@@ -90,6 +93,14 @@ impl HybridHashJoinState {
 
     pub fn has_spilled_once(&self) -> bool {
         self.ever_spilled.load(Ordering::Acquire)
+    }
+
+    pub fn mark_build_input_non_empty(&self) {
+        self.has_build_input_rows.store(true, Ordering::Release);
+    }
+
+    pub fn has_build_input_rows(&self) -> bool {
+        self.has_build_input_rows.load(Ordering::Acquire)
     }
 
     pub fn create_grace_state(&self) -> Result<Arc<GraceHashJoinState>> {

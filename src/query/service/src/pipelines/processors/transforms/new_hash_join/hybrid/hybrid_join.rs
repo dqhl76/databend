@@ -172,6 +172,10 @@ impl HybridHashJoin {
 
 impl Join for HybridHashJoin {
     fn add_block(&mut self, data: Option<DataBlock>) -> Result<()> {
+        if data.as_ref().is_some_and(|block| !block.is_empty()) {
+            self.state.mark_build_input_non_empty();
+        }
+
         // 1. Check if another processor has already triggered spill
         if self.state.check_spilled() {
             self.switch_to_grace_mode(false)?;
@@ -231,6 +235,18 @@ impl Join for HybridHashJoin {
 
     fn is_spill_happened(&self) -> bool {
         self.state.has_spilled_once()
+    }
+
+    fn can_skip_probe(&self) -> bool {
+        !self.state.has_build_input_rows()
+            && matches!(
+                self.join_type,
+                JoinType::Inner
+                    | JoinType::LeftSemi
+                    | JoinType::Right
+                    | JoinType::RightSemi
+                    | JoinType::RightAnti
+            )
     }
 
     fn probe_block(&mut self, data: DataBlock) -> Result<Box<dyn JoinStream + '_>> {
