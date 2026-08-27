@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod do_exchange_inbound;
+mod do_exchange_protocol;
 pub mod inbound_channel;
 pub mod inbound_quota;
 pub mod local_channel;
@@ -21,7 +23,12 @@ pub mod outbound_transport;
 
 pub use databend_common_pipeline::core::SyncTaskHandle;
 pub use databend_common_pipeline::core::SyncTaskSet;
+pub use do_exchange_inbound::NetworkInboundConnection;
+pub use do_exchange_inbound::NetworkInboundSource;
+pub(crate) use do_exchange_protocol::DoExchangeRequest;
+pub(crate) use do_exchange_protocol::DoExchangeResponse;
 pub use inbound_channel::InboundChannel;
+pub use inbound_channel::NetworkInboundChannel;
 pub use inbound_channel::NetworkInboundChannelSet;
 pub use inbound_channel::NetworkInboundReceiver;
 pub use inbound_channel::NetworkInboundSender;

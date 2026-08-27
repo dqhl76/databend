@@ -49,6 +49,22 @@ pub struct DoExchangeParams {
     pub query_id: String,
     pub exchange_id: String,
     pub num_threads: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_flight_source_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_flight_receiver_lease_secs: Option<u64>,
+}
+
+impl DoExchangeParams {
+    pub fn create(query_id: String, exchange_id: String, num_threads: usize) -> Self {
+        Self {
+            query_id,
+            exchange_id,
+            num_threads,
+            new_flight_source_id: None,
+            new_flight_receiver_lease_secs: None,
+        }
+    }
 }
 
 pub struct FlightClient {
@@ -435,5 +451,19 @@ impl FlightExchange {
             },
             _ => unreachable!(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DoExchangeParams;
+
+    #[test]
+    fn test_existing_do_exchange_params_keep_wire_shape() {
+        let params = DoExchangeParams::create("query".to_string(), "exchange".to_string(), 4);
+        let json = serde_json::to_value(params).unwrap();
+
+        assert!(json.get("new_flight_source_id").is_none());
+        assert!(json.get("new_flight_receiver_lease_secs").is_none());
     }
 }

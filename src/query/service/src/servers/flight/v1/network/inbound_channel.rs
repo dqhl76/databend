@@ -30,6 +30,7 @@ use databend_common_expression::DataBlock;
 use databend_common_expression::DataSchemaRef;
 use databend_common_io::prelude::BinaryRead;
 use databend_common_io::prelude::bincode_deserialize_from_stream;
+use parking_lot::Mutex;
 use tokio::sync::Semaphore;
 
 use super::inbound_quota::QueueItem;
@@ -40,6 +41,9 @@ pub struct NetworkInboundChannel {
     pub receiver: Receiver<QueueItem>,
 
     pub sender_count: Arc<AtomicUsize>,
+    /// The first terminal error from any logical source feeding this channel.
+    /// After queued data drains, a closed channel returns this cause, or clean EOF when it is `None`.
+    pub close_cause: Arc<Mutex<Option<ErrorCode>>>,
 }
 
 impl NetworkInboundChannel {
@@ -49,15 +53,22 @@ impl NetworkInboundChannel {
             sender: tx,
             receiver: rx,
             sender_count: Arc::new(AtomicUsize::new(0)),
+            close_cause: Arc::new(Mutex::new(None)),
         }
     }
 
-    pub async fn recv_raw(&self) -> Option<QueueItem> {
+    pub async fn recv_raw(&self) -> Result<Option<QueueItem>, ErrorCode> {
         if let Ok(item) = self.receiver.try_recv() {
-            return Some(item);
+            return Ok(Some(item));
         }
 
-        self.receiver.recv().await.ok()
+        match self.receiver.recv().await {
+            Ok(item) => Ok(Some(item)),
+            Err(_) => match self.close_cause.lock().clone() {
+                Some(cause) => Err(cause),
+                None => Ok(None),
+            },
+        }
     }
 }
 
@@ -210,7 +221,7 @@ impl InboundChannel for NetworkInboundReceiver {
     }
 
     async fn recv(&self) -> Result<Option<DataBlock>, ErrorCode> {
-        match self.channel.recv_raw().await {
+        match self.channel.recv_raw().await? {
             None => Ok(None),
             Some(QueueItem::LocalData(v)) => Ok(Some(v.into_data())),
             Some(QueueItem::RemoteData(r)) => {
@@ -249,14 +260,14 @@ pub fn strip_tid(mut data: FlightData) -> FlightData {
 }
 
 /// Detect a batch FlightData by checking for the BATCH_MARKER (0x02) as the last byte.
-fn is_batch(data: &FlightData) -> bool {
+pub(super) fn is_batch(data: &FlightData) -> bool {
     const BATCH_MARKER: u8 = 0x02;
     data.app_metadata.len() >= 5 && data.app_metadata[data.app_metadata.len() - 1] == BATCH_MARKER
 }
 
 /// Split a batch FlightData back into individual FlightData items.
 /// Uses zero-copy `Bytes::split_to()` for the large data_header and data_body fields.
-fn split_batch_flight_data(data: FlightData) -> Vec<FlightData> {
+pub(super) fn split_batch_flight_data(data: FlightData) -> Vec<FlightData> {
     let meta = &data.app_metadata;
     let tid_bytes: [u8; 2] = [meta[0], meta[1]];
     let num_items = u16::from_le_bytes([meta[2], meta[3]]) as usize;

@@ -154,32 +154,52 @@ impl FlightService for DatabendQueryFlightService {
             Status::invalid_argument(format!("Failed to parse DoExchangeParams: {}", e))
         })?;
 
-        let sender = DataExchangeManager::instance().handle_do_exchange(
-            &params.query_id,
-            &params.exchange_id,
-            params.num_threads,
-        )?;
-
-        let mut stream = req.into_inner();
+        let stream = req.into_inner();
         let (tx, rx) = async_channel::bounded(1);
 
-        GlobalIORuntime::instance().spawn(async move {
-            while let Some(result) = stream.next().await {
-                let Ok(flight_data) = result else {
-                    break;
-                };
-
-                if sender.add_data(flight_data).await.is_err() {
-                    break; // Receiver closed
-                }
-
-                // Send pong (empty response signals readiness for next ping)
-                if let Err(_cause) = tx.try_send(Ok(FlightData::default())) {
-                    break;
-                }
+        match (
+            params.new_flight_source_id.as_deref(),
+            params.new_flight_receiver_lease_secs,
+        ) {
+            (Some(source_id), Some(receiver_lease_secs)) => {
+                let connection = DataExchangeManager::instance().handle_new_flight_do_exchange(
+                    &params.query_id,
+                    &params.exchange_id,
+                    source_id,
+                    params.num_threads,
+                    std::time::Duration::from_secs(receiver_lease_secs),
+                )?;
+                GlobalIORuntime::instance().spawn(async move {
+                    connection.serve(stream, tx).await;
+                });
             }
-            // sender is dropped here → closes sub-queues, notifies processors
-        });
+            (None, None) => {
+                let sender = DataExchangeManager::instance().handle_do_exchange(
+                    &params.query_id,
+                    &params.exchange_id,
+                    params.num_threads,
+                )?;
+                GlobalIORuntime::instance().spawn(async move {
+                    let mut stream = stream;
+                    while let Some(result) = stream.next().await {
+                        let Ok(flight_data) = result else {
+                            break;
+                        };
+                        if sender.add_data(flight_data).await.is_err() {
+                            break;
+                        }
+                        if tx.try_send(Ok(FlightData::default())).is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+            _ => {
+                return Err(Status::invalid_argument(
+                    "New Flight source id and receiver lease must be provided together",
+                ));
+            }
+        }
 
         Ok(RawResponse::new(Box::pin(rx)))
     }

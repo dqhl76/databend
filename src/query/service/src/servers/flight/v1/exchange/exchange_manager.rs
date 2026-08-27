@@ -82,7 +82,9 @@ use crate::servers::flight::v1::exchange::DataExchange;
 use crate::servers::flight::v1::exchange::DefaultExchangeInjector;
 use crate::servers::flight::v1::exchange::ExchangeInjector;
 use crate::servers::flight::v1::network::NetworkInboundChannelSet;
+use crate::servers::flight::v1::network::NetworkInboundConnection;
 use crate::servers::flight::v1::network::NetworkInboundSender;
+use crate::servers::flight::v1::network::NetworkInboundSource;
 use crate::servers::flight::v1::network::PingPongExchange;
 use crate::servers::flight::v1::packets::Edge;
 use crate::servers::flight::v1::packets::QueryEnv;
@@ -403,11 +405,14 @@ impl DataExchangeManager {
 
                                 let (send_tx, send_rx) = async_channel::bounded(1);
                                 let response_stream = flight_client
-                                    .do_exchange(send_rx, DoExchangeParams {
-                                        query_id,
-                                        num_threads,
-                                        exchange_id: exchange_id.clone(),
-                                    })
+                                    .do_exchange(
+                                        send_rx,
+                                        DoExchangeParams::create(
+                                            query_id,
+                                            exchange_id.clone(),
+                                            num_threads,
+                                        ),
+                                    )
                                     .await?;
                                 Ok::<_, ErrorCode>((send_tx, response_stream))
                             }?;
@@ -724,6 +729,36 @@ impl DataExchangeManager {
         }
     }
 
+    #[fastrace::trace]
+    pub fn handle_new_flight_do_exchange(
+        &self,
+        query_id: &str,
+        channel_id: &str,
+        source_id: &str,
+        num_threads: usize,
+        receiver_lease: Duration,
+    ) -> Result<NetworkInboundConnection> {
+        let queries_coordinator_guard = self.queries_coordinator.lock();
+        let queries_coordinator = unsafe { &mut *queries_coordinator_guard.deref().get() };
+
+        match queries_coordinator.entry(query_id.to_string()) {
+            Entry::Occupied(mut entry) => entry.get_mut().open_new_flight_inbound_connection(
+                channel_id,
+                source_id,
+                num_threads,
+                receiver_lease,
+            ),
+            Entry::Vacant(entry) => entry
+                .insert(QueryCoordinator::create())
+                .open_new_flight_inbound_connection(
+                    channel_id,
+                    source_id,
+                    num_threads,
+                    receiver_lease,
+                ),
+        }
+    }
+
     /// Get the NetworkInboundReceivers for a given query and channel.
     ///
     /// Returns one `Arc<NetworkInboundReceiver>` per tid, for building
@@ -1035,6 +1070,7 @@ pub(crate) struct QueryCoordinator {
     flight_data_senders: HashMap<String, Vec<FlightSender>>,
     flight_data_receivers: HashMap<String, Vec<FlightReceiver>>,
     inbound_channel_sets: HashMap<String, Arc<NetworkInboundChannelSet>>,
+    new_flight_inbound_sources: HashMap<(String, String), Arc<NetworkInboundSource>>,
     ping_pong_exchanges: HashMap<String, HashMap<String, PingPongExchange>>,
 }
 
@@ -1048,6 +1084,7 @@ impl QueryCoordinator {
             statistics_exchanges: HashMap::new(),
             fragments_coordinator: HashMap::new(),
             inbound_channel_sets: HashMap::new(),
+            new_flight_inbound_sources: HashMap::new(),
             ping_pong_exchanges: HashMap::new(),
         }
     }
@@ -1163,6 +1200,37 @@ impl QueryCoordinator {
         ))
     }
 
+    fn open_new_flight_inbound_connection(
+        &mut self,
+        channel_id: &str,
+        source_id: &str,
+        num_threads: usize,
+        receiver_lease: Duration,
+    ) -> Result<NetworkInboundConnection> {
+        let channel_set = self.get_or_create_inbound_channel_set(channel_id, num_threads)?;
+        let key = (channel_id.to_string(), source_id.to_string());
+        let source = self
+            .new_flight_inbound_sources
+            .entry(key)
+            .or_insert_with(|| {
+                Arc::new(NetworkInboundSource::new(
+                    &channel_set,
+                    20 * 1024 * 1024,
+                    receiver_lease,
+                    format!("channel_id={}, source_id={}", channel_id, source_id),
+                ))
+            })
+            .clone();
+
+        Ok(source.connect(
+            GlobalIORuntime::instance(),
+            ErrorCode::CannotConnectNode(format!(
+                "New Flight source {} for channel {} did not reconnect before its lease expired",
+                source_id, channel_id
+            )),
+        ))
+    }
+
     fn get_or_create_inbound_channel_set(
         &mut self,
         channel_id: &str,
@@ -1257,6 +1325,11 @@ impl QueryCoordinator {
     }
 
     pub fn shutdown_query(&mut self, cause: Option<ErrorCode>) {
+        if let Some(cause) = &cause {
+            for source in self.new_flight_inbound_sources.values() {
+                source.fail(cause.clone());
+            }
+        }
         if let Some(query_info) = &mut self.info {
             if let Some(query_executor) = &query_info.query_executor {
                 query_executor.finish(cause);
