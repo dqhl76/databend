@@ -13,6 +13,7 @@
 // limitations under the License.
 
 mod do_exchange_inbound;
+mod do_exchange_outbound;
 mod do_exchange_protocol;
 pub mod inbound_channel;
 pub mod inbound_quota;
@@ -20,11 +21,17 @@ pub mod local_channel;
 pub mod outbound_buffer;
 pub mod outbound_channel;
 pub mod outbound_transport;
+mod reconnect_policy;
 
 pub use databend_common_pipeline::core::SyncTaskHandle;
 pub use databend_common_pipeline::core::SyncTaskSet;
 pub use do_exchange_inbound::NetworkInboundConnection;
 pub use do_exchange_inbound::NetworkInboundSource;
+pub use do_exchange_outbound::DoExchangeConnector;
+pub use do_exchange_outbound::DoExchangeTransport;
+pub use do_exchange_outbound::NetworkOutbound;
+pub use do_exchange_outbound::PendingNetworkOutbound;
+pub use do_exchange_outbound::SendOutcome;
 pub(crate) use do_exchange_protocol::DoExchangeRequest;
 pub(crate) use do_exchange_protocol::DoExchangeResponse;
 pub use inbound_channel::InboundChannel;
@@ -44,3 +51,5 @@ pub use outbound_transport::PingPongCallback;
 pub use outbound_transport::PingPongExchange;
 pub use outbound_transport::PingPongExchangeInner;
 pub use outbound_transport::PingPongResponse;
+pub(crate) use reconnect_policy::FlightConnectionAttempts;
+pub use reconnect_policy::FlightReconnectPolicy;

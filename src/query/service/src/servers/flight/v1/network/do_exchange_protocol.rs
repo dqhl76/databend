@@ -62,6 +62,33 @@ pub(crate) enum DoExchangeRequest {
 }
 
 impl DoExchangeRequest {
+    pub(crate) fn data(sequence: u64, payload: FlightData) -> Self {
+        Self::Data { sequence, payload }
+    }
+
+    pub(crate) fn finish() -> Self {
+        Self::Finish
+    }
+
+    pub(crate) fn sender_fail(cause: ErrorCode) -> Self {
+        Self::SenderFail(cause)
+    }
+
+    pub(crate) fn encode(&self) -> FlightData {
+        match self {
+            Self::Data { sequence, payload } => {
+                let mut payload = payload.clone();
+                let mut metadata = BytesMut::with_capacity(HEADER_LEN + payload.app_metadata.len());
+                encode_header(&mut metadata, DATA_KIND, *sequence);
+                metadata.extend_from_slice(&payload.app_metadata);
+                payload.app_metadata = metadata.freeze();
+                payload
+            }
+            Self::Finish => encode_control_packet(FINISH_KIND, 0),
+            Self::SenderFail(cause) => encode_error_packet(SENDER_FAIL_KIND, cause.clone()),
+        }
+    }
+
     pub(crate) fn decode(mut data: FlightData) -> Result<Self> {
         let (kind, sequence) = decode_header(&data)?;
         match kind {
@@ -112,6 +139,28 @@ impl DoExchangeResponse {
             Self::Ack { sequence } => encode_control_packet(ACK_KIND, sequence),
             Self::ReceiverClosed => encode_control_packet(RECEIVER_CLOSED_KIND, 0),
             Self::Fail(cause) => encode_error_packet(FAIL_KIND, cause),
+        }
+    }
+
+    pub(crate) fn decode(mut data: FlightData) -> Result<Self> {
+        let (kind, sequence) = decode_header(&data)?;
+        match kind {
+            ACK_KIND => {
+                validate_control_packet(&data)?;
+                Ok(Self::Ack { sequence })
+            }
+            RECEIVER_CLOSED_KIND => {
+                validate_control_packet(&data)?;
+                Ok(Self::ReceiverClosed)
+            }
+            FAIL_KIND => {
+                data.app_metadata = data.app_metadata.slice(HEADER_LEN..);
+                Ok(Self::Fail(ErrorCode::try_from(data)?))
+            }
+            DATA_KIND | FINISH_KIND | SENDER_FAIL_KIND => Err(ErrorCode::Internal(
+                "received a do_exchange request packet on the response stream",
+            )),
+            _ => Err(unknown_packet_kind(kind)),
         }
     }
 }
