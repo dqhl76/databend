@@ -110,6 +110,25 @@ async fn test_set_settings() {
         }
 
         {
+            assert!(settings.get_enable_parquet_unload_multipart().unwrap());
+            settings
+                .set_setting(
+                    "enable_parquet_unload_multipart".to_string(),
+                    "0".to_string(),
+                )
+                .unwrap();
+            assert!(!settings.get_enable_parquet_unload_multipart().unwrap());
+
+            let result = settings.set_setting(
+                "enable_parquet_unload_multipart".to_string(),
+                "2".to_string(),
+            );
+            let expect =
+                "WrongValueForVariable. Code: 2803, Text = Value 2 is not within the range [0, 1].";
+            assert_eq!(expect, format!("{}", result.unwrap_err()));
+        }
+
+        {
             assert!(settings.get_enable_top_n().unwrap());
             settings
                 .set_setting("enable_top_n".to_string(), "0".to_string())

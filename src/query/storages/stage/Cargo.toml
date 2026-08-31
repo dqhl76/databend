@@ -14,6 +14,7 @@ arrow-schema = { workspace = true }
 async-backtrace = { workspace = true }
 async-trait = { workspace = true }
 bstr = { workspace = true }
+bytes = { workspace = true }
 chrono = { workspace = true }
 csv-core = { workspace = true }
 databend-common-ast = { workspace = true }
@@ -65,9 +66,6 @@ uuid = { workspace = true }
 
 [lints]
 workspace = true
-
-[dev-dependencies]
-bytes = { workspace = true }
 
 [package.metadata.cargo-machete]
 ignored = ["match-template", "lance-encoding"]

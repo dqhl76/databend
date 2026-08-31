@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::any::Any;
+use std::collections::VecDeque;
 use std::mem;
 use std::sync::Arc;
 
@@ -20,16 +22,23 @@ use arrow_array::RecordBatchOptions;
 use arrow_schema::DataType;
 use arrow_schema::FieldRef;
 use arrow_schema::Schema;
+use async_trait::async_trait;
+use bytes::Bytes;
 use databend_common_exception::ErrorCode;
 use databend_common_exception::Result;
+use databend_common_expression::BlockMetaInfoDowncast;
 use databend_common_expression::DataBlock;
 use databend_common_expression::TableSchemaRef;
 use databend_common_meta_app::principal::StageFileCompression;
+use databend_common_pipeline::core::Event;
 use databend_common_pipeline::core::InputPort;
 use databend_common_pipeline::core::OutputPort;
+use databend_common_pipeline::core::Processor;
 use databend_common_pipeline::core::ProcessorPtr;
+use databend_common_storage::ensure_no_stage_path_traversal;
 use databend_storages_common_stage::CopyIntoLocationInfo;
 use opendal::Operator;
+use opendal::Writer;
 use parquet::arrow::ARROW_SCHEMA_META_KEY;
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_writer::ArrowWriterOptions;
@@ -41,8 +50,13 @@ use parquet::file::properties::EnabledStatistics;
 use parquet::file::properties::WriterProperties;
 use parquet::file::properties::WriterVersion;
 
+use crate::append::UnloadOutput;
+use crate::append::column_based::block_batch::BlockBatch;
 use crate::append::column_based::file_writer::ColumnarFileEncoder;
 use crate::append::column_based::file_writer::ColumnarFileWriter;
+use crate::append::output::DataSummary;
+use crate::append::partition::partition_from_block;
+use crate::append::path::unload_path;
 
 pub struct ParquetFileWriter;
 
@@ -59,6 +73,7 @@ const MAX_BUFFER_SIZE: usize = 64 * 1024 * 1024;
 const MAX_ROW_GROUP_SIZE: usize = 1024 * 1024;
 // Maximum estimated encoded size of a Parquet row group.
 const MAX_ROW_GROUP_BYTES: usize = 128 * 1024 * 1024;
+const MULTIPART_CHUNK_SIZE: usize = 8 * 1024 * 1024;
 
 /// Return an Arrow schema with canonical names for Parquet map entries.
 ///
@@ -181,12 +196,11 @@ fn legacy_compatible_data_type(data_type: &DataType) -> DataType {
     }
 }
 
-fn create_writer(
+fn writer_options(
     arrow_schema: Arc<Schema>,
-    target_file_size: Option<usize>,
     compression: Compression,
     create_by: String,
-) -> Result<ArrowWriter<Vec<u8>>> {
+) -> ArrowWriterOptions {
     let metadata_schema = legacy_compatible_schema(&arrow_schema);
     let metadata = KeyValue {
         key: ARROW_SCHEMA_META_KEY.to_string(),
@@ -209,15 +223,24 @@ fn create_writer(
         .set_key_value_metadata(Some(vec![metadata]))
         .build();
 
+    ArrowWriterOptions::new()
+        .with_properties(props)
+        // `ARROW:schema` above intentionally describes storage-equivalent legacy types.
+        // Do not let ArrowWriter replace it with the original modern schema.
+        .with_skip_arrow_metadata(true)
+}
+
+fn create_writer(
+    arrow_schema: Arc<Schema>,
+    target_file_size: Option<usize>,
+    compression: Compression,
+    create_by: String,
+) -> Result<ArrowWriter<Vec<u8>>> {
+    let options = writer_options(arrow_schema.clone(), compression, create_by);
     let buf_size = match target_file_size {
         Some(n) if n < MAX_BUFFER_SIZE => n,
         _ => MAX_BUFFER_SIZE,
     };
-    let options = ArrowWriterOptions::new()
-        .with_properties(props)
-        // `ARROW:schema` above intentionally describes storage-equivalent legacy types.
-        // Do not let ArrowWriter replace it with the original modern schema.
-        .with_skip_arrow_metadata(true);
     Ok(ArrowWriter::try_new_with_options(
         Vec::with_capacity(buf_size),
         arrow_schema,
@@ -233,17 +256,7 @@ impl ParquetEncoder {
         create_by: String,
     ) -> Result<Self> {
         let arrow_schema = Arc::new(parquet_compatible_schema(&Schema::from(schema.as_ref())));
-        let compression = info.stage.file_format_params.compression();
-        let compression = match &compression {
-            StageFileCompression::Zstd => Compression::ZSTD(ZstdLevel::default()),
-            StageFileCompression::Snappy => Compression::SNAPPY,
-            StageFileCompression::None => Compression::UNCOMPRESSED,
-            _ => {
-                return Err(ErrorCode::Internal(format!(
-                    "unexpected compression {compression}"
-                )));
-            }
-        };
+        let compression = compression_from_info(info)?;
         let writer = create_writer(
             arrow_schema.clone(),
             target_file_size,
@@ -251,7 +264,7 @@ impl ParquetEncoder {
             create_by.clone(),
         )?;
 
-        Ok(ParquetEncoder {
+        Ok(Self {
             arrow_schema,
             compression,
             create_by,
@@ -298,6 +311,65 @@ impl ColumnarFileEncoder for ParquetEncoder {
     }
 }
 
+fn compression_from_info(info: &CopyIntoLocationInfo) -> Result<Compression> {
+    match info.stage.file_format_params.compression() {
+        StageFileCompression::Zstd => Ok(Compression::ZSTD(ZstdLevel::default())),
+        StageFileCompression::Snappy => Ok(Compression::SNAPPY),
+        StageFileCompression::None => Ok(Compression::UNCOMPRESSED),
+        compression => Err(ErrorCode::Internal(format!(
+            "unexpected compression {compression}"
+        ))),
+    }
+}
+
+struct PendingBatch {
+    batch: RecordBatch,
+    partition: Option<Arc<str>>,
+    row_counts: usize,
+    input_bytes: usize,
+}
+
+struct ActiveFile {
+    path: String,
+    partition: Option<Arc<str>>,
+    encoder: ArrowWriter<Vec<u8>>,
+    uploader: Option<Writer>,
+    row_counts: usize,
+    input_bytes: usize,
+}
+
+struct ParquetStreamConfig {
+    info: CopyIntoLocationInfo,
+    schema: TableSchemaRef,
+    arrow_schema: Arc<Schema>,
+    compression: Compression,
+    create_by: String,
+    data_accessor: Operator,
+    query_id: String,
+    group_id: usize,
+    target_file_size: Option<usize>,
+}
+
+enum WriterState {
+    Idle,
+    Finish,
+    Upload(Bytes),
+    Complete(Bytes),
+    Abort(Option<ErrorCode>),
+}
+
+struct StreamingParquetFileWriter {
+    input: Arc<InputPort>,
+    output: Arc<OutputPort>,
+    config: ParquetStreamConfig,
+    batch_id: usize,
+    input_data: VecDeque<DataBlock>,
+    active_file: Option<ActiveFile>,
+    state: WriterState,
+    unload_output: UnloadOutput,
+    unload_output_blocks: Option<VecDeque<DataBlock>>,
+}
+
 impl ParquetFileWriter {
     #[allow(clippy::too_many_arguments)]
     pub fn try_create(
@@ -310,10 +382,25 @@ impl ParquetFileWriter {
         group_id: usize,
         target_file_size: Option<usize>,
         create_by: String,
+        enable_multipart: bool,
     ) -> Result<ProcessorPtr> {
-        let encoder =
-            ParquetEncoder::try_create(&info, schema.clone(), target_file_size, create_by)?;
-        ColumnarFileWriter::try_create(
+        if !enable_multipart || !data_accessor.info().full_capability().write_can_multi {
+            let encoder =
+                ParquetEncoder::try_create(&info, schema.clone(), target_file_size, create_by)?;
+            return ColumnarFileWriter::try_create(
+                input,
+                output,
+                info,
+                schema,
+                data_accessor,
+                query_id,
+                group_id,
+                target_file_size,
+                encoder,
+            );
+        }
+
+        StreamingParquetFileWriter::try_create(
             input,
             output,
             info,
@@ -322,8 +409,364 @@ impl ParquetFileWriter {
             query_id,
             group_id,
             target_file_size,
-            encoder,
+            create_by,
         )
+    }
+}
+
+impl StreamingParquetFileWriter {
+    #[allow(clippy::too_many_arguments)]
+    fn try_create(
+        input: Arc<InputPort>,
+        output: Arc<OutputPort>,
+        info: CopyIntoLocationInfo,
+        schema: TableSchemaRef,
+        data_accessor: Operator,
+        query_id: String,
+        group_id: usize,
+        target_file_size: Option<usize>,
+        create_by: String,
+    ) -> Result<ProcessorPtr> {
+        let arrow_schema = Arc::new(parquet_compatible_schema(&Schema::from(schema.as_ref())));
+        let compression = compression_from_info(&info)?;
+        let unload_output = UnloadOutput::create(info.options.detailed_output);
+
+        Ok(ProcessorPtr::create(Box::new(Self {
+            input,
+            output,
+            config: ParquetStreamConfig {
+                info,
+                schema,
+                arrow_schema,
+                compression,
+                create_by,
+                data_accessor,
+                query_id,
+                group_id,
+                target_file_size,
+            },
+            batch_id: 0,
+            input_data: VecDeque::new(),
+            active_file: None,
+            state: WriterState::Idle,
+            unload_output,
+            unload_output_blocks: None,
+        })))
+    }
+
+    fn prepare_batch(&self, block: DataBlock) -> Result<PendingBatch> {
+        let partition = partition_from_block(&block);
+        let row_counts = block.num_rows();
+        let input_bytes = block.memory_size();
+        let batch = block.to_record_batch(&self.config.schema)?;
+        let options = RecordBatchOptions::new().with_match_field_names(false);
+        let batch = RecordBatch::try_new_with_options(
+            self.config.arrow_schema.clone(),
+            batch.columns().to_vec(),
+            &options,
+        )?;
+
+        Ok(PendingBatch {
+            batch,
+            partition,
+            row_counts,
+            input_bytes,
+        })
+    }
+
+    fn create_file(&self, partition: Option<Arc<str>>) -> Result<ActiveFile> {
+        let path = unload_path(
+            &self.config.info,
+            &self.config.query_id,
+            self.config.group_id,
+            self.batch_id,
+            None,
+            partition.as_deref(),
+        );
+        if !self.config.info.allow_path_traversal {
+            ensure_no_stage_path_traversal(&path)?;
+        }
+
+        let options = writer_options(
+            self.config.arrow_schema.clone(),
+            self.config.compression,
+            self.config.create_by.clone(),
+        );
+        let encoder = ArrowWriter::try_new_with_options(
+            Vec::new(),
+            self.config.arrow_schema.clone(),
+            options,
+        )?;
+        Ok(ActiveFile {
+            path,
+            partition,
+            encoder,
+            uploader: None,
+            row_counts: 0,
+            input_bytes: 0,
+        })
+    }
+
+    async fn open_uploader(data_accessor: Operator, path: &str) -> Result<Writer> {
+        data_accessor
+            .writer_with(path)
+            .chunk(MULTIPART_CHUNK_SIZE)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn abort_file(mut file: ActiveFile) {
+        if let Some(uploader) = file.uploader.as_mut() {
+            let _ = uploader.abort().await;
+        }
+    }
+
+    async fn abort_current_file(&mut self) {
+        if let Some(file) = self.active_file.take() {
+            Self::abort_file(file).await;
+        }
+    }
+
+    fn defer_error_until_abort(&mut self, error: ErrorCode) -> Result<()> {
+        self.input.finish();
+        self.input_data.clear();
+        if self
+            .active_file
+            .as_ref()
+            .is_none_or(|file| file.uploader.is_none())
+        {
+            self.active_file = None;
+            return Err(error);
+        }
+        self.state = WriterState::Abort(Some(error));
+        Ok(())
+    }
+
+    fn finish_current_file(&mut self) -> Result<()> {
+        let Some(mut file) = self.active_file.take() else {
+            return Ok(());
+        };
+
+        if let Err(error) = file.encoder.finish() {
+            self.active_file = Some(file);
+            return self.defer_error_until_abort(error.into());
+        }
+        if let Err(error) = file.encoder.sync() {
+            self.active_file = Some(file);
+            return self.defer_error_until_abort(error.into());
+        }
+        let data = mem::take(file.encoder.inner_mut());
+        self.active_file = Some(file);
+        self.state = WriterState::Complete(Bytes::from(data));
+        Ok(())
+    }
+
+    fn write_pending_batch(&mut self, pending: PendingBatch) -> Result<()> {
+        if self.active_file.is_none() {
+            self.active_file = Some(self.create_file(pending.partition.clone())?);
+        }
+
+        let file = self.active_file.as_mut().unwrap();
+        let flushed_row_groups = file.encoder.flushed_row_groups().len();
+        if let Err(error) = file.encoder.write(&pending.batch) {
+            return self.defer_error_until_abort(error.into());
+        }
+        file.row_counts += pending.row_counts;
+        file.input_bytes += pending.input_bytes;
+
+        let should_close = self.config.target_file_size.is_some_and(|target| {
+            file.encoder.bytes_written() + file.encoder.in_progress_size() >= target
+        });
+        if should_close {
+            return self.finish_current_file();
+        }
+        if file.encoder.flushed_row_groups().len() != flushed_row_groups {
+            if let Err(error) = file.encoder.sync() {
+                return self.defer_error_until_abort(error.into());
+            }
+            let data = mem::take(file.encoder.inner_mut());
+            self.state = WriterState::Upload(Bytes::from(data));
+        }
+        Ok(())
+    }
+
+    async fn upload(&mut self, data: Bytes, complete: bool) -> Result<()> {
+        let mut file = self.active_file.take().unwrap();
+        if file.uploader.is_none() {
+            file.uploader =
+                Some(Self::open_uploader(self.config.data_accessor.clone(), &file.path).await?);
+        }
+        let uploader = file.uploader.as_mut().unwrap();
+        if let Err(error) = uploader.write(data).await {
+            Self::abort_file(file).await;
+            return Err(error.into());
+        }
+        if !complete {
+            self.active_file = Some(file);
+            return Ok(());
+        }
+        if let Err(error) = uploader.close().await {
+            Self::abort_file(file).await;
+            return Err(error.into());
+        }
+
+        let output_bytes = file.encoder.bytes_written();
+        self.unload_output.add_file(&file.path, DataSummary {
+            row_counts: file.row_counts,
+            input_bytes: file.input_bytes,
+            output_bytes,
+        });
+        self.batch_id += 1;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl Processor for StreamingParquetFileWriter {
+    fn name(&self) -> String {
+        "ParquetFileWriter".to_string()
+    }
+
+    fn as_any(&mut self) -> &mut dyn Any {
+        self
+    }
+
+    fn event(&mut self) -> Result<Event> {
+        if self.output.is_finished() {
+            self.input.finish();
+            self.input_data.clear();
+            if self
+                .active_file
+                .as_ref()
+                .is_some_and(|file| file.uploader.is_some())
+            {
+                self.state = WriterState::Abort(None);
+                return Ok(Event::Async);
+            }
+            self.active_file = None;
+            return Ok(Event::Finished);
+        }
+
+        if matches!(
+            self.state,
+            WriterState::Upload(_) | WriterState::Complete(_) | WriterState::Abort(_)
+        ) {
+            self.input.set_not_need_data();
+            return Ok(Event::Async);
+        }
+
+        if matches!(self.state, WriterState::Finish) {
+            self.input.set_not_need_data();
+            return Ok(Event::Sync);
+        }
+
+        if !self.input_data.is_empty() {
+            self.input.set_not_need_data();
+            return Ok(Event::Sync);
+        }
+
+        if self.input.is_finished() {
+            if self.active_file.is_some() {
+                self.state = WriterState::Finish;
+                return Ok(Event::Sync);
+            }
+            if self.unload_output.is_empty() {
+                self.output.finish();
+                return Ok(Event::Finished);
+            }
+            if self.unload_output_blocks.is_none() {
+                self.unload_output_blocks = Some(self.unload_output.to_block_partial().into());
+            }
+            if self.output.can_push() {
+                if let Some(block) = self.unload_output_blocks.as_mut().unwrap().pop_front() {
+                    self.output.push_data(Ok(block));
+                    return Ok(Event::NeedConsume);
+                }
+                self.output.finish();
+                return Ok(Event::Finished);
+            }
+            return Ok(Event::NeedConsume);
+        }
+
+        if self.input.has_data() {
+            let block = match self.input.pull_data().unwrap() {
+                Ok(block) => block,
+                Err(error) => {
+                    self.defer_error_until_abort(error)?;
+                    return Ok(Event::Async);
+                }
+            };
+            if self.config.target_file_size.is_some() && block.get_meta().is_some() {
+                let block_meta = block.get_owned_meta().unwrap();
+                let block_batch = BlockBatch::downcast_from(block_meta).unwrap();
+                self.input_data.extend(block_batch.blocks);
+            } else {
+                self.input_data.push_back(block);
+            }
+            self.input.set_not_need_data();
+            return Ok(Event::Sync);
+        }
+
+        self.input.set_need_data();
+        Ok(Event::NeedData)
+    }
+
+    fn process(&mut self) -> Result<()> {
+        match mem::replace(&mut self.state, WriterState::Idle) {
+            WriterState::Idle => {}
+            WriterState::Finish => return self.finish_current_file(),
+            action => {
+                self.state = action;
+                return Err(ErrorCode::Internal(
+                    "unexpected sync state in ParquetFileWriter".to_string(),
+                ));
+            }
+        }
+
+        while let Some(block) = self.input_data.pop_front() {
+            if block.num_rows() == 0 {
+                continue;
+            }
+            let partition = partition_from_block(&block);
+            if self
+                .active_file
+                .as_ref()
+                .is_some_and(|file| file.partition != partition)
+            {
+                self.input_data.push_front(block);
+                return self.finish_current_file();
+            }
+            let batch = match self.prepare_batch(block) {
+                Ok(batch) => batch,
+                Err(error) => {
+                    self.defer_error_until_abort(error)?;
+                    return Ok(());
+                }
+            };
+            self.write_pending_batch(batch)?;
+            if !matches!(self.state, WriterState::Idle) {
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+
+    #[async_backtrace::framed]
+    async fn async_process(&mut self) -> Result<()> {
+        match mem::replace(&mut self.state, WriterState::Idle) {
+            WriterState::Upload(data) => self.upload(data, false).await,
+            WriterState::Complete(data) => self.upload(data, true).await,
+            WriterState::Abort(error) => {
+                self.abort_current_file().await;
+                match error {
+                    Some(error) => Err(error),
+                    None => Ok(()),
+                }
+            }
+            WriterState::Idle | WriterState::Finish => Err(ErrorCode::Internal(
+                "unexpected async state in ParquetFileWriter".to_string(),
+            )),
+        }
     }
 }
 
@@ -336,11 +779,13 @@ mod tests {
     use arrow_array::BooleanArray;
     use arrow_array::Decimal64Array;
     use arrow_array::Decimal128Array;
+    use arrow_array::Int32Array;
     use arrow_array::MapArray;
     use arrow_array::StringArray;
     use arrow_array::StringViewArray;
     use arrow_schema::Field;
     use bytes::Bytes;
+    use opendal::services::Memory;
     use parquet::arrow::arrow_reader::ArrowReaderOptions;
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use parquet::basic::Encoding;
@@ -349,6 +794,58 @@ mod tests {
     use parquet::file::serialized_reader::SerializedFileReader;
 
     use super::*;
+
+    #[tokio::test]
+    async fn test_streams_parquet_row_groups_to_opendal() {
+        let data_accessor = Operator::new(Memory::default()).unwrap().finish();
+        let arrow_schema = Arc::new(Schema::new(vec![Field::new(
+            "number",
+            DataType::Int32,
+            false,
+        )]));
+        let properties = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(4))
+            .build();
+        let options = ArrowWriterOptions::new().with_properties(properties);
+        let mut encoder =
+            ArrowWriter::try_new_with_options(Vec::new(), arrow_schema.clone(), options).unwrap();
+        let mut uploader =
+            StreamingParquetFileWriter::open_uploader(data_accessor.clone(), "stream.parquet")
+                .await
+                .unwrap();
+
+        for (index, values) in [vec![1, 2], vec![3, 4], vec![5, 6], vec![7, 8]]
+            .into_iter()
+            .enumerate()
+        {
+            let batch = RecordBatch::try_new(arrow_schema.clone(), vec![Arc::new(
+                Int32Array::from(values),
+            )])
+            .unwrap();
+            encoder.write(&batch).unwrap();
+            if index % 2 == 0 {
+                assert_eq!(encoder.flushed_row_groups().len(), index / 2);
+                continue;
+            }
+            assert_eq!(encoder.flushed_row_groups().len(), index.div_ceil(2));
+            encoder.sync().unwrap();
+            let row_group = mem::take(encoder.inner_mut());
+            assert!(!row_group.is_empty());
+            uploader.write(Bytes::from(row_group)).await.unwrap();
+        }
+        encoder.finish().unwrap();
+        encoder.sync().unwrap();
+        let footer = mem::take(encoder.inner_mut());
+        assert!(!footer.is_empty());
+        uploader.write(Bytes::from(footer)).await.unwrap();
+        uploader.close().await.unwrap();
+
+        let parquet_data =
+            Bytes::from(data_accessor.read("stream.parquet").await.unwrap().to_vec());
+        let builder = ParquetRecordBatchReaderBuilder::try_new(parquet_data).unwrap();
+        assert_eq!(builder.metadata().num_row_groups(), 2);
+        assert_eq!(builder.metadata().file_metadata().num_rows(), 8);
+    }
 
     #[test]
     fn test_legacy_compatible_schema_recursively_downgrades_storage_equivalent_types() {

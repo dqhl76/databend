@@ -21,7 +21,8 @@ use opendal::Operator;
 use super::writer_processor::ParquetFileWriter;
 use crate::append::column_based::limit_file_size_processor::LimitFileSizeProcessor;
 /// - LimitFileSizeProcessor * 1: slice/group block to batches (as a block meta) to avoid files being too small when there are many threads.
-/// - ParquetFileSink * N:  serialize incoming blocks to Vec to reduce memory, and flush when they are large enough.
+/// - ParquetFileSink * N: stream row groups when the storage supports multipart writes,
+///   otherwise buffer and upload the complete file for compatibility.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn append_data_to_parquet_files(
     pipeline: &mut Pipeline,
@@ -33,6 +34,7 @@ pub(crate) fn append_data_to_parquet_files(
     mem_limit: usize,
     max_file_size: usize,
     create_by: String,
+    enable_multipart: bool,
 ) -> Result<()> {
     let max_file_size =
         LimitFileSizeProcessor::build(pipeline, mem_limit, max_file_size, &info.options)?;
@@ -48,6 +50,7 @@ pub(crate) fn append_data_to_parquet_files(
             gid,
             max_file_size,
             create_by.clone(),
+            enable_multipart,
         )
     })?;
     Ok(())

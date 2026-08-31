@@ -99,6 +99,7 @@ impl StageSinkTable {
         let op = StageTable::get_op(stage_info)?;
         let query_id = ctx.get_id();
         let group_id = AtomicUsize::new(0);
+        let enable_parquet_unload_multipart = settings.get_enable_parquet_unload_multipart()?;
         let fmt = self.info.stage.file_format_params.clone();
         match fmt {
             FileFormatParams::Parquet(_) => append_data_to_parquet_files(
@@ -111,6 +112,7 @@ impl StageSinkTable {
                 mem_limit,
                 max_threads,
                 self.create_by.clone(),
+                enable_parquet_unload_multipart,
             )?,
             FileFormatParams::Arrow(_) | FileFormatParams::ArrowStream(_) => {
                 append_data_to_arrow_files(
