@@ -156,6 +156,7 @@ impl IPhysicalPlan for AggregateFinal {
         }
 
         let params = PipelineBuilder::build_aggregator_params(
+            builder.ctx.clone(),
             self.before_group_by_schema.clone(),
             &self.group_by,
             &self.agg_funcs,

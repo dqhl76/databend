@@ -758,6 +758,20 @@ impl DefaultSettings {
                     scope: SettingScope::Both,
                     range: Some(SettingRange::Numeric(0..=100)),
                 }),
+                ("aggregate_function_spilling_memory_threshold", DefaultSettingValue {
+                    value: UserSettingValue::UInt64(64 * 1024 * 1024),
+                    desc: "Minimum aggregate-function state size in bytes required to trigger spilling under memory pressure, unless forced. Size alone never triggers spilling.",
+                    mode: SettingMode::Both,
+                    scope: SettingScope::Both,
+                    range: Some(SettingRange::Numeric(1..=u64::MAX)),
+                }),
+                ("aggregate_function_restore_memory_threshold", DefaultSettingValue {
+                    value: UserSettingValue::UInt64(64 * 1024 * 1024),
+                    desc: "Soft memory budget in bytes for a restored aggregate-function partition or external merge buffer; independent of the initial spill selection threshold.",
+                    mode: SettingMode::Both,
+                    scope: SettingScope::Both,
+                    range: Some(SettingRange::Numeric(1..=u64::MAX)),
+                }),
                 ("window_partition_spilling_memory_ratio", DefaultSettingValue {
                     value: UserSettingValue::UInt64(60),
                     desc: "Sets the maximum memory ratio in bytes that a window partitioner can use before spilling data to storage during query execution.",

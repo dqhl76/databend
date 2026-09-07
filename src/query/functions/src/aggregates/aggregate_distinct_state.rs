@@ -20,6 +20,8 @@ use std::sync::Arc;
 
 use borsh::BorshSerialize;
 use bumpalo::Bump;
+use databend_common_column::binary::BinaryColumnBuilder;
+use databend_common_exception::ErrorCode;
 use databend_common_exception::Result;
 use databend_common_expression::AggrState;
 use databend_common_expression::AggrStateLoc;
@@ -27,8 +29,10 @@ use databend_common_expression::BlockEntry;
 use databend_common_expression::Column;
 use databend_common_expression::ColumnBuilder;
 use databend_common_expression::ColumnView;
+use databend_common_expression::DataBlock;
 use databend_common_expression::ProjectedBlock;
 use databend_common_expression::Scalar;
+use databend_common_expression::ScalarRef;
 use databend_common_expression::StateSerdeItem;
 use databend_common_expression::types::simple_type::SimpleType;
 use databend_common_expression::types::simple_type::SimpleValueType;
@@ -46,6 +50,7 @@ use siphasher::sip128::SipHasher24;
 use super::SerializeInfo;
 use super::StateAddr;
 use super::StateSerde;
+use super::aggregate_spill::SPILL_BATCH_ROWS;
 use super::batch_merge1;
 use super::batch_serialize1;
 use super::borsh_partial_deserialize;
@@ -54,6 +59,7 @@ pub(super) trait DistinctStateFunc: Sized + Send + StateSerde + 'static {
     fn new() -> Self;
     fn is_empty(&self) -> bool;
     fn len(&self) -> usize;
+    fn memory_size(&self) -> usize;
     fn add(&mut self, columns: ProjectedBlock, row: usize) -> Result<()>;
     fn batch_add(
         &mut self,
@@ -63,6 +69,37 @@ pub(super) trait DistinctStateFunc: Sized + Send + StateSerde + 'static {
     ) -> Result<()>;
     fn merge(&mut self, rhs: &Self) -> Result<()>;
     fn build_entries(&mut self, types: &[DataType]) -> Result<Vec<BlockEntry>>;
+
+    fn spill_types(types: &[DataType]) -> Vec<DataType> {
+        types.to_vec()
+    }
+
+    fn spill_entries(&mut self, types: &[DataType]) -> Result<Vec<BlockEntry>> {
+        self.build_entries(types)
+    }
+
+    fn merge_spilled(&mut self, columns: ProjectedBlock, rows: usize) -> Result<()> {
+        self.batch_add(columns, None, rows)
+    }
+
+    fn visit_serialized(
+        state: &BlockEntry,
+        mut consume: impl FnMut(DataBlock) -> Result<()>,
+    ) -> Result<()> {
+        let Column::Tuple(fields) = state.to_column() else {
+            return Err(ErrorCode::BadBytes("Invalid serialized DISTINCT state"));
+        };
+        let Some(ScalarRef::Array(values)) = fields[0].index(0) else {
+            return Err(ErrorCode::BadBytes(
+                "DISTINCT state must contain an array of keys",
+            ));
+        };
+        for start in (0..values.len()).step_by(SPILL_BATCH_ROWS) {
+            let end = (start + SPILL_BATCH_ROWS).min(values.len());
+            consume(DataBlock::new_from_columns(vec![values.slice(start..end)]))?;
+        }
+        Ok(())
+    }
 }
 
 pub trait SimpleAccessType: AccessType {
@@ -151,6 +188,11 @@ where
 
     fn len(&self) -> usize {
         self.set.len()
+    }
+
+    fn memory_size(&self) -> usize {
+        std::mem::size_of_val(&self.set)
+            + self.set.capacity() * std::mem::size_of::<<A::Access as AccessType>::Scalar>()
     }
 
     fn add(&mut self, columns: ProjectedBlock, row: usize) -> Result<()> {
@@ -250,12 +292,34 @@ pub type AggregateDistinctDateState = AggregateDistinctAdapterState<DateAdapter>
 
 pub struct AggregateDistinctState {
     set: HashSet<Vec<u8>>,
+    bytes: usize,
 }
 
 impl DistinctStateFunc for AggregateDistinctState {
+    fn spill_types(_: &[DataType]) -> Vec<DataType> {
+        vec![DataType::Binary]
+    }
+
+    fn spill_entries(&mut self, _: &[DataType]) -> Result<Vec<BlockEntry>> {
+        let mut builder = BinaryColumnBuilder::with_capacity(self.len(), self.bytes);
+        for key in &self.set {
+            builder.put_slice(key);
+            builder.commit_row();
+        }
+        Ok(vec![Column::Binary(builder.build()).into()])
+    }
+
+    fn merge_spilled(&mut self, columns: ProjectedBlock, _: usize) -> Result<()> {
+        for key in columns[0].downcast::<BinaryType>().unwrap().iter() {
+            self.insert(key.to_vec());
+        }
+        Ok(())
+    }
+
     fn new() -> Self {
         AggregateDistinctState {
             set: HashSet::new(),
+            bytes: 0,
         }
     }
 
@@ -267,6 +331,10 @@ impl DistinctStateFunc for AggregateDistinctState {
         self.set.len()
     }
 
+    fn memory_size(&self) -> usize {
+        self.bytes + self.set.capacity() * (size_of::<Vec<u8>>() + 1)
+    }
+
     fn add(&mut self, columns: ProjectedBlock, row: usize) -> Result<()> {
         let values = columns
             .iter()
@@ -275,7 +343,7 @@ impl DistinctStateFunc for AggregateDistinctState {
 
         let mut buffer = Vec::with_capacity(values.len() * std::mem::size_of::<Scalar>());
         values.serialize(&mut buffer)?;
-        self.set.insert(buffer);
+        self.insert(buffer);
         Ok(())
     }
 
@@ -304,7 +372,9 @@ impl DistinctStateFunc for AggregateDistinctState {
     }
 
     fn merge(&mut self, rhs: &Self) -> Result<()> {
-        self.set.extend(rhs.set.clone());
+        for value in &rhs.set {
+            self.insert(value.clone());
+        }
         Ok(())
     }
 
@@ -323,6 +393,15 @@ impl DistinctStateFunc for AggregateDistinctState {
         }
 
         Ok(builders.into_iter().map(|b| b.build().into()).collect())
+    }
+}
+
+impl AggregateDistinctState {
+    fn insert(&mut self, value: Vec<u8>) {
+        let bytes = value.capacity();
+        if self.set.insert(value) {
+            self.bytes += bytes;
+        }
     }
 }
 
@@ -358,7 +437,7 @@ impl StateSerde for AggregateDistinctState {
     ) -> Result<()> {
         batch_merge1::<ArrayType<BinaryType>, Self, _>(places, loc, state, filter, |state, data| {
             for v in data.iter() {
-                state.set.insert(v.to_vec());
+                state.insert(v.to_vec());
             }
             Ok(())
         })
@@ -370,6 +449,26 @@ pub struct AggregateDistinctStringState {
 }
 
 impl DistinctStateFunc for AggregateDistinctStringState {
+    fn spill_types(_: &[DataType]) -> Vec<DataType> {
+        vec![DataType::Binary]
+    }
+
+    fn spill_entries(&mut self, _: &[DataType]) -> Result<Vec<BlockEntry>> {
+        let mut builder = BinaryColumnBuilder::with_capacity(self.len(), 0);
+        for key in self.set.iter() {
+            builder.put_slice(key.key());
+            builder.commit_row();
+        }
+        Ok(vec![Column::Binary(builder.build()).into()])
+    }
+
+    fn merge_spilled(&mut self, columns: ProjectedBlock, _: usize) -> Result<()> {
+        for key in columns[0].downcast::<BinaryType>().unwrap().iter() {
+            let _ = self.set.set_insert(key);
+        }
+        Ok(())
+    }
+
     fn new() -> Self {
         #![allow(clippy::arc_with_non_send_sync)]
         AggregateDistinctStringState {
@@ -383,6 +482,10 @@ impl DistinctStateFunc for AggregateDistinctStringState {
 
     fn len(&self) -> usize {
         self.set.len()
+    }
+
+    fn memory_size(&self) -> usize {
+        self.set.bytes_len(false)
     }
 
     fn add(&mut self, columns: ProjectedBlock, row: usize) -> Result<()> {
@@ -477,6 +580,38 @@ pub struct AggregateUniqStringState {
 }
 
 impl DistinctStateFunc for AggregateUniqStringState {
+    fn visit_serialized(
+        state: &BlockEntry,
+        mut consume: impl FnMut(DataBlock) -> Result<()>,
+    ) -> Result<()> {
+        let Column::Tuple(fields) = state.to_column() else {
+            return Err(ErrorCode::BadBytes(
+                "Invalid serialized string DISTINCT state",
+            ));
+        };
+        let column = fields[0]
+            .as_binary()
+            .ok_or_else(|| ErrorCode::BadBytes("String DISTINCT state must be binary"))?;
+        let mut data = column.index(0).unwrap();
+        let count = data.read_uvarint()?;
+        if count.checked_mul(16) != Some(data.len() as u64) {
+            return Err(ErrorCode::BadBytes(
+                "Invalid serialized string DISTINCT key count",
+            ));
+        }
+        for chunk in data.chunks(SPILL_BATCH_ROWS * 16) {
+            let mut builder = BinaryColumnBuilder::with_capacity(chunk.len() / 16, chunk.len());
+            for key in chunk.chunks_exact(16) {
+                builder.put_slice(key);
+                builder.commit_row();
+            }
+            consume(DataBlock::new_from_columns(vec![Column::Binary(
+                builder.build(),
+            )]))?;
+        }
+        Ok(())
+    }
+
     fn new() -> Self {
         AggregateUniqStringState {
             set: StackHashSet::new(),
@@ -489,6 +624,10 @@ impl DistinctStateFunc for AggregateUniqStringState {
 
     fn len(&self) -> usize {
         self.set.len()
+    }
+
+    fn memory_size(&self) -> usize {
+        self.set.capacity() * size_of::<u128>()
     }
 
     fn add(&mut self, columns: ProjectedBlock, row: usize) -> Result<()> {
@@ -540,6 +679,30 @@ impl DistinctStateFunc for AggregateUniqStringState {
     // This method won't be called.
     fn build_entries(&mut self, _types: &[DataType]) -> Result<Vec<BlockEntry>> {
         Ok(vec![])
+    }
+
+    fn spill_types(_: &[DataType]) -> Vec<DataType> {
+        vec![DataType::Binary]
+    }
+
+    fn spill_entries(&mut self, _: &[DataType]) -> Result<Vec<BlockEntry>> {
+        let mut builder = BinaryColumnBuilder::with_capacity(self.len(), self.len() * 16);
+        for key in self.set.iter() {
+            builder.put_slice(&key.key().to_le_bytes());
+            builder.commit_row();
+        }
+        Ok(vec![Column::Binary(builder.build()).into()])
+    }
+
+    fn merge_spilled(&mut self, columns: ProjectedBlock, _: usize) -> Result<()> {
+        let view = columns[0].downcast::<BinaryType>().unwrap();
+        for bytes in view.iter() {
+            let bytes = bytes.try_into().map_err(|_| {
+                ErrorCode::BadBytes("Invalid spilled COUNT DISTINCT string fingerprint")
+            })?;
+            let _ = self.set.set_insert(u128::from_le_bytes(bytes));
+        }
+        Ok(())
     }
 }
 

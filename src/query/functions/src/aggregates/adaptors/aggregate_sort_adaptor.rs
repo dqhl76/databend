@@ -28,11 +28,13 @@ use databend_common_expression::AggrStateRegistry;
 use databend_common_expression::AggrStateType;
 use databend_common_expression::AggregateFunction;
 use databend_common_expression::AggregateFunctionRef;
+use databend_common_expression::AggregateFunctionSpill;
 use databend_common_expression::BlockEntry;
 use databend_common_expression::Column;
 use databend_common_expression::ColumnBuilder;
 use databend_common_expression::DataBlock;
 use databend_common_expression::ProjectedBlock;
+use databend_common_expression::Scalar;
 use databend_common_expression::SortColumnDescription;
 use databend_common_expression::StateAddr;
 use databend_common_expression::StateSerdeItem;
@@ -47,6 +49,11 @@ use super::SerializeInfo;
 use super::StateSerde;
 use super::batch_merge1;
 use super::batch_serialize1;
+use crate::aggregates::aggregate_spill::FunctionState;
+use crate::aggregates::aggregate_spill::SPILL_BATCH_ROWS;
+use crate::aggregates::aggregate_spill_sort::AggregateSpillSort;
+use crate::aggregates::aggregate_streaming_spill::AggregateSpillResult;
+use crate::aggregates::aggregate_streaming_spill::AggregateStreamingSpillFunction;
 
 #[derive(Debug, Clone)]
 pub struct SortAggState {
@@ -100,6 +107,39 @@ pub struct AggregateFunctionSortAdaptor {
 }
 
 impl AggregateFunction for AggregateFunctionSortAdaptor {
+    fn state_memory_size(&self, place: AggrState) -> usize {
+        Self::get_state(place)
+            .columns
+            .iter()
+            .map(ColumnBuilder::memory_size)
+            .sum()
+    }
+
+    fn spill_serialize_type(&self) -> Vec<StateSerdeItem> {
+        self.serialize_type()
+            .into_iter()
+            .chain([StateSerdeItem::Binary(None)])
+            .collect()
+    }
+
+    fn with_spill(
+        self: Arc<Self>,
+        spill: Arc<dyn AggregateFunctionSpill>,
+    ) -> Result<Option<AggregateFunctionRef>> {
+        let inner = self
+            .inner
+            .clone()
+            .with_spill(spill.clone())?
+            .unwrap_or_else(|| self.inner.clone());
+        let result = Arc::new(SortSpillResult {
+            inner,
+            sort_descs: self.sort_descs.clone(),
+        });
+        Ok(Some(AggregateStreamingSpillFunction::create(
+            self, spill, result,
+        )))
+    }
+
     fn name(&self) -> &str {
         &self.name
     }
@@ -209,7 +249,10 @@ impl AggregateFunction for AggregateFunctionSortAdaptor {
         let state = Self::get_state(place);
 
         if state.columns.is_empty() || state.columns[0].len() == 0 {
-            return Ok(());
+            let result_state = FunctionState::new(self.inner.clone())?;
+            return self
+                .inner
+                .merge_result(result_state.place(), false, builder);
         }
         let num_rows = state.columns[0].len();
 
@@ -253,8 +296,10 @@ impl AggregateFunction for AggregateFunctionSortAdaptor {
         }
         block = DataBlock::sort(&block, &sort_descs, None)?;
 
-        let inner_place = place.remove_first_loc();
-        self.inner.init_state(inner_place);
+        // Read-only finalization may run repeatedly (for example in a window).
+        // Keep its reducer separate from the retained ordered input state.
+        let result_state = FunctionState::new(self.inner.clone())?;
+        let inner_place = result_state.place();
 
         let args = (0..block.num_columns())
             .filter(|i| !not_arg_indexes.contains(i))
@@ -342,5 +387,99 @@ impl AggregateFunctionSortAdaptor {
 impl Display for AggregateFunctionSortAdaptor {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.name)
+    }
+}
+
+struct SortSpillResult {
+    inner: AggregateFunctionRef,
+    sort_descs: Vec<AggregateFunctionSortDesc>,
+}
+
+impl AggregateSpillResult for SortSpillResult {
+    fn visit_serialized(
+        &self,
+        state: &BlockEntry,
+        _memory_limit: usize,
+        consume: &mut dyn FnMut(BlockEntry) -> Result<()>,
+    ) -> Result<()> {
+        let column = state.to_column();
+        let fields = column.as_tuple().unwrap();
+        let mut bytes = fields[0].as_binary().unwrap().index(0).unwrap();
+        let columns: Vec<Column> = BorshDeserialize::deserialize(&mut bytes)?;
+        if columns.is_empty() {
+            return Ok(());
+        }
+        let block = DataBlock::new_from_columns(columns);
+        for start in (0..block.num_rows()).step_by(SPILL_BATCH_ROWS) {
+            let end = (start + SPILL_BATCH_ROWS).min(block.num_rows());
+            let columns = block
+                .slice(start..end)
+                .columns()
+                .iter()
+                .map(|c| c.to_column())
+                .collect::<Vec<_>>();
+            let mut bytes = Vec::new();
+            columns.serialize(&mut bytes)?;
+            consume(BlockEntry::new_const_column(
+                state.data_type(),
+                Scalar::Tuple(vec![Scalar::Binary(bytes)]),
+                1,
+            ))?;
+        }
+        Ok(())
+    }
+
+    fn merge_result(
+        &self,
+        _function: &AggregateFunctionRef,
+        spill: Arc<dyn AggregateFunctionSpill>,
+        states: &mut dyn Iterator<Item = Result<DataBlock>>,
+        builder: &mut ColumnBuilder,
+    ) -> Result<()> {
+        let mut excluded = HashSet::new();
+        let descriptions = self
+            .sort_descs
+            .iter()
+            .map(|desc| {
+                let offset = match desc.index {
+                    SymbolOrOffset::Symbol(index) => index.as_usize(),
+                    SymbolOrOffset::Offset(offset) => offset,
+                };
+                if !desc.is_reuse_index {
+                    excluded.insert(offset);
+                }
+                SortColumnDescription {
+                    offset,
+                    asc: desc.asc,
+                    nulls_first: desc.nulls_first,
+                }
+            })
+            .collect();
+        let mut sorter = AggregateSpillSort::new(spill.clone(), descriptions);
+        for block in states {
+            let block = block?;
+            let column = block.get_by_offset(0).to_column();
+            let fields = column.as_tuple().unwrap();
+            for mut bytes in fields[0].as_binary().unwrap().iter() {
+                spill.check_interrupt()?;
+                let columns: Vec<Column> = BorshDeserialize::deserialize(&mut bytes)?;
+                if !columns.is_empty() {
+                    sorter.push(DataBlock::new_from_columns(columns))?;
+                }
+            }
+        }
+        let state = FunctionState::new(self.inner.clone())?;
+        sorter.finish(|block| {
+            let args = (0..block.num_columns())
+                .filter(|i| !excluded.contains(i))
+                .collect::<Vec<_>>();
+            self.inner.accumulate(
+                state.place(),
+                ProjectedBlock::project(&args, &block),
+                None,
+                block.num_rows(),
+            )
+        })?;
+        self.inner.merge_result(state.place(), false, builder)
     }
 }

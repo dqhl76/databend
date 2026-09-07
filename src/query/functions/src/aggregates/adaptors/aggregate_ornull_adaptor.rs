@@ -19,6 +19,7 @@ use databend_common_base::hints::assume;
 use databend_common_exception::Result;
 use databend_common_expression::AggrStateRegistry;
 use databend_common_expression::AggrStateType;
+use databend_common_expression::AggregateFunctionSpill;
 use databend_common_expression::BlockEntry;
 use databend_common_expression::Column;
 use databend_common_expression::ColumnBuilder;
@@ -82,6 +83,25 @@ fn flag_offset(place: AggrState) -> usize {
 }
 
 impl AggregateFunction for AggregateFunctionOrNullAdaptor {
+    fn spill_serialize_type(&self) -> Vec<StateSerdeItem> {
+        self.nested
+            .spill_serialize_type()
+            .into_iter()
+            .chain([DataType::Boolean.into()])
+            .collect()
+    }
+
+    fn with_spill(
+        self: Arc<Self>,
+        spill: Arc<dyn AggregateFunctionSpill>,
+    ) -> Result<Option<AggregateFunctionRef>> {
+        self.nested
+            .clone()
+            .with_spill(spill)?
+            .map(Self::create)
+            .transpose()
+    }
+
     fn name(&self) -> &str {
         self.nested.name()
     }

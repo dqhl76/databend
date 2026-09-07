@@ -24,6 +24,7 @@ use databend_common_expression::DataSchemaRef;
 use databend_common_expression::DataSchemaRefExt;
 use databend_common_expression::HashTableConfig;
 use databend_common_expression::SortColumnDescription;
+use databend_common_expression::StateSerdeType;
 use databend_common_expression::types::DataType;
 use databend_common_functions::aggregates::AggregateFunctionFactory;
 use databend_common_pipeline::core::ProcessorPtr;
@@ -104,7 +105,10 @@ impl IPhysicalPlan for AggregatePartial {
                 )
                 .unwrap();
 
-            fields.push(DataField::new(&name, func.serialize_data_type()))
+            fields.push(DataField::new(
+                &name,
+                StateSerdeType::new(func.spill_serialize_type()).data_type(),
+            ))
         }
 
         for (idx, field) in self.group_by.iter().zip(
@@ -175,6 +179,7 @@ impl IPhysicalPlan for AggregatePartial {
         let cluster = &builder.ctx.get_cluster();
 
         let params = PipelineBuilder::build_aggregator_params(
+            builder.ctx.clone(),
             self.input.output_schema()?,
             &self.group_by,
             &self.agg_funcs,

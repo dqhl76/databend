@@ -25,6 +25,8 @@ use databend_common_column::binary::BinaryColumnBuilder;
 use databend_common_exception::Result;
 use databend_common_expression::AggrStateRegistry;
 use databend_common_expression::AggrStateType;
+use databend_common_expression::AggregateFunctionRef;
+use databend_common_expression::AggregateFunctionSpill;
 use databend_common_expression::BlockEntry;
 use databend_common_expression::Column;
 use databend_common_expression::ColumnBuilder;
@@ -64,6 +66,8 @@ use super::SerializeInfo;
 use super::StateAddr;
 use super::StateSerde;
 use super::aggregate_scalar_state::ScalarStateFunc;
+use super::aggregate_streaming_spill::AggregateStreamingSpillFunction;
+use super::aggregate_streaming_spill::ArraySpillResult;
 use super::assert_params;
 use super::assert_unary_arguments;
 use super::batch_merge1;
@@ -74,25 +78,35 @@ struct ArrayAggStateAny<T>
 where T: ValueType
 {
     values: Vec<T::Scalar>,
+    bytes: usize,
 }
 
 impl<T> Default for ArrayAggStateAny<T>
 where T: ValueType
 {
     fn default() -> Self {
-        Self { values: Vec::new() }
+        Self {
+            values: Vec::new(),
+            bytes: 0,
+        }
     }
 }
 
 impl<T> ScalarStateFunc<T> for ArrayAggStateAny<T>
 where T: ValueType
 {
+    fn memory_size(&self) -> usize {
+        self.bytes + self.values.capacity() * size_of::<T::Scalar>()
+    }
+
     fn new() -> Self {
         Self::default()
     }
 
     fn add(&mut self, other: Option<T::ScalarRef<'_>>) {
-        self.values.push(T::to_owned_scalar(other.unwrap()));
+        let value = other.unwrap();
+        self.bytes += T::scalar_memory_size(&value);
+        self.values.push(T::to_owned_scalar(value));
     }
 
     fn add_batch(&mut self, column: ColumnView<T>, _validity: Option<&Bitmap>) -> Result<()> {
@@ -101,6 +115,7 @@ where T: ValueType
         }
 
         for val in column.iter() {
+            self.bytes += T::scalar_memory_size(&val);
             self.values.push(T::to_owned_scalar(val));
         }
 
@@ -108,6 +123,7 @@ where T: ValueType
     }
 
     fn merge(&mut self, rhs: &Self) -> Result<()> {
+        self.bytes += rhs.bytes;
         self.values.extend_from_slice(&rhs.values);
         Ok(())
     }
@@ -118,6 +134,7 @@ where T: ValueType
 
         let mut inner_builder = ColumnBuilder::with_capacity(inner_type, self.values.len());
         let values = mem::take(&mut self.values);
+        self.bytes = 0;
         for value in values.into_iter() {
             let val = T::upcast_scalar_with_type(value, inner_type);
             inner_builder.push(val.as_ref());
@@ -163,6 +180,7 @@ where
     ) -> Result<()> {
         batch_merge1::<ArrayType<T>, Self, _>(places, loc, state, filter, |state, values| {
             for val in T::iter_column(&values) {
+                state.bytes += T::scalar_memory_size(&val);
                 state.values.push(T::to_owned_scalar(val));
             }
             Ok(())
@@ -186,6 +204,10 @@ impl<T: Debug + SimpleType> Default for ArrayAggStateSimple<T> {
 impl<T> ScalarStateFunc<SimpleValueType<T>> for ArrayAggStateSimple<T>
 where T: SimpleType + Debug
 {
+    fn memory_size(&self) -> usize {
+        self.values.capacity() * size_of::<T::Scalar>()
+    }
+
     fn new() -> Self {
         Self::default()
     }
@@ -296,6 +318,10 @@ struct ArrayAggStateZST<const IS_NULL: bool> {
 impl<V, const IS_NULL: bool> ScalarStateFunc<ZeroSizeValueType<V>> for ArrayAggStateZST<IS_NULL>
 where V: ZeroSizeType
 {
+    fn memory_size(&self) -> usize {
+        self.validity.as_slice().len()
+    }
+
     fn new() -> Self {
         Self {
             validity: Default::default(),
@@ -407,6 +433,10 @@ impl<T: Debug + ArgType> Default for ArrayAggStateBinary<T> {
 impl<T> ScalarStateFunc<T> for ArrayAggStateBinary<T>
 where T: ArgType + Debug + std::marker::Send
 {
+    fn memory_size(&self) -> usize {
+        self.builder.data.capacity() + self.builder.offsets.capacity() * size_of::<u64>()
+    }
+
     fn new() -> Self {
         Self::default()
     }
@@ -567,6 +597,28 @@ where
     T: AccessType,
     State: Clone + ScalarStateFunc<T>,
 {
+    fn state_memory_size(&self, place: AggrState) -> usize {
+        place.get::<State>().memory_size()
+    }
+
+    fn spill_serialize_type(&self) -> Vec<StateSerdeItem> {
+        self.serialize_type()
+            .into_iter()
+            .chain([StateSerdeItem::Binary(None)])
+            .collect()
+    }
+
+    fn with_spill(
+        self: Arc<Self>,
+        spill: Arc<dyn AggregateFunctionSpill>,
+    ) -> Result<Option<AggregateFunctionRef>> {
+        Ok(Some(AggregateStreamingSpillFunction::create(
+            self,
+            spill,
+            Arc::new(ArraySpillResult),
+        )))
+    }
+
     fn name(&self) -> &str {
         "AggregateArrayAggFunction"
     }

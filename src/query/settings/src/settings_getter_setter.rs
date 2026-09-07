@@ -583,6 +583,14 @@ impl Settings {
         Ok(self.try_get_u64("aggregate_spilling_memory_ratio")? as usize)
     }
 
+    pub fn get_aggregate_function_spilling_memory_threshold(&self) -> Result<usize> {
+        Ok(self.try_get_u64("aggregate_function_spilling_memory_threshold")? as usize)
+    }
+
+    pub fn get_aggregate_function_restore_memory_threshold(&self) -> Result<usize> {
+        Ok(self.try_get_u64("aggregate_function_restore_memory_threshold")? as usize)
+    }
+
     pub fn get_window_partition_spilling_memory_ratio(&self) -> Result<usize> {
         Ok(self.try_get_u64("window_partition_spilling_memory_ratio")? as usize)
     }

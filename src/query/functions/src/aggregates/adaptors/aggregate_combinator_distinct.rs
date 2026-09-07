@@ -20,6 +20,8 @@ use std::sync::Arc;
 use databend_common_exception::Result;
 use databend_common_expression::AggrStateRegistry;
 use databend_common_expression::AggrStateType;
+use databend_common_expression::AggregateFunctionRef;
+use databend_common_expression::AggregateFunctionSpill;
 use databend_common_expression::BlockEntry;
 use databend_common_expression::ColumnBuilder;
 use databend_common_expression::ProjectedBlock;
@@ -49,6 +51,7 @@ use super::aggregate_distinct_state::AggregateUniqStringState;
 use super::aggregate_distinct_state::DistinctStateFunc;
 use super::assert_variadic_arguments;
 use crate::aggregates::AggregateFunctionFeatures;
+use crate::aggregates::aggregate_distinct_spill::AggregateDistinctSpillFunction;
 
 #[derive(Clone)]
 pub struct AggregateDistinctCombinator<State> {
@@ -117,6 +120,25 @@ where State: DistinctStateFunc
 
     fn serialize_type(&self) -> Vec<StateSerdeItem> {
         State::serialize_type(None)
+    }
+
+    fn spill_serialize_type(&self) -> Vec<StateSerdeItem> {
+        self.serialize_type()
+            .into_iter()
+            .chain([StateSerdeItem::Binary(None)])
+            .collect()
+    }
+
+    fn with_spill(
+        self: Arc<Self>,
+        spill: Arc<dyn AggregateFunctionSpill>,
+    ) -> Result<Option<AggregateFunctionRef>> {
+        Ok(Some(AggregateDistinctSpillFunction::<State>::create(
+            self.name.clone(),
+            self.nested.clone(),
+            self.arguments.clone(),
+            spill,
+        )?))
     }
 
     fn batch_serialize(

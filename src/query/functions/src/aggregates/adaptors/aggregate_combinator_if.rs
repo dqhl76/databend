@@ -18,6 +18,7 @@ use std::sync::Arc;
 use databend_common_exception::ErrorCode;
 use databend_common_exception::Result;
 use databend_common_expression::AggrStateRegistry;
+use databend_common_expression::AggregateFunctionSpill;
 use databend_common_expression::BlockEntry;
 use databend_common_expression::Column;
 use databend_common_expression::ColumnBuilder;
@@ -94,6 +95,22 @@ impl AggregateIfCombinator {
 }
 
 impl AggregateFunction for AggregateIfCombinator {
+    fn spill_serialize_type(&self) -> Vec<StateSerdeItem> {
+        self.nested.spill_serialize_type()
+    }
+
+    fn with_spill(
+        self: Arc<Self>,
+        spill: Arc<dyn AggregateFunctionSpill>,
+    ) -> Result<Option<AggregateFunctionRef>> {
+        Ok(self.nested.clone().with_spill(spill)?.map(|nested| {
+            Arc::new(Self {
+                nested,
+                ..self.as_ref().clone()
+            }) as AggregateFunctionRef
+        }))
+    }
+
     fn name(&self) -> &str {
         &self.name
     }

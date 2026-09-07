@@ -47,6 +47,7 @@ pub struct PartialSingleStateAggregator {
     states_layout: StatesLayout,
     arg_indices: Vec<Vec<usize>>,
     funcs: Vec<AggregateFunctionRef>,
+    states_dropped: bool,
 
     start: Instant,
     first_block_start: Option<Instant>,
@@ -79,6 +80,7 @@ impl PartialSingleStateAggregator {
             addr,
             states_layout: state_layout,
             funcs: params.aggregate_functions.clone(),
+            states_dropped: false,
             arg_indices: params.aggregate_functions_arguments.clone(),
             start: Instant::now(),
             first_block_start: None,
@@ -164,6 +166,7 @@ impl AccumulatingTransform for PartialSingleStateAggregator {
         };
 
         // destroy states
+        self.states_dropped = true;
         for (loc, func) in self.states_layout.states_loc.iter().zip(self.funcs.iter()) {
             if func.need_manual_drop_state() {
                 unsafe { func.drop_state(AggrState::new(self.addr, loc)) }
@@ -188,13 +191,30 @@ impl AccumulatingTransform for PartialSingleStateAggregator {
     }
 }
 
+impl Drop for PartialSingleStateAggregator {
+    fn drop(&mut self) {
+        if !self.states_dropped {
+            for (loc, func) in self.states_layout.states_loc.iter().zip(&self.funcs) {
+                if func.need_manual_drop_state() {
+                    unsafe { func.drop_state(AggrState::new(self.addr, loc)) };
+                }
+            }
+        }
+    }
+}
+
 /// SELECT COUNT | SUM FROM table;
 pub struct FinalSingleStateAggregator {
-    arena: Bump,
+    _arena: Bump,
+    addr: StateAddr,
     states_layout: StatesLayout,
-    to_merge_data: Vec<DataBlock>,
     funcs: Vec<AggregateFunctionRef>,
+    states_dropped: bool,
 }
+
+// The processor owns the arena behind `addr`; moving it between executor
+// threads does not share the aggregate states or change their addresses.
+unsafe impl Send for FinalSingleStateAggregator {}
 
 impl FinalSingleStateAggregator {
     pub fn try_create(
@@ -210,15 +230,24 @@ impl FinalSingleStateAggregator {
             .clone();
 
         assert!(!states_layout.states_loc.is_empty());
+        let addr = arena.alloc_layout(states_layout.layout).into();
+        for (func, loc) in params
+            .aggregate_functions
+            .iter()
+            .zip(&states_layout.states_loc)
+        {
+            func.init_state(AggrState::new(addr, loc));
+        }
 
         Ok(AccumulatingTransformer::create(
             input,
             output,
             FinalSingleStateAggregator {
-                arena,
+                _arena: arena,
+                addr,
                 states_layout,
                 funcs: params.aggregate_functions.clone(),
-                to_merge_data: Vec::new(),
+                states_dropped: false,
             },
         ))
     }
@@ -229,7 +258,15 @@ impl AccumulatingTransform for FinalSingleStateAggregator {
 
     fn transform(&mut self, block: DataBlock) -> Result<Vec<DataBlock>> {
         if !block.is_empty() {
-            self.to_merge_data.push(block);
+            let places = vec![self.addr; block.num_rows()];
+            for (idx, (func, loc)) in self
+                .funcs
+                .iter()
+                .zip(&self.states_layout.states_loc)
+                .enumerate()
+            {
+                func.batch_merge(&places, loc, block.get_by_offset(idx), None)?;
+            }
         }
 
         Ok(vec![])
@@ -240,40 +277,43 @@ impl AccumulatingTransform for FinalSingleStateAggregator {
             return Ok(vec![]);
         }
 
-        let main_addr: StateAddr = self.arena.alloc_layout(self.states_layout.layout).into();
-
-        for (func, loc) in self.funcs.iter().zip(self.states_layout.states_loc.iter()) {
-            func.init_state(AggrState::new(main_addr, loc));
-        }
-
         let mut result_builders = self
             .funcs
             .iter()
             .map(|f| Ok(ColumnBuilder::with_capacity(&f.return_type()?, 1)))
             .collect::<Result<Vec<_>>>()?;
 
-        for (idx, ((func, loc), builder)) in self
+        for ((func, loc), builder) in self
             .funcs
             .iter()
             .zip(self.states_layout.states_loc.iter())
             .zip(result_builders.iter_mut())
-            .enumerate()
         {
-            for block in self.to_merge_data.iter() {
-                func.batch_merge(&[main_addr], loc, block.get_by_offset(idx), None)?;
-            }
-            func.merge_result(AggrState::new(main_addr, loc), false, builder)?;
+            func.merge_result(AggrState::new(self.addr, loc), false, builder)?;
         }
 
         let columns = result_builders.into_iter().map(|b| b.build()).collect();
 
         // destroy states
+        self.states_dropped = true;
         for (func, loc) in self.funcs.iter().zip(self.states_layout.states_loc.iter()) {
             if func.need_manual_drop_state() {
-                unsafe { func.drop_state(AggrState::new(main_addr, loc)) }
+                unsafe { func.drop_state(AggrState::new(self.addr, loc)) }
             }
         }
 
         Ok(vec![DataBlock::new_from_columns(columns)])
+    }
+}
+
+impl Drop for FinalSingleStateAggregator {
+    fn drop(&mut self) {
+        if !self.states_dropped {
+            for (func, loc) in self.funcs.iter().zip(&self.states_layout.states_loc) {
+                if func.need_manual_drop_state() {
+                    unsafe { func.drop_state(AggrState::new(self.addr, loc)) };
+                }
+            }
+        }
     }
 }

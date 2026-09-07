@@ -4,6 +4,8 @@
 
 - [Aggregate function](https://docs.databend.com/developer/community/contributor/how-to-write-aggregate-functions)
 
+- [Function-owned aggregate spilling](src/aggregates/README.md)
+
 ## Don't forget to add tests
 
 - run:

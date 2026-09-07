@@ -138,6 +138,9 @@ impl<T: ValueType> ChangeIf<T> for CmpAny {
 }
 
 pub(super) trait ScalarStateFunc<T: AccessType>: StateSerde + Send + 'static {
+    fn memory_size(&self) -> usize {
+        std::mem::size_of_val(self)
+    }
     fn new() -> Self;
     fn add(&mut self, other: Option<T::ScalarRef<'_>>);
     fn add_batch(&mut self, column: ColumnView<T>, validity: Option<&Bitmap>) -> Result<()>;

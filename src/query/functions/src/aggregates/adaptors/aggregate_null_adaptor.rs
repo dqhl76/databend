@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use databend_common_base::hints::assume;
 use databend_common_exception::Result;
+use databend_common_expression::AggregateFunctionSpill;
 use databend_common_expression::BlockEntry;
 use databend_common_expression::Column;
 use databend_common_expression::ColumnBuilder;
@@ -112,6 +113,17 @@ impl<const NULLABLE_RESULT: bool> AggregateNullUnaryAdaptor<NULLABLE_RESULT> {
 }
 
 impl<const NULLABLE_RESULT: bool> AggregateFunction for AggregateNullUnaryAdaptor<NULLABLE_RESULT> {
+    fn spill_serialize_type(&self) -> Vec<StateSerdeItem> {
+        self.0.spill_serialize_type()
+    }
+
+    fn with_spill(
+        self: Arc<Self>,
+        spill: Arc<dyn AggregateFunctionSpill>,
+    ) -> Result<Option<AggregateFunctionRef>> {
+        Ok(self.0.nested.clone().with_spill(spill)?.map(Self::create))
+    }
+
     fn name(&self) -> &str {
         "AggregateNullUnaryAdaptor"
     }
@@ -257,6 +269,17 @@ impl<const NULLABLE_RESULT: bool> AggregateNullVariadicAdaptor<NULLABLE_RESULT> 
 impl<const NULLABLE_RESULT: bool> AggregateFunction
     for AggregateNullVariadicAdaptor<NULLABLE_RESULT>
 {
+    fn spill_serialize_type(&self) -> Vec<StateSerdeItem> {
+        self.0.spill_serialize_type()
+    }
+
+    fn with_spill(
+        self: Arc<Self>,
+        spill: Arc<dyn AggregateFunctionSpill>,
+    ) -> Result<Option<AggregateFunctionRef>> {
+        Ok(self.0.nested.clone().with_spill(spill)?.map(Self::create))
+    }
+
     fn name(&self) -> &str {
         "AggregateNullVariadicAdaptor"
     }
@@ -368,6 +391,14 @@ struct CommonNullAdaptor<const NULLABLE_RESULT: bool> {
 }
 
 impl<const NULLABLE_RESULT: bool> CommonNullAdaptor<NULLABLE_RESULT> {
+    fn spill_serialize_type(&self) -> Vec<StateSerdeItem> {
+        let mut fields = self.nested.spill_serialize_type();
+        if NULLABLE_RESULT {
+            fields.push(DataType::Boolean.into());
+        }
+        fields
+    }
+
     fn return_type(&self) -> Result<DataType> {
         if !NULLABLE_RESULT {
             return self.nested.return_type();

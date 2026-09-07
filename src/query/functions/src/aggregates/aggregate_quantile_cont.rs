@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::marker::PhantomData;
+use std::sync::Arc;
+
 use databend_common_exception::ErrorCode;
 use databend_common_exception::Result;
 use databend_common_expression::AggrStateLoc;
@@ -36,6 +39,9 @@ use super::SerializeInfo;
 use super::StateSerde;
 use super::StateSerdeItem;
 use super::UnaryState;
+use super::aggregate_quantile_spill::QuantileSpillResult;
+use super::aggregate_quantile_spill::interpolate_decimal;
+use super::aggregate_streaming_spill::AggregateSpillResult;
 use super::assert_params;
 use super::assert_unary_arguments;
 use super::batch_merge1;
@@ -76,6 +82,18 @@ where
     R: ValueType,
 {
     type FunctionInfo = QuantileData;
+
+    fn memory_size(&self) -> usize {
+        self.value.capacity() * size_of::<F64>()
+    }
+
+    fn spill_result(info: &QuantileData) -> Option<Arc<dyn AggregateSpillResult>> {
+        Some(Arc::new(QuantileSpillResult::<Float64Type> {
+            levels: info.levels.clone(),
+            interpolate: |left, right, fraction| Ok((left.0 + (right.0 - left.0) * fraction).into()),
+            _value: PhantomData,
+        }))
+    }
 
     fn add(&mut self, other: T::ScalarRef<'_>, _: &Self::FunctionInfo) -> Result<()> {
         let other = T::to_owned_scalar(other).as_();
@@ -210,15 +228,7 @@ where
             *self.value.get(whole + 1).unwrap()
         };
 
-        let result = value1
-            .checked_sub(value)
-            .and_then(|sub_result| sub_result.checked_mul(Decimal::from_float(frac)))
-            .and_then(|mul_result| value.checked_add(mul_result));
-
-        match result {
-            Some(r) => Ok(r),
-            None => Err(ErrorCode::Overflow("Decimal overflow when interpolate")),
-        }
+        interpolate_decimal(value, value1, frac)
     }
 }
 
@@ -228,6 +238,18 @@ where
     T::Scalar: Decimal,
 {
     type FunctionInfo = QuantileData;
+
+    fn memory_size(&self) -> usize {
+        self.value.capacity() * size_of::<T::Scalar>()
+    }
+
+    fn spill_result(info: &QuantileData) -> Option<Arc<dyn AggregateSpillResult>> {
+        Some(Arc::new(QuantileSpillResult::<T> {
+            levels: info.levels.clone(),
+            interpolate: interpolate_decimal::<T::Scalar>,
+            _value: PhantomData,
+        }))
+    }
 
     fn add(&mut self, other: T::ScalarRef<'_>, _: &Self::FunctionInfo) -> Result<()> {
         self.value.push(T::to_owned_scalar(other));
@@ -279,6 +301,18 @@ where
     T::Scalar: Decimal,
 {
     type FunctionInfo = QuantileData;
+
+    fn memory_size(&self) -> usize {
+        self.value.capacity() * size_of::<T::Scalar>()
+    }
+
+    fn spill_result(info: &QuantileData) -> Option<Arc<dyn AggregateSpillResult>> {
+        Some(Arc::new(QuantileSpillResult::<T> {
+            levels: info.levels.clone(),
+            interpolate: interpolate_decimal::<T::Scalar>,
+            _value: PhantomData,
+        }))
+    }
 
     fn add(&mut self, other: T::ScalarRef<'_>, _: &Self::FunctionInfo) -> Result<()> {
         self.value.push(T::to_owned_scalar(other));

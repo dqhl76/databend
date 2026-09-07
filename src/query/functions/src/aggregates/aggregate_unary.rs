@@ -23,6 +23,7 @@ use databend_common_expression::AggrStateRegistry;
 use databend_common_expression::AggrStateType;
 use databend_common_expression::AggregateFunction;
 use databend_common_expression::AggregateFunctionRef;
+use databend_common_expression::AggregateFunctionSpill;
 use databend_common_expression::BlockEntry;
 use databend_common_expression::ColumnBuilder;
 use databend_common_expression::ColumnView;
@@ -38,6 +39,8 @@ use super::AggrState;
 use super::AggrStateLoc;
 use super::SerializeInfo;
 use super::StateSerde;
+use super::aggregate_streaming_spill::AggregateSpillResult;
+use super::aggregate_streaming_spill::AggregateStreamingSpillFunction;
 
 pub(super) trait UnaryState<T, R>: StateSerde + Default + Send + 'static
 where
@@ -45,6 +48,14 @@ where
     R: ValueType,
 {
     type FunctionInfo: Send + Sync = ();
+
+    fn memory_size(&self) -> usize {
+        std::mem::size_of_val(self)
+    }
+
+    fn spill_result(_info: &Self::FunctionInfo) -> Option<Arc<dyn AggregateSpillResult>> {
+        None
+    }
 
     fn add(&mut self, other: T::ScalarRef<'_>, function_data: &Self::FunctionInfo) -> Result<()>;
 
@@ -167,6 +178,26 @@ where
     T: AccessType,
     R: ValueType,
 {
+    fn state_memory_size(&self, place: AggrState) -> usize {
+        place.get::<S>().memory_size()
+    }
+
+    fn spill_serialize_type(&self) -> Vec<StateSerdeItem> {
+        let mut fields = self.serialize_type();
+        if S::spill_result(&self.function_info).is_some() {
+            fields.push(StateSerdeItem::Binary(None));
+        }
+        fields
+    }
+
+    fn with_spill(
+        self: Arc<Self>,
+        spill: Arc<dyn AggregateFunctionSpill>,
+    ) -> Result<Option<AggregateFunctionRef>> {
+        Ok(S::spill_result(&self.function_info)
+            .map(|result| AggregateStreamingSpillFunction::create(self, spill, result)))
+    }
+
     fn name(&self) -> &str {
         &self.display_name
     }

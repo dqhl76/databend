@@ -13,6 +13,8 @@
 // limitations under the License.
 
 mod adapter;
+mod aggregate_function;
+mod aggregate_function_policy;
 mod async_buffer;
 mod block_reader;
 mod block_writer;
@@ -23,6 +25,7 @@ mod serialize;
 mod test_memory;
 
 pub use adapter::*;
+pub use aggregate_function::AggregateFunctionSpiller;
 pub use async_buffer::BufferWriter;
 pub use async_buffer::SpillTarget;
 pub use async_buffer::SpillsBufferPool;

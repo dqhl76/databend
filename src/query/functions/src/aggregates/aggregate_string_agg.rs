@@ -14,6 +14,7 @@
 
 use std::fmt::Display;
 use std::fmt::Write;
+use std::sync::Arc;
 
 use databend_common_exception::ErrorCode;
 use databend_common_exception::Result;
@@ -42,6 +43,8 @@ use super::AggregateUnaryFunction;
 use super::SerializeInfo;
 use super::StateSerde;
 use super::UnaryState;
+use super::aggregate_streaming_spill::AggregateSpillResult;
+use super::aggregate_streaming_spill::StringSpillResult;
 use super::assert_variadic_arguments;
 use super::batch_merge1;
 use super::batch_serialize1;
@@ -55,6 +58,16 @@ impl<T> UnaryState<T, StringType> for StringAggState
 where T: ToStringType
 {
     type FunctionInfo = String;
+
+    fn memory_size(&self) -> usize {
+        self.values.capacity()
+    }
+
+    fn spill_result(delimiter: &String) -> Option<Arc<dyn AggregateSpillResult>> {
+        Some(Arc::new(StringSpillResult {
+            delimiter: delimiter.clone(),
+        }))
+    }
 
     fn add(&mut self, other: T::ScalarRef<'_>, delimiter: &String) -> Result<()> {
         write!(self.values, "{}{delimiter}", T::format(&other)).unwrap();

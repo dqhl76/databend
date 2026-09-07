@@ -28,9 +28,12 @@ use databend_common_sql::plans::UDFType;
 use crate::pipelines::PipelineBuilder;
 use crate::pipelines::processors::transforms::aggregator::AggregatorParams;
 use crate::pipelines::processors::transforms::aggregator::create_udaf_script_function;
+use crate::sessions::QueryContext;
+use crate::spillers::AggregateFunctionSpiller;
 
 impl PipelineBuilder {
     pub fn build_aggregator_params(
+        ctx: Arc<QueryContext>,
         input_schema: DataSchemaRef,
         group_by: &[Symbol],
         agg_funcs: &[AggregateFunctionDesc],
@@ -38,6 +41,7 @@ impl PipelineBuilder {
         max_block_rows: usize,
         max_block_bytes: usize,
     ) -> Result<Arc<AggregatorParams>> {
+        let spill = AggregateFunctionSpiller::try_create(ctx)?;
         let mut agg_args = Vec::with_capacity(agg_funcs.len());
         let (group_by, group_data_types) = group_by
             .iter()
@@ -90,7 +94,7 @@ impl PipelineBuilder {
                     })
                     .collect::<Vec<_>>();
 
-                match &agg_func.sig.udaf {
+                let function = match &agg_func.sig.udaf {
                     None => AggregateFunctionFactory::instance().get(
                         agg_func.sig.name.as_str(),
                         agg_func.sig.params.clone(),
@@ -117,7 +121,11 @@ impl PipelineBuilder {
                         agg_func.sig.return_type.clone(),
                     ),
                     Some((UDFType::Server(_), _state_fields)) => unimplemented!(),
-                }
+                }?;
+                Ok(function
+                    .clone()
+                    .with_spill(spill.clone())?
+                    .unwrap_or(function))
             })
             .collect::<Result<_>>()?;
 

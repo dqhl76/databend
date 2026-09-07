@@ -21,6 +21,7 @@ use databend_common_exception::Result;
 use super::AggrState;
 use super::AggrStateLoc;
 use super::AggrStateRegistry;
+use super::AggregateFunctionSpill;
 use super::StateAddr;
 use super::StateSerdeItem;
 use super::StateSerdeType;
@@ -41,6 +42,12 @@ pub trait AggregateFunction: fmt::Display + Sync + Send {
     fn init_state(&self, place: AggrState);
 
     fn register_state(&self, registry: &mut AggrStateRegistry);
+
+    /// Memory retained by this function's state, excluding shared query I/O
+    /// buffers and final output builders. Used by function-owned spilling.
+    fn state_memory_size(&self, _place: AggrState) -> usize {
+        0
+    }
 
     // accumulate is to accumulate the arrays in batch mode
     // common used when there is no group by for aggregate function
@@ -71,9 +78,28 @@ pub trait AggregateFunction: fmt::Display + Sync + Send {
 
     /// Describes the physical aggregate state layout.
     ///
-    /// This layout is persisted in typed aggregate-state table schemas and must remain stable.
-    /// Changing it requires a versioned metadata migration for previously stored states.
+    /// On factory-created functions this layout is persisted in aggregate-state
+    /// table schemas and must remain stable. Query-scoped instances returned by
+    /// `with_spill` instead describe an ephemeral execution layout and must not
+    /// be used to create durable aggregate states.
     fn serialize_type(&self) -> Vec<StateSerdeItem>;
+
+    /// Intermediate state layout for query execution. This may include spill
+    /// references; `serialize_type` remains the durable aggregate-state format.
+    fn spill_serialize_type(&self) -> Vec<StateSerdeItem> {
+        self.serialize_type()
+    }
+
+    /// Create a query-scoped implementation with function-owned spill/restore.
+    /// Its serialization must match `spill_serialize_type`. The default leaves
+    /// the function unchanged. Adaptors that expose durable states must not
+    /// propagate this specialization to their nested function.
+    fn with_spill(
+        self: Arc<Self>,
+        _spill: Arc<dyn AggregateFunctionSpill>,
+    ) -> Result<Option<AggregateFunctionRef>> {
+        Ok(None)
+    }
 
     fn serialize_data_type(&self) -> DataType {
         let serde_type = StateSerdeType::new(self.serialize_type());

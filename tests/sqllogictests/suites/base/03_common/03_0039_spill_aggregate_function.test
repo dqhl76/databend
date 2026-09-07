@@ -1,0 +1,198 @@
+skipif mysql
+statement ok
+SET max_threads = 2;
+
+skipif mysql
+statement ok
+SET force_aggregate_data_spill = 1;
+
+# Multiple DISTINCTs must retain their own partitioned spill states.
+skipif mysql
+query IIIIII
+SELECT count(DISTINCT substr(s, 1, 18)),
+       count(DISTINCT substr(s, 1, 20)),
+       count(DISTINCT substr(s, 1, 22)),
+       count(DISTINCT substr(s, 1, 24)),
+       count(DISTINCT substr(s, 1, 26)),
+       count(DISTINCT substr(s, 1, 28))
+FROM (SELECT lpad(number::string, 28, '0') AS s FROM numbers_mt(1000));
+----
+1 1 1 1 10 1000
+
+# Duplicates cross partial states and spill runs. NULLs do not enter the set.
+skipif mysql
+query IIR
+SELECT count(DISTINCT x), sum(DISTINCT x), avg(DISTINCT x)
+FROM (SELECT if(number % 10 = 0, NULL, number % 10) AS x FROM numbers_mt(1000));
+----
+9 45 5.0
+
+skipif mysql
+query II
+SELECT count(DISTINCT x, y), count(*)
+FROM (SELECT if(number % 5 = 0, NULL, number % 10) AS x,
+             (number % 3)::string AS y FROM numbers_mt(1000));
+----
+24 1000
+
+# Function spilling and outer GROUP BY spilling can occur in the same query.
+skipif mysql
+query III
+SELECT number % 2 AS g, count(DISTINCT number % 100), sum(DISTINCT number % 100)
+FROM numbers_mt(1000) GROUP BY g ORDER BY g;
+----
+0 50 2450
+1 50 2500
+
+# Streaming result merging retains duplicates; DISTINCT uses the same backend
+# with a separate partition/reduction strategy.
+skipif mysql
+query IT
+SELECT array_length(array_agg(number % 5)), array_sort(array_agg(DISTINCT number % 5))
+FROM numbers_mt(40);
+----
+40 [0,1,2,3,4]
+
+skipif mysql
+query I
+SELECT length(string_agg(if(number % 5 = 0, NULL, 'x'), '|'))
+FROM numbers_mt(100);
+----
+159
+
+skipif mysql
+query IIT
+SELECT count(DISTINCT number), sum(DISTINCT number), array_agg(number)
+FROM numbers_mt(0);
+----
+0 NULL []
+
+# ORDER BY must be enforced across runs, including NULL placement and ties.
+skipif mysql
+query TT
+SELECT array_agg(number ORDER BY number DESC),
+       string_agg(number::string, '|' ORDER BY number DESC)
+FROM numbers_mt(8);
+----
+[7,6,5,4,3,2,1,0] 7|6|5|4|3|2|1|0
+
+skipif mysql
+query T
+SELECT array_agg(number ORDER BY if(number % 3 = 0, NULL, number % 2) DESC NULLS FIRST, number)
+FROM numbers_mt(8);
+----
+[0,3,6,1,5,7,2,4]
+
+skipif mysql
+query TT
+SELECT array_agg(number ORDER BY number), string_agg(number::string, '|' ORDER BY number)
+FROM numbers_mt(0);
+----
+[] NULL
+
+# Merging per-run medians/quantiles would produce the wrong answer.
+skipif mysql
+query RRT
+SELECT median(number), quantile_cont(0.75)(number), quantile_cont(0, 0.5, 1)(number)
+FROM numbers_mt(100);
+----
+49.5 74.25 [0.0,49.5,99.0]
+
+skipif mysql
+query TT
+SELECT median(number::decimal(10,2)), quantile_cont(0, 0.5, 1)(number::decimal(10,2))
+FROM numbers_mt(100);
+----
+49.00 [0.00,49.00,99.00]
+
+skipif mysql
+statement ok
+UNSET force_aggregate_data_spill;
+
+# A small selection threshold or restore budget alone must not require spilling.
+skipif mysql
+statement ok
+SET aggregate_spilling_memory_ratio = 0;
+
+skipif mysql
+statement ok
+SET query_out_of_memory_behavior = 'throw';
+
+skipif mysql
+statement ok
+SET aggregate_function_spilling_memory_threshold = 4096;
+
+skipif mysql
+statement ok
+SET aggregate_function_restore_memory_threshold = 4096;
+
+skipif mysql
+query II
+SELECT count(DISTINCT number), count(DISTINCT (number % 97)::string)
+FROM numbers_mt(10000);
+----
+10000 97
+
+# Both states remain below the size threshold despite shared memory pressure.
+skipif mysql
+statement ok
+SET max_query_memory_usage = 1073741824;
+
+skipif mysql
+statement ok
+SET max_memory_usage = 1;
+
+skipif mysql
+statement ok
+SET aggregate_spilling_memory_ratio = 1;
+
+skipif mysql
+statement ok
+SET aggregate_function_spilling_memory_threshold = 67108864;
+
+skipif mysql
+query II
+SELECT count(DISTINCT number), count(DISTINCT (number % 97)::string)
+FROM numbers_mt(10000);
+----
+10000 97
+
+# Lowering the state threshold permits function-owned spilling under pressure.
+skipif mysql
+statement ok
+SET aggregate_function_spilling_memory_threshold = 4096;
+
+skipif mysql
+query II
+SELECT count(DISTINCT number), count(DISTINCT (number % 97)::string)
+FROM numbers_mt(10000);
+----
+10000 97
+
+skipif mysql
+statement ok
+UNSET max_memory_usage;
+
+skipif mysql
+statement ok
+UNSET max_query_memory_usage;
+
+skipif mysql
+statement ok
+UNSET aggregate_spilling_memory_ratio;
+
+skipif mysql
+statement ok
+UNSET aggregate_function_restore_memory_threshold;
+
+skipif mysql
+statement ok
+UNSET query_out_of_memory_behavior;
+
+skipif mysql
+statement ok
+UNSET aggregate_function_spilling_memory_threshold;
+
+skipif mysql
+statement ok
+UNSET max_threads;
