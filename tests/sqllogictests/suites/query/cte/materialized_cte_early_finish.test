@@ -13,7 +13,7 @@ statement ok
 SET materialized_cte_spilling_memory_ratio = 0
 
 # The limited row is unordered; check its range and cardinality, not its value.
-query TT rowsort
+query TB rowsort
 WITH t AS (
     SELECT number FROM numbers(1000000)
 )
@@ -22,11 +22,11 @@ UNION ALL
 SELECT 'limited', count(*) = 1 AND sum(number) BETWEEN 0 AND 999999
 FROM (SELECT number FROM t LIMIT 1)
 ----
-full true
-limited true
+full 1
+limited 1
 
 # Reverse the branches to cover either consumer closing first.
-query TT rowsort
+query TB rowsort
 WITH t AS (
     SELECT number FROM numbers(1000000)
 )
@@ -35,11 +35,11 @@ FROM (SELECT number FROM t LIMIT 1)
 UNION ALL
 SELECT 'full', sum(number) = 499999500000 FROM t
 ----
-full true
-limited true
+full 1
+limited 1
 
 # Both consumers may stop before the producer reaches the end.
-query IT rowsort
+query IB rowsort
 WITH t AS (
     SELECT number FROM numbers(1000000)
 )
@@ -49,14 +49,14 @@ UNION ALL
 SELECT count(*), sum(number) BETWEEN 0 AND 1999998
 FROM (SELECT number FROM t LIMIT 2)
 ----
-1 true
-2 true
+1 1
+2 1
 
 statement ok
 SET force_materialized_cte_spill = 1
 
 # More than one spill unit: early completion must also work with spilled payloads.
-query TT rowsort
+query TB rowsort
 WITH t AS (
     SELECT number FROM numbers(2000000)
 )
@@ -65,8 +65,8 @@ UNION ALL
 SELECT 'limited', count(*) = 1 AND sum(number) BETWEEN 0 AND 1999999
 FROM (SELECT number FROM t LIMIT 1)
 ----
-full true
-limited true
+full 1
+limited 1
 
 statement ok
 UNSET force_materialized_cte_spill
