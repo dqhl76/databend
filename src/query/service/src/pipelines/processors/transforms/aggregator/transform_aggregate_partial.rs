@@ -197,8 +197,8 @@ impl TransformPartialAggregate {
         self.windowed |= stats.windows > 0;
         self.total += stats;
 
-        // An index entry costs a control byte and a row pointer at the index load factor.
-        const INDEX_BYTES_PER_GROUP: usize = 13;
+        // An index entry costs a control byte and a 4-byte row id at the index load factor.
+        const INDEX_BYTES_PER_GROUP: usize = 7;
         if hashtable.len() >= 16 * 1024 {
             self.bytes_per_group =
                 hashtable.partial_hot_bytes() / hashtable.len() + INDEX_BYTES_PER_GROUP;
