@@ -43,7 +43,7 @@ pub(super) struct PartitionMask {
 }
 
 impl PartitionMask {
-    fn with_start_bit(partition_count: u64, start_bit: u64) -> Self {
+    pub(super) fn with_start_bit(partition_count: u64, start_bit: u64) -> Self {
         let radix_bits = partition_count.trailing_zeros() as u64;
         debug_assert_eq!(1 << radix_bits, partition_count);
         debug_assert!(start_bit + radix_bits <= 48);
@@ -54,7 +54,7 @@ impl PartitionMask {
         Self { mask, shift }
     }
 
-    fn index(&self, hash: u64) -> usize {
+    pub(super) fn index(&self, hash: u64) -> usize {
         ((hash & self.mask) >> self.shift) as _
     }
 }

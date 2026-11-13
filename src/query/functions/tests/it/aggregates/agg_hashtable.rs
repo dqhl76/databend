@@ -25,6 +25,8 @@ use databend_common_expression::HashTableConfig;
 use databend_common_expression::PayloadFlushState;
 use databend_common_expression::ProbeState;
 use databend_common_expression::ProjectedBlock;
+use databend_common_expression::RowPartitions;
+use databend_common_expression::RowStatesSerializer;
 use databend_common_expression::aggregate_function::AggregateCallRef;
 use databend_common_expression::aggregate_function::RawAggregateCall;
 use databend_common_expression::aggregate_function::get_states_layout;
@@ -638,4 +640,179 @@ fn test_payload_flush_all_with_reused_state() {
             assert!(empty_payloads > 0);
         }
     }
+}
+
+/// A payload flushed by partition gives each partition the rows a hash table partitioned at that
+/// depth holds in it.
+#[test]
+fn test_payload_aggregate_flush_partitioned() {
+    let aggrs = vec![
+        resolve_agg("sum", Int64Type::data_type()),
+        resolve_agg("max", StringType::data_type()),
+    ];
+    let m = 5000_usize;
+    let n = m * 3;
+    let group_columns: Vec<BlockEntry> =
+        vec![Int64Type::from_data((0..n).map(|x| (x % m) as i64).collect_vec()).into()];
+    let group_types = vec![group_columns[0].data_type()];
+    let ints: BlockEntry = Int64Type::from_data((0..n).map(|x| x as i64).collect_vec()).into();
+    let strings: BlockEntry =
+        StringType::from_data((0..n).map(|x| format!("v{}", x % 97)).collect_vec()).into();
+    let args = [vec![ints], vec![strings]];
+    let params: Vec<ProjectedBlock> = args.iter().map(|v| v.into()).collect_vec();
+
+    let table = |radix_bits: u64, start_bit: u64| {
+        let mut table = AggregateHashTable::new(
+            group_types.clone(),
+            aggrs.clone(),
+            HashTableConfig::default()
+                .with_initial_radix_bits(radix_bits)
+                .with_partition_start_bit(start_bit),
+            Arc::new(Bump::new()),
+        );
+        let mut state = ProbeState::default();
+        table
+            .add_groups(
+                &mut state,
+                (&group_columns).into(),
+                &params,
+                (&[]).into(),
+                n,
+            )
+            .unwrap();
+        table
+    };
+
+    for start_bit in [0, 2, 5] {
+        let mut expected = table(2, start_bit).into_payloads();
+        let payloads = table(0, 0).into_payloads();
+        assert_eq!(payloads.len(), 1);
+
+        let mut flush_state = PayloadFlushState::default();
+        let mut partitions = vec![vec![]; 4];
+        while let Some((block, ends)) = payloads[0]
+            .aggregate_flush_partitioned(&mut flush_state, 4, start_bit)
+            .unwrap()
+        {
+            assert_eq!(ends.len(), 4);
+            assert_eq!(*ends.last().unwrap(), block.num_rows());
+            let mut start = 0;
+            for (partition, end) in ends.into_iter().enumerate() {
+                if end > start {
+                    partitions[partition].push(block.slice(start..end));
+                }
+                start = end;
+            }
+        }
+
+        for (partition, blocks) in partitions.into_iter().enumerate() {
+            let expected = expected.remove(0).aggregate_flush_all().unwrap();
+            assert!(expected.num_rows() > 0, "partition {partition} is empty");
+            assert_block_value_sort_eq(&DataBlock::concat(&blocks).unwrap(), &expected);
+        }
+    }
+}
+
+/// Merging the states of groups that hold one row each aggregates like the rows themselves.
+#[test]
+fn test_row_states_merge_like_rows() {
+    let n = 5000;
+    let m = 700;
+    let group_columns: Vec<BlockEntry> =
+        vec![Int64Type::from_data((0..n).map(|x| (x % m) as i64).collect_vec()).into()];
+    let group_types = vec![group_columns[0].data_type()];
+    let ints: BlockEntry = Int64Type::from_data((0..n).map(|x| x as i64).collect_vec()).into();
+    let nullable: BlockEntry = Int64Type::from_opt_data(
+        (0..n)
+            .map(|x| (x % 3 != 0).then_some(x as i64))
+            .collect_vec(),
+    )
+    .into();
+    let strings: BlockEntry =
+        StringType::from_data((0..n).map(|x| format!("v{}", x % 97)).collect_vec()).into();
+    let aggrs = vec![
+        resolve_agg("sum", Int64Type::data_type()),
+        resolve_agg("count", NullableType::<Int64Type>::data_type()),
+        resolve_agg("uniq", Int64Type::data_type()),
+        resolve_agg("max", StringType::data_type()),
+        resolve_agg("avg", NullableType::<Int64Type>::data_type()),
+        resolve_agg("min", NullableType::<Int64Type>::data_type()),
+    ];
+    let args = [
+        vec![ints.clone()],
+        vec![nullable.clone()],
+        vec![ints],
+        vec![strings],
+        vec![nullable.clone()],
+        vec![nullable],
+    ];
+    let params: Vec<ProjectedBlock> = args.iter().map(|v| v.into()).collect_vec();
+
+    let table = || {
+        AggregateHashTable::new(
+            group_types.clone(),
+            aggrs.clone(),
+            HashTableConfig::default(),
+            Arc::new(Bump::new()),
+        )
+    };
+    let result = |mut table: AggregateHashTable| {
+        let mut flush_state = PayloadFlushState::default();
+        let mut blocks = Vec::new();
+        while table.merge_result(&mut flush_state).unwrap() {
+            let mut entries = flush_state.take_group_columns();
+            entries.extend(flush_state.take_aggregate_results());
+            let num_rows = entries[0].len();
+            blocks.push(DataBlock::new(entries, num_rows));
+        }
+        DataBlock::concat(&blocks).unwrap()
+    };
+
+    let mut state = ProbeState::default();
+    let mut from_rows = table();
+    from_rows
+        .add_groups(
+            &mut state,
+            (&group_columns).into(),
+            &params,
+            (&[]).into(),
+            n,
+        )
+        .unwrap();
+
+    let states = RowStatesSerializer::try_create(aggrs.clone())
+        .unwrap()
+        .serialize(&params, n)
+        .unwrap();
+    assert!(states.iter().all(|entry| entry.len() == n));
+    let mut from_states = table();
+    from_states
+        .add_groups(
+            &mut state,
+            (&group_columns).into(),
+            &[],
+            (&states).into(),
+            n,
+        )
+        .unwrap();
+
+    assert_block_value_sort_eq(&result(from_states), &result(from_rows));
+}
+
+#[test]
+fn test_row_partitions_of_hashes() {
+    // Two partitions from bit 0 take bit 47 of the hash.
+    let high = 1u64 << 47;
+    let hashes = [0, high, 5, high | 9, 3];
+    match RowPartitions::of_hashes(&hashes, 2, 0) {
+        RowPartitions::Ordered { rows, ends } => {
+            assert_eq!(rows, vec![0, 2, 4, 1, 3]);
+            assert_eq!(ends, vec![3, 5]);
+        }
+        RowPartitions::Single(_) => unreachable!(),
+    }
+    assert!(matches!(
+        RowPartitions::of_hashes(&[high, high | 1], 2, 0),
+        RowPartitions::Single(1)
+    ));
 }

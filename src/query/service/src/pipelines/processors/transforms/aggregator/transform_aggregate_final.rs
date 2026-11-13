@@ -25,13 +25,19 @@ use databend_common_base::base::WatchNotify;
 use databend_common_exception::ErrorCode;
 use databend_common_exception::Result;
 use databend_common_expression::AggregateHashTable;
+use databend_common_expression::BlockEntry;
 use databend_common_expression::BlockMetaInfoDowncast;
 use databend_common_expression::BlockPartitionStream;
+use databend_common_expression::Column;
 use databend_common_expression::DataBlock;
 use databend_common_expression::HashTableConfig;
+use databend_common_expression::Payload;
 use databend_common_expression::PayloadFlushState;
 use databend_common_expression::ProjectedBlock;
+use databend_common_expression::RowPartitions;
+use databend_common_expression::RowStatesSerializer;
 use databend_common_expression::SortColumnDescription;
+use databend_common_expression::group_hash_entries;
 use databend_common_pipeline::core::Event;
 use databend_common_pipeline::core::EventCause;
 use databend_common_pipeline::core::InputPort;
@@ -106,6 +112,8 @@ pub struct TransformFinalAggregate {
     max_partition_depth: usize,
     current_partition_depth: usize,
     spiller: AggregateSpiller,
+    /// Serializes the states of raw rows spilled without the hash table, created on the first.
+    row_states: Option<RowStatesSerializer>,
     settings: MemorySettings,
     max_aggregate_spill_level: usize,
     next_task_id: Arc<AtomicU64>,
@@ -160,6 +168,7 @@ impl TransformFinalAggregate {
             max_partition_depth,
             current_partition_depth: 0,
             spiller,
+            row_states: None,
             settings: MemorySettings::from_aggregate_settings(&ctx)?,
             max_aggregate_spill_level,
             next_task_id,
@@ -226,6 +235,11 @@ impl TransformFinalAggregate {
         let bytes = payload.data_block.memory_size();
         self.statistics.record_block(rows, bytes);
 
+        if self.spilled_occurred {
+            // Everything from now on is spilled: a hash table would only merge the groups of
+            // this block before serializing them again.
+            return self.spill_rows(payload.data_block);
+        }
         self.merge_serialized(payload)?;
         self.check_spill(need_check_spill)
     }
@@ -234,6 +248,9 @@ impl TransformFinalAggregate {
         let rows = block.num_rows();
         self.statistics.record_block(rows, block.memory_size());
 
+        if rows != 0 && self.spilled_occurred {
+            return self.spill_raw(block);
+        }
         if rows != 0 {
             let ht = Self::hashtable_mut(
                 &mut self.hashtable,
@@ -284,16 +301,97 @@ impl TransformFinalAggregate {
         let bytes = payload.payload.memory_size();
         self.statistics.record_block(rows, bytes);
 
-        if rows != 0 {
-            let ht = Self::hashtable_mut(
-                &mut self.hashtable,
-                &self.params,
-                self.current_partition_depth,
-            );
-            ht.combine_payload(&payload.payload, &mut self.flush_state)?;
+        if rows == 0 {
+            return self.check_spill(need_check_spill);
+        }
+        if self.spilled_occurred {
+            // Everything from now on is spilled: a hash table would only hold this payload,
+            // whose groups are already distinct, so spill it straight from its rows.
+            return self.spill_payload(&payload.payload);
         }
 
+        let ht = Self::hashtable_mut(
+            &mut self.hashtable,
+            &self.params,
+            self.current_partition_depth,
+        );
+        ht.combine_payload(&payload.payload, &mut self.flush_state)?;
         self.check_spill(need_check_spill)
+    }
+
+    /// Spills the groups of `payload` to the buckets of the current depth, without merging
+    /// them into the hash table.
+    fn spill_payload(&mut self, payload: &Payload) -> Result<()> {
+        let start_bit = self.current_partition_depth as u64 * SPILL_BUCKET_BITS;
+        self.flush_state.clear();
+        while let Some((block, ends)) = payload.aggregate_flush_partitioned(
+            &mut self.flush_state,
+            SPILL_BUCKET_NUM,
+            start_bit,
+        )? {
+            check_interrupt()?;
+            let block = block.consume_convert_to_full();
+            let mut start = 0;
+            for (bucket, end) in ends.into_iter().enumerate() {
+                if end > start {
+                    self.spiller.spill(bucket, block.slice(start..end))?;
+                }
+                start = end;
+            }
+        }
+        self.flush_state.clear();
+        Ok(())
+    }
+
+    /// Spills raw rows as the states of groups holding one row each. The partial aggregate
+    /// forwards raw rows when they repeat little, so merging them in a hash table first would
+    /// not shrink what is spilled.
+    fn spill_raw(&mut self, block: DataBlock) -> Result<()> {
+        let rows = block.num_rows();
+        let row_states = match &mut self.row_states {
+            Some(row_states) => row_states,
+            None => self.row_states.insert(RowStatesSerializer::try_create(
+                self.params.aggregate_functions.clone(),
+            )?),
+        };
+        let params = self
+            .params
+            .aggregate_functions_arguments
+            .iter()
+            .map(|args| ProjectedBlock::project(args, &block))
+            .collect::<Vec<_>>();
+        let mut entries = row_states.serialize(&params, rows)?;
+        entries.extend(
+            ProjectedBlock::project(&self.params.group_columns, &block)
+                .iter()
+                .cloned(),
+        );
+        self.spill_rows(DataBlock::new(entries, rows))
+    }
+
+    /// Spills a block of serialized states followed by group keys to the buckets of the current
+    /// depth, by the hash of its group keys.
+    fn spill_rows(&mut self, block: DataBlock) -> Result<()> {
+        let num_states = self.params.num_states();
+        let groups =
+            (num_states..num_states + self.params.group_data_types.len()).collect::<Vec<_>>();
+        let mut hashes = vec![0; block.num_rows()];
+        group_hash_entries(ProjectedBlock::project(&groups, &block), &mut hashes);
+        let start_bit = self.current_partition_depth as u64 * SPILL_BUCKET_BITS;
+        match RowPartitions::of_hashes(&hashes, SPILL_BUCKET_NUM, start_bit) {
+            RowPartitions::Single(bucket) => self.spiller.spill(bucket, block),
+            RowPartitions::Ordered { rows, ends } => {
+                let block = take_rows(&block, &rows)?;
+                let mut start = 0;
+                for (bucket, end) in ends.into_iter().enumerate() {
+                    if end > start {
+                        self.spiller.spill(bucket, block.slice(start..end))?;
+                    }
+                    start = end;
+                }
+                Ok(())
+            }
+        }
     }
 
     fn check_spill(&mut self, need_check_spill: bool) -> Result<()> {
@@ -663,6 +761,37 @@ impl Processor for TransformFinalAggregate {
     }
 }
 
+/// Takes `rows` of `block`. A serialized state is a tuple, which a take copies row by row, so
+/// tuples are taken field by field.
+fn take_rows(block: &DataBlock, rows: &[u32]) -> Result<DataBlock> {
+    fn take_column(column: &Column, rows: &[u32]) -> Result<Column> {
+        Ok(match column {
+            Column::Tuple(fields) if !fields.is_empty() => Column::Tuple(
+                fields
+                    .iter()
+                    .map(|field| take_column(field, rows))
+                    .collect::<Result<_>>()?,
+            ),
+            Column::Nullable(nullable) if matches!(nullable.column(), Column::Tuple(_)) => {
+                let validity = take_column(&Column::Boolean(nullable.validity().clone()), rows)?;
+                take_column(nullable.column(), rows)?
+                    .wrap_nullable(Some(validity.into_boolean().unwrap()))
+            }
+            column => BlockEntry::Column(column.clone()).take(rows)?.to_column(),
+        })
+    }
+
+    let entries = block
+        .columns()
+        .iter()
+        .map(|entry| match entry {
+            BlockEntry::Column(column) => Ok(take_column(column, rows)?.into()),
+            entry => entry.take(rows),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(DataBlock::new(entries, rows.len()))
+}
+
 /// The blocks of a top N are reduced to its first rows once there are this many.
 const TOP_N_PRUNE_BLOCKS: usize = 32;
 
@@ -882,6 +1011,44 @@ mod tests {
         assert!(final_aggregate.hashtable.is_none());
         assert_eq!(final_aggregate.pressure_outputs, 2);
         drop(tx);
+        Ok(())
+    }
+
+    // Taking tuples field by field gives the rows a take of the whole tuple gives.
+    #[test]
+    fn test_take_rows_by_tuple_fields() -> Result<()> {
+        use databend_common_expression::RandomOptions;
+
+        let types = [
+            DataType::Tuple(vec![
+                DataType::Number(NumberDataType::Int64),
+                DataType::Nullable(Box::new(DataType::String)),
+            ]),
+            DataType::Nullable(Box::new(DataType::Tuple(vec![
+                DataType::Boolean,
+                DataType::Tuple(vec![DataType::String]),
+            ]))),
+            DataType::String,
+        ];
+        let options = RandomOptions {
+            seed: Some(3),
+            min_string_len: 0,
+            max_string_len: 10,
+            max_array_len: 2,
+        };
+        let block = DataBlock::new_from_columns(
+            types
+                .iter()
+                .map(|data_type| Column::random(data_type, 500, Some(options.clone())))
+                .collect(),
+        );
+        let rows = (0..500u32).rev().step_by(3).collect::<Vec<_>>();
+        let expected = block.take(rows.as_slice())?;
+        let actual = take_rows(&block, &rows)?;
+        assert_eq!(actual.num_rows(), rows.len());
+        for (expected, actual) in expected.columns().iter().zip(actual.columns()) {
+            assert_eq!(expected.to_column(), actual.to_column());
+        }
         Ok(())
     }
 }

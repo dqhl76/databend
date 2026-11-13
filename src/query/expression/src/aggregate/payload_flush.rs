@@ -18,6 +18,7 @@ use databend_common_io::prelude::bincode_deserialize_from_slice;
 use super::BATCH_SIZE;
 use super::StateAddr;
 use super::aggregate_function::AggregateStateSet;
+use super::partitioned_payload::PartitionMask;
 use super::partitioned_payload::PartitionedPayload;
 use super::payload::Payload;
 use super::payload_row::RowTypeVisitor;
@@ -216,7 +217,62 @@ impl Payload {
         if !self.flush(state) {
             return Ok(None);
         }
+        self.serialize_flushed_states(state).map(Some)
+    }
 
+    /// Flushes the next rows like `aggregate_flush`, ordered by the partition of their hash
+    /// among `partition_count` partitions from `start_bit`, as the hash table of that spill
+    /// depth would place them. Returns the block and the end row of each partition in it, so
+    /// that each partition is a slice of the block.
+    pub fn aggregate_flush_partitioned(
+        &self,
+        state: &mut PayloadFlushState,
+        partition_count: usize,
+        start_bit: u64,
+    ) -> Result<Option<(DataBlock, Vec<usize>)>> {
+        if !self.scan_rows(state) {
+            return Ok(None);
+        }
+
+        let mask = PartitionMask::with_start_bit(partition_count as u64, start_bit);
+        let rows = state.row_count;
+        let mut ends = vec![0; partition_count];
+        for hash in &state.probe_state.group_hashes[..rows] {
+            ends[mask.index(*hash)] += 1;
+        }
+        // Rows of a payload usually share their partition: then they are already in order.
+        if !ends.contains(&rows) {
+            let mut next = Vec::with_capacity(partition_count);
+            let mut start = 0;
+            for count in &ends {
+                next.push(start);
+                start += count;
+            }
+            let addresses = state.addresses;
+            let state_places = state.state_places;
+            let hashes = state.probe_state.group_hashes;
+            for row in 0..rows {
+                let partition = mask.index(hashes[row]);
+                let to = next[partition];
+                next[partition] += 1;
+                state.addresses[to] = addresses[row];
+                state.state_places[to] = state_places[row];
+                state.probe_state.group_hashes[to] = hashes[row];
+            }
+        }
+        let mut end = 0;
+        for count in ends.iter_mut() {
+            end += *count;
+            *count = end;
+        }
+
+        self.flush_group_columns(state);
+        let block = self.serialize_flushed_states(state)?;
+        Ok(Some((block, ends)))
+    }
+
+    /// The block of the flushed rows: their serialized states, then their group columns.
+    fn serialize_flushed_states(&self, state: &mut PayloadFlushState) -> Result<DataBlock> {
         let row_count = state.row_count;
 
         let mut entries = Vec::with_capacity(self.aggrs.len() + self.group_types.len());
@@ -240,7 +296,7 @@ impl Payload {
         }
 
         entries.extend_from_slice(&state.take_group_columns());
-        Ok(Some(DataBlock::new(entries, row_count)))
+        Ok(DataBlock::new(entries, row_count))
     }
 
     pub fn group_by_flush_all(&self) -> Result<DataBlock> {
@@ -267,13 +323,17 @@ impl Payload {
         if !self.scan_rows(flush_state) {
             return false;
         }
+        self.flush_group_columns(flush_state);
+        true
+    }
 
+    /// Builds the group columns of the scanned rows.
+    fn flush_group_columns(&self, flush_state: &mut PayloadFlushState) {
         flush_state.group_columns.clear();
         for col_index in 0..self.group_types.len() {
             let col = self.flush_column(col_index, flush_state);
             flush_state.group_columns.push(col.into());
         }
-        true
     }
 
     /// Scans the next rows like `flush`, without building their group columns.
