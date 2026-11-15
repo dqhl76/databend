@@ -210,6 +210,13 @@ impl AggregatePayloadWriters {
             }
         }
 
+        info!(
+            "[MEASURE] aggregate spill write: writes={}, write_ms={:.3}, bytes={}, rows={}",
+            self.write_stats.count,
+            self.write_stats.elapsed.as_secs_f64() * 1000.0,
+            self.write_stats.bytes,
+            self.write_stats.rows
+        );
         let stats = self.write_stats.take();
         flush_write_profile(&self.ctx, stats);
 
@@ -230,6 +237,8 @@ pub struct AggregateSpiller {
     buffer_bytes: usize,
     pending: Vec<PendingBlocks>,
     payload_writers: AggregatePayloadWriters,
+    measure_calls: usize,
+    measure_spill: Duration,
 }
 
 impl AggregateSpiller {
@@ -240,6 +249,13 @@ impl AggregateSpiller {
         if self.payload_writers.has_writer() {
             return None;
         }
+        info!(
+            "[MEASURE] aggregate spill buffered: calls={}, spill_ms={:.3}",
+            self.measure_calls,
+            self.measure_spill.as_secs_f64() * 1000.0
+        );
+        self.measure_calls = 0;
+        self.measure_spill = Duration::default();
         Some(
             self.pending
                 .iter_mut()
@@ -275,6 +291,8 @@ impl AggregateSpiller {
                 .take(partition_count)
                 .collect(),
             payload_writers,
+            measure_calls: 0,
+            measure_spill: Duration::default(),
         })
     }
 
@@ -282,12 +300,15 @@ impl AggregateSpiller {
         if block.is_empty() {
             return Ok(());
         }
+        let start = Instant::now();
         let pending = &mut self.pending[partition_id];
         pending.bytes += block.memory_size();
         pending.blocks.push(block);
         if pending.bytes >= self.buffer_bytes {
             self.write_pending(partition_id)?;
         }
+        self.measure_calls += 1;
+        self.measure_spill += start.elapsed();
         Ok(())
     }
 
@@ -301,11 +322,20 @@ impl AggregateSpiller {
     }
 
     pub fn spill_finish(&mut self) -> Result<Vec<SpilledPayload>> {
+        let start = Instant::now();
         for partition_id in 0..self.pending.len() {
             self.write_pending(partition_id)?;
         }
 
         let payloads = self.payload_writers.finalize()?;
+        info!(
+            "[MEASURE] aggregate spill calls: calls={}, spill_ms={:.3}, finish_ms={:.3}",
+            self.measure_calls,
+            self.measure_spill.as_secs_f64() * 1000.0,
+            start.elapsed().as_secs_f64() * 1000.0
+        );
+        self.measure_calls = 0;
+        self.measure_spill = Duration::default();
         debug!(
             "[AggregateSpiller] spill finish with {} payloads",
             payloads.len()
