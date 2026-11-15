@@ -222,6 +222,13 @@ impl AggregatePayloadWriters {
             }
         }
 
+        info!(
+            "[MEASURE] aggregate spill write: writes={}, write_ms={:.3}, bytes={}, rows={}",
+            self.write_stats.count,
+            self.write_stats.elapsed.as_secs_f64() * 1000.0,
+            self.write_stats.bytes,
+            self.write_stats.rows
+        );
         let stats = self.write_stats.take();
         flush_write_profile(&self.ctx, stats);
 
@@ -261,6 +268,8 @@ pub struct AggregateSpiller {
     partition_stream: LocalPartitionStream,
     data_schema: DataSchemaRef,
     payload_writers: AggregatePayloadWriters,
+    measure_calls: usize,
+    measure_spill: Duration,
 }
 
 impl AggregateSpiller {
@@ -270,6 +279,13 @@ impl AggregateSpiller {
         if self.payload_writers.writers.iter().any(Option::is_some) {
             return None;
         }
+        info!(
+            "[MEASURE] aggregate spill buffered: calls={}, spill_ms={:.3}",
+            self.measure_calls,
+            self.measure_spill.as_secs_f64() * 1000.0
+        );
+        self.measure_calls = 0;
+        self.measure_spill = Duration::default();
         Some(self.partition_stream.finish())
     }
 
@@ -295,20 +311,34 @@ impl AggregateSpiller {
             data_schema,
             partition_stream,
             payload_writers,
+            measure_calls: 0,
+            measure_spill: Duration::default(),
         })
     }
 
     pub fn spill(&mut self, partition_id: usize, block: DataBlock) -> Result<()> {
+        let start = Instant::now();
         let ready_blocks = self.partition_stream.partition(partition_id, block);
         self.payload_writers.write_ready_blocks(ready_blocks)?;
+        self.measure_calls += 1;
+        self.measure_spill += start.elapsed();
         Ok(())
     }
 
     pub fn spill_finish(&mut self) -> Result<Vec<SpilledPayload>> {
+        let start = Instant::now();
         let pending_blocks = self.partition_stream.finish();
         self.payload_writers.write_ready_blocks(pending_blocks)?;
 
         let payloads = self.payload_writers.finalize()?;
+        info!(
+            "[MEASURE] aggregate spill calls: calls={}, spill_ms={:.3}, finish_ms={:.3}",
+            self.measure_calls,
+            self.measure_spill.as_secs_f64() * 1000.0,
+            start.elapsed().as_secs_f64() * 1000.0
+        );
+        self.measure_calls = 0;
+        self.measure_spill = Duration::default();
         debug!(
             "[AggregateSpiller] spill finish with {} payloads",
             payloads.len()
