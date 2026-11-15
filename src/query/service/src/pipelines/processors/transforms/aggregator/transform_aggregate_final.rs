@@ -52,7 +52,6 @@ use crate::pipelines::processors::transforms::aggregator::AggregatePayload;
 use crate::pipelines::processors::transforms::aggregator::AggregateSpiller;
 use crate::pipelines::processors::transforms::aggregator::AggregateStatesMeta;
 use crate::pipelines::processors::transforms::aggregator::AggregatorParams;
-use crate::pipelines::processors::transforms::aggregator::LocalPartitionStream;
 use crate::pipelines::processors::transforms::aggregator::PartitionedData;
 use crate::pipelines::processors::transforms::aggregator::SerializedPayload;
 use crate::pipelines::processors::transforms::aggregator::SpilledPayload;
@@ -144,7 +143,7 @@ impl TransformFinalAggregate {
             params.spill_schema(),
             // Final processors own separate spill buffers, unlike partial aggregation,
             // so halve the threshold to reduce per-processor memory usage.
-            LocalPartitionStream::new(0, params.max_block_bytes / 2, SPILL_BUCKET_NUM),
+            params.max_block_bytes / 2,
         )?;
 
         Ok(Box::new(TransformFinalAggregate {
@@ -465,11 +464,21 @@ impl TransformFinalAggregate {
         self.spilled_occurred = true;
         // No hash table means nothing was aggregated since the last reset.
         if let Some(v) = self.hashtable.take() {
-            for (bucket, payload) in v.payload.into_non_empty_bucket_payloads() {
-                check_interrupt()?;
-                let data_block = payload.aggregate_flush_all()?.consume_convert_to_full();
-                self.spiller.spill(bucket, data_block)?;
+            // Hand each flushed batch to the spiller as it is serialized, and release a bucket's
+            // states before serializing the next one: serializing a whole bucket first would
+            // hold it twice more, as batches and as their concatenation.
+            for (bucket, payload) in v.into_payloads().into_iter().enumerate() {
+                if payload.len() == 0 {
+                    continue;
+                }
+                self.flush_state.clear();
+                while let Some(block) = payload.aggregate_flush(&mut self.flush_state)? {
+                    check_interrupt()?;
+                    self.spiller
+                        .spill(bucket, block.consume_convert_to_full())?;
+                }
             }
+            self.flush_state.clear();
         }
         self.reset_hashtable(self.current_partition_depth);
         Ok(())
@@ -495,13 +504,16 @@ impl TransformFinalAggregate {
             // another spill check or buffering results to form larger blocks.
             let mut output_rows = 0;
             let mut hash_index_resizes = 0;
-            for (bucket, data_block) in pending_blocks {
+            for (bucket, blocks) in pending_blocks {
                 self.ensure_spill_depth(spilled_depth);
-                // These states were already counted as input.
-                self.merge_serialized(SerializedPayload {
-                    bucket: bucket as isize,
-                    data_block,
-                })?;
+                // These states were already counted as input. A bucket's blocks may repeat
+                // groups: merge all of them before output.
+                for data_block in blocks {
+                    self.merge_serialized(SerializedPayload {
+                        bucket: bucket as isize,
+                        data_block,
+                    })?;
+                }
                 let (rows, resizes) = self.output_hashtable(None)?;
                 output_rows += rows;
                 hash_index_resizes += resizes;

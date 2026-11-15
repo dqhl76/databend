@@ -21,7 +21,6 @@ use databend_base::uniq_id::GlobalUniq;
 use databend_common_base::base::ProgressValues;
 use databend_common_exception::ErrorCode;
 use databend_common_exception::Result;
-use databend_common_expression::BlockPartitionStream;
 use databend_common_expression::DataBlock;
 use databend_common_expression::DataSchemaRef;
 use databend_common_pipeline_transforms::traits::Location;
@@ -66,12 +65,11 @@ impl PayloadWriter {
         })
     }
 
-    fn write_block(&mut self, block: DataBlock) -> Result<()> {
-        if block.is_empty() {
-            return Ok(());
+    /// Writes `blocks` as one row group.
+    fn write_row_group(&mut self, blocks: Vec<DataBlock>) -> Result<()> {
+        for block in blocks {
+            self.writer.write(block)?;
         }
-
-        self.writer.write(block)?;
         self.writer.flush()
     }
 
@@ -151,25 +149,15 @@ impl AggregatePayloadWriters {
         Ok(self.writers[bucket].as_mut().unwrap())
     }
 
-    pub fn write_ready_blocks(&mut self, ready_blocks: Vec<(usize, DataBlock)>) -> Result<()> {
-        if ready_blocks.is_empty() {
-            return Ok(());
-        }
-
-        for (bucket, block) in ready_blocks {
-            if block.is_empty() {
-                continue;
-            }
-
-            let start = Instant::now();
-            let writer = self.ensure_writer(bucket)?;
-            writer.write_block(block)?;
-
-            let elapsed = start.elapsed();
-            self.write_stats.accumulate(elapsed);
-        }
-
+    fn write_row_group(&mut self, bucket: usize, blocks: Vec<DataBlock>) -> Result<()> {
+        let start = Instant::now();
+        self.ensure_writer(bucket)?.write_row_group(blocks)?;
+        self.write_stats.accumulate(start.elapsed());
         Ok(())
+    }
+
+    fn has_writer(&self) -> bool {
+        self.writers.iter().any(Option::is_some)
     }
 
     pub fn finalize(&mut self) -> Result<Vec<SpilledPayload>> {
@@ -229,55 +217,44 @@ impl AggregatePayloadWriters {
     }
 }
 
-pub struct LocalPartitionStream {
-    partition_stream: BlockPartitionStream,
-}
-
-impl LocalPartitionStream {
-    pub fn new(max_rows: usize, max_bytes: usize, partition_count: usize) -> Self {
-        let partition_stream = BlockPartitionStream::create(max_rows, max_bytes, partition_count);
-        Self { partition_stream }
-    }
-
-    fn finish(&mut self) -> Vec<(usize, DataBlock)> {
-        let ids = self.partition_stream.partition_ids();
-        let mut pending_blocks = Vec::with_capacity(ids.len());
-        for id in ids {
-            if let Some(block) = self.partition_stream.finalize_partition(id) {
-                pending_blocks.push((id, block));
-            }
-        }
-        pending_blocks
-    }
-
-    fn partition(&mut self, partition_id: usize, block: DataBlock) -> Vec<(usize, DataBlock)> {
-        let indices = vec![partition_id as u64; block.num_rows()];
-        self.partition_stream.partition(indices, block, true)
-    }
+/// Blocks of one bucket waiting to fill a row group.
+#[derive(Default)]
+struct PendingBlocks {
+    blocks: Vec<DataBlock>,
+    bytes: usize,
 }
 
 pub struct AggregateSpiller {
     read_setting: ReadSettings,
-    partition_stream: LocalPartitionStream,
     data_schema: DataSchemaRef,
+    buffer_bytes: usize,
+    pending: Vec<PendingBlocks>,
     payload_writers: AggregatePayloadWriters,
 }
 
 impl AggregateSpiller {
-    /// Take buffered states only if this round has not written any blocks. Once
-    /// a writer exists, the tails must stay with the spilled states for merging.
-    pub(super) fn take_pending_if_unspilled(&mut self) -> Option<Vec<(usize, DataBlock)>> {
-        if self.payload_writers.writers.iter().any(Option::is_some) {
+    /// Take the blocks of every bucket only if this round has not written any of them. Once a
+    /// writer exists, the pending blocks must stay with the spilled ones for merging. A
+    /// bucket's blocks may repeat groups.
+    pub(super) fn take_pending_if_unspilled(&mut self) -> Option<Vec<(usize, Vec<DataBlock>)>> {
+        if self.payload_writers.has_writer() {
             return None;
         }
-        Some(self.partition_stream.finish())
+        Some(
+            self.pending
+                .iter_mut()
+                .map(|pending| mem::take(pending).blocks)
+                .enumerate()
+                .filter(|(_, blocks)| !blocks.is_empty())
+                .collect(),
+        )
     }
 
     pub fn try_create(
         ctx: Arc<QueryContext>,
         partition_count: usize,
         data_schema: DataSchemaRef,
-        partition_stream: LocalPartitionStream,
+        buffer_bytes: usize,
     ) -> Result<Self> {
         let table_ctx: Arc<dyn TableContext> = ctx.clone();
         let read_setting = ReadSettings::from_settings(&table_ctx.get_settings())?;
@@ -293,20 +270,40 @@ impl AggregateSpiller {
         Ok(Self {
             read_setting,
             data_schema,
-            partition_stream,
+            buffer_bytes,
+            pending: std::iter::repeat_with(PendingBlocks::default)
+                .take(partition_count)
+                .collect(),
             payload_writers,
         })
     }
 
     pub fn spill(&mut self, partition_id: usize, block: DataBlock) -> Result<()> {
-        let ready_blocks = self.partition_stream.partition(partition_id, block);
-        self.payload_writers.write_ready_blocks(ready_blocks)?;
+        if block.is_empty() {
+            return Ok(());
+        }
+        let pending = &mut self.pending[partition_id];
+        pending.bytes += block.memory_size();
+        pending.blocks.push(block);
+        if pending.bytes >= self.buffer_bytes {
+            self.write_pending(partition_id)?;
+        }
         Ok(())
     }
 
+    fn write_pending(&mut self, partition_id: usize) -> Result<()> {
+        let pending = mem::take(&mut self.pending[partition_id]);
+        if pending.blocks.is_empty() {
+            return Ok(());
+        }
+        self.payload_writers
+            .write_row_group(partition_id, pending.blocks)
+    }
+
     pub fn spill_finish(&mut self) -> Result<Vec<SpilledPayload>> {
-        let pending_blocks = self.partition_stream.finish();
-        self.payload_writers.write_ready_blocks(pending_blocks)?;
+        for partition_id in 0..self.pending.len() {
+            self.write_pending(partition_id)?;
+        }
 
         let payloads = self.payload_writers.finalize()?;
         debug!(
@@ -397,7 +394,6 @@ mod tests {
     use databend_common_expression::types::Int32Type;
 
     use crate::pipelines::processors::transforms::aggregator::AggregateSpiller;
-    use crate::pipelines::processors::transforms::aggregator::LocalPartitionStream;
     use crate::test_kits::TestFixture;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -406,12 +402,11 @@ mod tests {
         let ctx = fixture.new_query_ctx().await?;
 
         let partition_count = 4;
-        let partition_stream = LocalPartitionStream::new(1024, 1024 * 1024, partition_count);
         let mut spiller = AggregateSpiller::try_create(
             ctx.clone(),
             partition_count,
             Arc::new(DataSchema::empty()),
-            partition_stream,
+            1024 * 1024,
         )?;
 
         let block = DataBlock::new_from_columns(vec![Int32Type::from_data(vec![1i32, 2, 3])]);
