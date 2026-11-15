@@ -21,12 +21,13 @@ use databend_common_expression::BlockMetaInfoPtr;
 use databend_common_expression::BlockProfileStatistics;
 use databend_common_expression::DataBlock;
 use databend_common_expression::SerializedPayload;
-use parquet::file::metadata::RowGroupMetaData;
+
+use crate::spillers::SpilledSegment;
 
 pub struct SpilledPayload {
     pub bucket: isize,
     pub location: String,
-    pub row_group: RowGroupMetaData,
+    pub segment: SpilledSegment,
 }
 
 pub enum AggregateMeta {
@@ -137,14 +138,8 @@ impl BlockMetaInfo for AggregateMeta {
             }),
             AggregateMeta::Partitioned(data) => data.output_stats(),
             AggregateMeta::Spilled(payloads) => Some(BlockProfileStatistics {
-                rows: payloads
-                    .iter()
-                    .map(|p| p.row_group.num_rows() as usize)
-                    .sum(),
-                bytes: payloads
-                    .iter()
-                    .map(|p| p.row_group.total_byte_size() as usize)
-                    .sum(),
+                rows: payloads.iter().map(|p| p.segment.rows).sum(),
+                bytes: payloads.iter().map(|p| p.segment.len as usize).sum(),
             }),
         }
     }

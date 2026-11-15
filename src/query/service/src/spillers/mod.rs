@@ -16,8 +16,10 @@ mod adapter;
 mod async_buffer;
 mod block_reader;
 mod block_writer;
+mod column_codec;
 mod inner;
 mod partition_buffer;
+mod segments;
 mod serialize;
 mod sort;
 #[cfg(test)]
@@ -34,5 +36,6 @@ pub use databend_common_pipeline_transforms::traits::Location;
 pub use inner::*;
 pub use partition_buffer::PartitionBuffer;
 pub use partition_buffer::PartitionBufferFetchOption;
+pub use segments::*;
 pub use serialize::Layout;
 pub use sort::SortSpillerImpl;
