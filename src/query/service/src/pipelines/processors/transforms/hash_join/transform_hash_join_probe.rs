@@ -470,7 +470,7 @@ impl Processor for TransformHashJoinProbe {
                 );
             }
             Step::Async(AsyncStep::NextRound) => {
-                self.reset_probe_state()?;
+                self.reset_probe_state().await?;
                 self.reset_for_next_round();
                 self.join_probe_state.barrier.wait().await;
             }
@@ -643,7 +643,7 @@ impl TransformHashJoinProbe {
         }
     }
 
-    fn reset_probe_state(&mut self) -> Result<()> {
+    async fn reset_probe_state(&mut self) -> Result<()> {
         if self
             .join_probe_state
             .next_round_counter
@@ -666,6 +666,9 @@ impl TransformHashJoinProbe {
                 .continue_build_watcher
                 .send(true)
                 .map_err(|_| ErrorCode::TokioError("continue_build_watcher channel is closed"))?;
+            // The build side may run its next round from here on.
+            #[cfg(test)]
+            next_round_hook::after_build_released(&self.join_probe_state).await;
         }
         self.partition_id_to_restore = self
             .join_probe_state
@@ -693,5 +696,159 @@ impl TransformHashJoinProbe {
                 | JoinType::RightMark
                 | JoinType::Full
         )
+    }
+}
+
+/// Test-only pause point of the probe processor that releases the build side
+/// into the next spill round, before the probe reads the partition to restore.
+/// Hooks are keyed by query id, so concurrent tests do not interfere.
+#[cfg(test)]
+mod next_round_hook {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::sync::LazyLock;
+
+    use futures::future::BoxFuture;
+    use parking_lot::Mutex;
+
+    use crate::pipelines::processors::transforms::hash_join::HashJoinProbeState;
+    use crate::sessions::TableContextQueryIdentity;
+
+    pub(super) type Hook =
+        Arc<dyn Fn(Arc<HashJoinProbeState>) -> BoxFuture<'static, ()> + Send + Sync>;
+
+    static HOOKS: LazyLock<Mutex<HashMap<String, Hook>>> = LazyLock::new(Default::default);
+
+    pub(super) fn install(query_id: String, hook: Hook) {
+        HOOKS.lock().insert(query_id, hook);
+    }
+
+    pub(super) fn uninstall(query_id: &str) {
+        HOOKS.lock().remove(query_id);
+    }
+
+    pub(super) async fn after_build_released(state: &Arc<HashJoinProbeState>) {
+        let hook = HOOKS.lock().get(&state.ctx.get_id()).cloned();
+        if let Some(hook) = hook {
+            hook(state.clone()).await;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    use std::time::Duration;
+
+    use databend_common_exception::Result;
+    use databend_common_expression::DataBlock;
+    use databend_common_expression::ScalarRef;
+    use databend_common_expression::block_debug::pretty_format_blocks;
+    use databend_common_expression::types::number::NumberScalar;
+    use futures::future::BoxFuture;
+    use futures_util::TryStreamExt;
+
+    use super::next_round_hook;
+    use super::*;
+    use crate::sessions::TableContextQueryIdentity;
+    use crate::sessions::TableContextSettings;
+    use crate::test_kits::TestFixture;
+
+    /// Stall the probe that releases the build side into the second spill
+    /// round until the build side has finished that round. By then the build
+    /// side has published the partition of the third round.
+    fn stall_until_build_finishes_next_round() -> next_round_hook::Hook {
+        let stalled = Arc::new(AtomicBool::new(false));
+        Arc::new(move |state: Arc<HashJoinProbeState>| {
+            let first = !stalled.swap(true, Ordering::SeqCst);
+            let stall: BoxFuture<'static, ()> = Box::pin(async move {
+                if !first {
+                    return;
+                }
+                let mut finished = state.hash_join_state.build_watcher.subscribe();
+                tokio::time::timeout(
+                    Duration::from_secs(60),
+                    finished.wait_for(|table| *table != HashTableType::UnFinished),
+                )
+                .await
+                .expect("the build side did not finish its next spill round")
+                .expect("build_watcher is closed");
+            });
+            stall
+        })
+    }
+
+    /// Run `sql` on the legacy hash join with every join forced to spill and a
+    /// single probe processor, optionally with the probe stalled as above.
+    async fn run(fixture: &TestFixture, sql: &str, stall: bool) -> Result<Vec<DataBlock>> {
+        let ctx = fixture.new_query_ctx().await?;
+        let settings = ctx.get_settings();
+        settings.set_max_threads(1)?;
+        settings.set_setting("enable_experimental_new_join".to_string(), "0".to_string())?;
+        settings.set_setting("force_join_data_spill".to_string(), "1".to_string())?;
+
+        let query_id = ctx.get_id();
+        if stall {
+            next_round_hook::install(query_id.clone(), stall_until_build_finishes_next_round());
+        }
+        let blocks = match TestFixture::execute_query_with_ctx(ctx, sql).await {
+            Ok(stream) => stream.try_collect::<Vec<_>>().await,
+            Err(error) => Err(error),
+        };
+        next_round_hook::uninstall(&query_id);
+        blocks
+    }
+
+    fn count(blocks: &[DataBlock]) -> u64 {
+        assert_eq!(blocks.iter().map(DataBlock::num_rows).sum::<usize>(), 1);
+        let block = blocks.iter().find(|block| block.num_rows() == 1).unwrap();
+        match block.get_by_offset(0).index(0) {
+            Some(ScalarRef::Number(NumberScalar::UInt64(count))) => count,
+            other => panic!("unexpected count: {other:?}"),
+        }
+    }
+
+    // `a` is the smaller side, so it is the build side of the mark join and the
+    // subquery is probed, as in TPC-DS Q69. Every `a.number` exists in `b`, and
+    // the disjunct is never true, so no row qualifies.
+    const NOT_EXISTS: &str = "SELECT count(*) FROM numbers(200) AS a \
+        WHERE NOT EXISTS (SELECT 1 FROM numbers(2000) AS b WHERE b.number = a.number) \
+        OR a.number % 1000 = 999";
+
+    const INNER: &str =
+        "SELECT count(*) FROM numbers(2000) AS a JOIN numbers(200) AS b ON a.number = b.number";
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_spill_round_probe_restores_the_built_partition() -> Result<()> {
+        let fixture = TestFixture::setup().await?;
+
+        let plan =
+            pretty_format_blocks(&run(&fixture, &format!("EXPLAIN {NOT_EXISTS}"), false).await?)?;
+        assert!(
+            plan.contains("LEFT MARK"),
+            "expected a left mark join:\n{plan}"
+        );
+
+        // Without the stall the spilled joins are correct.
+        let not_exists = count(&run(&fixture, NOT_EXISTS, false).await?);
+        let inner = count(&run(&fixture, INNER, false).await?);
+        assert_eq!(
+            (not_exists, inner),
+            (0, 200),
+            "(NOT EXISTS, INNER) without stall"
+        );
+
+        // A probe that reads the partition to restore only after the build
+        // side finished the next round must still join the partition that the
+        // build side built.
+        let not_exists = count(&run(&fixture, NOT_EXISTS, true).await?);
+        let inner = count(&run(&fixture, INNER, true).await?);
+        assert_eq!(
+            (not_exists, inner),
+            (0, 200),
+            "(NOT EXISTS, INNER) with stall"
+        );
+        Ok(())
     }
 }
