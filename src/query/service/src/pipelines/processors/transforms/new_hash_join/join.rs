@@ -43,19 +43,6 @@ pub trait Join: Send + Sync + 'static {
         false
     }
 
-    /// Whether `Stage::BuildFinal` needs a second synchronized round after the barrier
-    /// (used when a flat join switches to radix-partitioned mode at the start of `BuildFinal`:
-    /// round 1 scatters untouched chunks into partitions; round 2 builds resident partitions
-    /// and spills the rest).
-    fn needs_build_final_reenter(&self) -> bool {
-        false
-    }
-
-    /// Clear per-processor re-entry state after all processors pass the `Stage::BuildFinal` barrier.
-    fn finish_build_final_reenter(&mut self) -> Result<()> {
-        Ok(())
-    }
-
     /// Whether probing can be skipped when the entire distributed build side is empty.
     fn can_skip_probe(&self) -> bool {
         false

@@ -14,19 +14,14 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::sync::PoisonError;
 
 use databend_base::uniq_id::GlobalUniq;
 use databend_common_base::base::ProgressValues;
 use databend_common_exception::Result;
-use databend_common_expression::BlockEntry;
 use databend_common_expression::BlockPartitionStream;
-use databend_common_expression::ColumnRef;
 use databend_common_expression::DataBlock;
-use databend_common_expression::Expr;
 use databend_common_expression::FunctionContext;
 use databend_common_expression::HashMethodKind;
-use databend_common_expression::arrow::and_validities;
 use databend_common_pipeline::core::check_interrupt;
 use databend_common_pipeline_transforms::MemorySettings;
 use databend_common_pipeline_transforms::traits::Location;
@@ -40,8 +35,6 @@ use super::partition_state::NUM_PARTITIONS;
 use super::partition_state::PartitionStatus;
 use super::partition_state::PartitionedJoinState;
 use super::partition_state::SpillMetadata;
-use super::partition_state::estimate_hash_table_bytes;
-use super::partition_state::estimate_probe_headroom;
 use super::partition_state::get_partition_id;
 use crate::pipelines::processors::HashJoinDesc;
 use crate::pipelines::processors::transforms::BasicHashJoinState;
@@ -107,15 +100,12 @@ struct PartitionedLocal {
     /// partition `pid` transitioned from `Collecting` to `Spilled`, so already-spilled partitions
     /// continue batching full blocks in `build_partition_stream` instead of flushing tiny chunks.
     flushed_on_spill: [bool; NUM_PARTITIONS],
-    /// Lazily allocated during build/scatter and dropped once build partitioning finishes.
+    /// Lazily allocated during `Stage::Build` and dropped in `add_block(None)` before `BuildFinal`.
     build_partition_stream: Option<BlockPartitionStream>,
-    /// Lazily allocated on first probe and dropped once `FlushProbeBuffers` finishes.
+    /// Lazily allocated on first probe and dropped in `FlushProbeBuffers`.
     probe_partition_stream: Option<BlockPartitionStream>,
     probe_actions: Option<[PartitionProbeAction; NUM_PARTITIONS]>,
     probe_final_stage: ProbeFinalStage,
-    /// Per-processor flag set during Round 1 of `Stage::BuildFinal` when scattering flat chunks
-    /// into partitions, so every processor re-enters `Stage::BuildFinal` together past the barrier.
-    need_build_final_reenter: bool,
     restore_sub_join: Option<Box<PartitionedHashJoin>>,
     block_rows: usize,
     block_bytes: usize,
@@ -143,7 +133,6 @@ impl PartitionedLocal {
             probe_partition_stream: None,
             probe_actions: None,
             probe_final_stage: ProbeFinalStage::FlushProbeBuffers,
-            need_build_final_reenter: false,
             restore_sub_join: None,
             block_rows,
             block_bytes,
@@ -159,13 +148,25 @@ impl PartitionedLocal {
         })
     }
 
-    fn probe_stream(&mut self) -> &mut BlockPartitionStream {
+    /// Use compact per-partition buffers when all partitions are in memory (avoids accumulating
+    /// 16 × `max_block_size` probe buffers per thread) and full block sizes when spilling to
+    /// Parquet (keeps spilled probe row groups large).
+    fn probe_stream(&mut self, has_spilled: bool) -> &mut BlockPartitionStream {
         self.probe_partition_stream.get_or_insert_with(|| {
-            BlockPartitionStream::create(self.block_rows, self.block_bytes, NUM_PARTITIONS)
+            if has_spilled {
+                BlockPartitionStream::create(self.block_rows, self.block_bytes, NUM_PARTITIONS)
+            } else {
+                let compact_rows = (self.block_rows / 4).max(4096);
+                let compact_bytes = (self.block_bytes / NUM_PARTITIONS).max(512 * 1024);
+                BlockPartitionStream::create(compact_rows, compact_bytes, NUM_PARTITIONS)
+            }
         })
     }
 
     fn write_build_spill(&mut self, pid: usize, block: DataBlock) -> Result<()> {
+        if block.is_empty() {
+            return Ok(());
+        }
         if self.build_writers[pid].is_none() {
             self.build_writers[pid] = Some(SpillPartitionWriter::create(
                 &self.location_prefix,
@@ -179,6 +180,9 @@ impl PartitionedLocal {
     }
 
     fn write_probe_spill(&mut self, pid: usize, block: DataBlock) -> Result<()> {
+        if block.is_empty() {
+            return Ok(());
+        }
         if self.probe_writers[pid].is_none() {
             self.probe_writers[pid] = Some(SpillPartitionWriter::create(
                 &self.location_prefix,
@@ -251,21 +255,19 @@ impl PartitionedLocal {
 }
 
 enum JoinLocal {
-    /// Zero-overhead flat single-partition path used for all non-spilling joins (and when
-    /// spilling is disallowed, e.g. `CacheScan`, empty keys, or `max_level`).
+    /// Used only when spilling/partitioning is disallowed (`CacheScan`, empty keys, or `max_level`).
     Flat(Box<dyn Join>),
-    /// 16-way radix partitioned mode: each partition is independently `InMemory` (resident) or `Spilled`.
+    /// 16-way radix partitioned mode: every partition is independently `InMemory` or `Spilled`,
+    /// controlled solely by real `memory_settings.check_spill()` checks.
     Partitioned(Box<PartitionedLocal>),
 }
 
-/// Unified radix-partitioned hash join with zero-regression flat in-memory path, resident
-/// partitions, deterministic `Stage::BuildFinal` partition planning with probe headroom, and
-/// recursive multi-level spilling.
+/// Unified 16-way radix-partitioned hash join with resident partitions, real `check_spill()`
+/// responsiveness during both `Stage::Build` and `Stage::BuildFinal`, and recursive spilling.
 pub struct PartitionedHashJoin {
     local: JoinLocal,
     state: Arc<PartitionedJoinState>,
     memory_settings: MemorySettings,
-    ctx: Arc<QueryContext>,
     function_ctx: FunctionContext,
     hash_method_kind: HashMethodKind,
     desc: Arc<HashJoinDesc>,
@@ -287,7 +289,7 @@ impl PartitionedHashJoin {
         desc: Arc<HashJoinDesc>,
         memory_settings: MemorySettings,
         state: Arc<PartitionedJoinState>,
-        flat_join: Box<dyn Join>,
+        flat_join: Option<Box<dyn Join>>,
         join_type: JoinType,
     ) -> Result<Self> {
         let settings = ctx.get_settings();
@@ -295,11 +297,15 @@ impl PartitionedHashJoin {
         let bloom_threshold = settings.get_bloom_runtime_filter_threshold()? as usize;
         let min_max_threshold = settings.get_min_max_runtime_filter_threshold()? as usize;
 
+        let local = match flat_join {
+            Some(join) => JoinLocal::Flat(join),
+            None => JoinLocal::Partitioned(Box::new(PartitionedLocal::create(&ctx)?)),
+        };
+
         Ok(PartitionedHashJoin {
-            local: JoinLocal::Flat(flat_join),
+            local,
             state,
             memory_settings,
-            ctx,
             function_ctx,
             hash_method_kind,
             desc,
@@ -324,20 +330,6 @@ impl PartitionedHashJoin {
             JoinType::Right | JoinType::RightAnti => has_build,
             _ => has_build || has_probe,
         }
-    }
-
-    /// Ensure this processor has switched its local mode to `Partitioned`.
-    /// When `flush_flat` is true, any blocks buffered in the local flat squasher are flushed first.
-    fn ensure_partitioned_local(&mut self, flush_flat: bool) -> Result<()> {
-        if let JoinLocal::Flat(flat_join) = &mut self.local {
-            if flush_flat {
-                flat_join.add_block(None)?;
-            }
-            self.state.set_partitioned();
-            self.state.move_flat_chunks_to_transition();
-            self.local = JoinLocal::Partitioned(Box::new(PartitionedLocal::create(&self.ctx)?));
-        }
-        Ok(())
     }
 
     fn partition_build_block(&mut self, block: DataBlock) -> Result<()> {
@@ -397,7 +389,7 @@ impl PartitionedHashJoin {
                     return Ok(());
                 }
                 PartitionStatus::Spilled => true,
-                PartitionStatus::Building | PartitionStatus::InMemory => {
+                PartitionStatus::InMemory => {
                     unreachable!("route_build_block called after build stage")
                 }
             }
@@ -405,14 +397,6 @@ impl PartitionedHashJoin {
 
         if spilled && let JoinLocal::Partitioned(local) = &mut self.local {
             local.write_build_spill(pid, block)?;
-        }
-        Ok(())
-    }
-
-    fn drain_transition_queue(&mut self) -> Result<()> {
-        while let Ok(block) = self.state.transition_queue.pop() {
-            check_interrupt()?;
-            self.partition_build_block(block)?;
         }
         Ok(())
     }
@@ -459,19 +443,18 @@ impl PartitionedHashJoin {
         Ok(progress)
     }
 
-    /// Under memory pressure during `Stage::Build` (or scatter), spill the largest `Collecting`
+    /// Under real `check_spill()` pressure during `Stage::Build`, spill the largest `Collecting`
     /// partitions one by one until pressure eases (or all 16 partitions are `Spilled`).
     ///
-    /// For partitions that were already marked `Spilled`, each processor flushes its pre-spill
-    /// `build_partition_stream` buffer at most once (`flushed_on_spill`), so subsequent rows batch
-    /// up to full blocks before writing Parquet row groups instead of creating tiny fragments.
+    /// For partitions that just flipped `Collecting -> Spilled`, each processor flushes its
+    /// pre-spill `build_partition_stream` buffer at most once (`flushed_on_spill`), so subsequent
+    /// rows batch up to full blocks before writing Parquet row groups instead of creating tiny
+    /// fragments.
     fn spill_partitions_on_build_pressure(&mut self) -> Result<()> {
         if !self.state.can_spill() {
             return Ok(());
         }
 
-        // Fast path: once all 16 partitions are Spilled, this thread has already done its one-time
-        // flush, and no shared pending blocks remain, let `build_partition_stream` batch normally.
         if self.state.are_all_spilled()
             && !self.state.has_any_pending_spill_blocks()
             && matches!(
@@ -482,14 +465,20 @@ impl PartitionedHashJoin {
             return Ok(());
         }
 
-        // One-time flush of this processor's pre-spill local buffers for already-spilled partitions.
-        let already_spilled: [bool; NUM_PARTITIONS] = {
-            let inner = self.state.lock();
-            std::array::from_fn(|pid| inner.partitions[pid].status == PartitionStatus::Spilled)
-        };
-        if let JoinLocal::Partitioned(local) = &mut self.local {
-            for (pid, is_spilled) in already_spilled.iter().enumerate() {
-                if *is_spilled && !local.flushed_on_spill[pid] {
+        // First flush this thread's local buffer once for any partition already marked Spilled by
+        // another processor.
+        if self.state.has_spilled()
+            && let JoinLocal::Partitioned(local) = &mut self.local
+        {
+            let need_flush: [bool; NUM_PARTITIONS] = {
+                let inner = self.state.lock();
+                std::array::from_fn(|pid| {
+                    inner.partitions[pid].status == PartitionStatus::Spilled
+                        && !local.flushed_on_spill[pid]
+                })
+            };
+            for (pid, should_flush) in need_flush.into_iter().enumerate() {
+                if should_flush {
                     local.flushed_on_spill[pid] = true;
                     if let Some(stream) = local.build_partition_stream.as_mut()
                         && let Some(block) = stream.finalize_partition(pid)
@@ -499,6 +488,7 @@ impl PartitionedHashJoin {
                 }
             }
         }
+
         self.drain_pending_spill_blocks()?;
 
         while self.memory_settings.check_spill() {
@@ -575,560 +565,118 @@ impl PartitionedHashJoin {
         Ok(())
     }
 
-    /// Inspect collected `chunks` to estimate `(valid_rows, hash_table_bytes)` accurately:
-    /// - `valid_rows` excludes rows with NULL values in non-null-equal key columns, because
-    ///   `BasicHashJoin::final_build` filters them out before inserting into the entry arena.
-    /// - `binary_key_bytes` (for `SingleBinary` / `Serializer` joins with a non-empty build
-    ///   projection) sums only the key columns' memory size rather than all payload columns.
-    fn estimate_chunks_hash_table_bytes(
-        &self,
-        basic_state: &BasicHashJoinState,
-        total_rows: usize,
-    ) -> (usize, usize) {
-        if total_rows == 0 {
-            return (0, 0);
-        }
+    /// Build resident partitions one at a time (with all threads collaborating on the active
+    /// partition's chunks in parallel) and check real `memory_settings.check_spill()` before
+    /// starting each next `Collecting` partition.
+    ///
+    /// As soon as `check_spill()` triggers (from this query's own hash table growth OR from any
+    /// concurrent query), all remaining `Collecting` partitions immediately flip to `Spilled` and
+    /// their untouched chunks are written to Parquet in parallel — releasing their memory before
+    /// `Stage::Probe` begins.
+    fn final_build_partitioned(&mut self) -> Result<Option<ProgressValues>> {
+        loop {
+            check_interrupt()?;
 
-        let locked = basic_state.mutex.lock();
-        let _locked = locked.unwrap_or_else(PoisonError::into_inner);
-        let chunks: &[DataBlock] = &basic_state.chunks;
-        if chunks.is_empty() {
-            return (0, 0);
-        }
-
-        // 1. Estimate `valid_rows` (rows surviving NULL-key filtering during `BuildFinal`).
-        let mut nullable_col_ids: Vec<usize> = Vec::new();
-        let mut has_non_colref_nullable_key = false;
-        let mut has_all_null_type = false;
-
-        for (expr, &is_null_equal) in self
-            .desc
-            .build_keys
-            .iter()
-            .zip(self.desc.is_null_equal.iter())
-        {
-            if is_null_equal {
-                continue;
+            enum BuildStep {
+                BuildChunk {
+                    pid: usize,
+                    basic_state: Arc<BasicHashJoinState>,
+                },
+                DrainSpills,
+                Done,
             }
-            let dt = expr.data_type();
-            if dt.is_null() {
-                has_all_null_type = true;
-                break;
-            }
-            if dt.is_nullable() {
-                match expr {
-                    Expr::ColumnRef(ColumnRef { id, .. }) => {
-                        if !nullable_col_ids.contains(id) {
-                            nullable_col_ids.push(*id);
+
+            let step = {
+                let mut inner = self.state.lock();
+
+                if let Some(pid) = inner.active_build_pid {
+                    BuildStep::BuildChunk {
+                        pid,
+                        basic_state: inner.partitions[pid].basic_state.clone(),
+                    }
+                } else if self.state.has_any_pending_spill_blocks() {
+                    BuildStep::DrainSpills
+                } else {
+                    // Empty partitions cost 0 bytes and become InMemory immediately.
+                    for slot in inner.partitions.iter_mut() {
+                        if slot.status == PartitionStatus::Collecting && slot.build_rows == 0 {
+                            slot.status = PartitionStatus::InMemory;
                         }
                     }
-                    _ => {
-                        has_non_colref_nullable_key = true;
-                    }
-                }
-            }
-        }
 
-        let valid_rows = if has_all_null_type {
-            0
-        } else if !has_non_colref_nullable_key && nullable_col_ids.is_empty() {
-            total_rows
-        } else if !has_non_colref_nullable_key {
-            let mut valid = 0usize;
-            if nullable_col_ids.len() == 1 {
-                let col_id = nullable_col_ids[0];
-                for chunk in chunks {
-                    match chunk.get_by_offset(col_id) {
-                        BlockEntry::Const(scalar, _, n) => {
-                            if !scalar.is_null() {
-                                valid = valid.saturating_add(*n);
-                            }
-                        }
-                        BlockEntry::Column(col) => {
-                            let (all_null, validity) = col.validity();
-                            if !all_null {
-                                valid = valid.saturating_add(match validity {
-                                    Some(bm) => chunk.num_rows().saturating_sub(bm.null_count()),
-                                    None => chunk.num_rows(),
-                                });
-                            }
-                        }
-                    }
-                }
-            } else {
-                for chunk in chunks {
-                    let mut combined = None;
-                    let mut all_null_chunk = false;
-                    for &col_id in &nullable_col_ids {
-                        match chunk.get_by_offset(col_id) {
-                            BlockEntry::Const(scalar, _, _) => {
-                                if scalar.is_null() {
-                                    all_null_chunk = true;
-                                    break;
-                                }
-                            }
-                            BlockEntry::Column(col) => {
-                                let (all_null, validity) = col.validity();
-                                if all_null {
-                                    all_null_chunk = true;
-                                    break;
-                                }
-                                combined = and_validities(combined, validity.cloned());
-                                if combined
-                                    .as_ref()
-                                    .is_some_and(|bm| bm.null_count() == bm.len())
-                                {
-                                    all_null_chunk = true;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    if !all_null_chunk {
-                        valid = valid.saturating_add(match combined {
-                            Some(bm) => chunk.num_rows().saturating_sub(bm.null_count()),
-                            None => chunk.num_rows(),
-                        });
-                    }
-                }
-            }
-            valid.min(total_rows)
-        } else if let Some(sample) = chunks.iter().find(|c| !c.is_empty()) {
-            match self
-                .desc
-                .build_key(sample, &self.function_ctx)
-                .and_then(|entries| {
-                    let keys_block = DataBlock::new(entries, sample.num_rows());
-                    self.desc.build_valids_by_keys(&keys_block)
-                }) {
-                Ok(Some(bm)) => {
-                    ((total_rows as u128 * bm.true_count() as u128) / sample.num_rows() as u128)
-                        as usize
-                }
-                _ => total_rows,
-            }
-        } else {
-            total_rows
-        };
+                    let next_collecting = inner
+                        .partitions
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, s)| s.status == PartitionStatus::Collecting)
+                        .min_by_key(|&(pid, s)| (s.build_bytes, s.build_rows, pid))
+                        .map(|(pid, _)| pid);
 
-        // 2. Estimate `binary_key_bytes` for `SingleBinary` / `Serializer` methods only.
-        let need_binary_key_bytes = valid_rows > 0
-            && !self.desc.build_projection.is_empty()
-            && matches!(
-                self.hash_method_kind,
-                HashMethodKind::Serializer(_) | HashMethodKind::SingleBinary(_)
-            );
-
-        let binary_key_bytes = if !need_binary_key_bytes {
-            0
-        } else {
-            let mut key_col_ids: Vec<usize> = Vec::with_capacity(self.desc.build_keys.len());
-            let mut all_colrefs = true;
-            for expr in &self.desc.build_keys {
-                match expr {
-                    Expr::ColumnRef(ColumnRef { id, .. }) => {
-                        if !key_col_ids.contains(id) {
-                            key_col_ids.push(*id);
-                        }
-                    }
-                    _ => {
-                        all_colrefs = false;
-                        break;
-                    }
-                }
-            }
-
-            if all_colrefs {
-                let mut key_bytes = 0usize;
-                for chunk in chunks {
-                    for &col_id in &key_col_ids {
-                        let col_bytes = match chunk.get_by_offset(col_id) {
-                            BlockEntry::Const(scalar, _, n) => {
-                                if scalar.is_null() {
-                                    0
-                                } else {
-                                    scalar.as_ref().memory_size().saturating_mul(*n)
-                                }
-                            }
-                            BlockEntry::Column(col) => col.memory_size(false),
-                        };
-                        key_bytes = key_bytes.saturating_add(col_bytes);
-                    }
-                }
-                key_bytes
-            } else if let Some(sample) = chunks.iter().find(|c| !c.is_empty()) {
-                match self.desc.build_key(sample, &self.function_ctx) {
-                    Ok(entries) => {
-                        let sample_bytes: usize = entries
-                            .iter()
-                            .map(|entry| match entry {
-                                BlockEntry::Const(scalar, _, n) => {
-                                    if scalar.is_null() {
-                                        0
-                                    } else {
-                                        scalar.as_ref().memory_size().saturating_mul(*n)
+                    match next_collecting {
+                        None => BuildStep::Done,
+                        Some(pid) => {
+                            if self.state.can_spill() && self.memory_settings.check_spill() {
+                                let mut newly_spilled = 0usize;
+                                for p in 0..NUM_PARTITIONS {
+                                    if inner.partitions[p].status == PartitionStatus::Collecting {
+                                        self.state.mark_partition_spilled(&mut inner, p);
+                                        newly_spilled += 1;
                                     }
                                 }
-                                BlockEntry::Column(col) => col.memory_size(false),
-                            })
-                            .sum();
-                        ((sample_bytes as u128 * valid_rows as u128) / sample.num_rows() as u128)
-                            as usize
-                    }
-                    Err(_) => chunks.iter().map(|c| c.memory_size()).sum(),
-                }
-            } else {
-                0
-            }
-        };
-
-        let est = estimate_hash_table_bytes(
-            total_rows,
-            valid_rows,
-            binary_key_bytes,
-            &self.hash_method_kind,
-            self.join_type,
-        );
-        (valid_rows, est)
-    }
-
-    /// Upfront admission check at the start of `Stage::BuildFinal` when the join stayed in `Flat`
-    /// mode throughout `Stage::Build`.
-    ///
-    /// - If the flat hash table fits in remaining memory (accounting for concurrent in-flight flat
-    ///   builds across other joins), reserve its estimate and stay 100% on the `Flat` path — zero
-    ///   partitioning overhead, zero memory inflation.
-    /// - Otherwise, switch to `Partitioned` mode and enter Round 1 of `Stage::BuildFinal` to
-    ///   scatter the untouched flat chunks into 16 partitions before the stage barrier.
-    fn check_flat_final_build_admission(&mut self) -> Result<bool> {
-        if !self.state.can_spill() {
-            return Ok(false);
-        }
-
-        let mut inner = self.state.lock();
-        if self.state.is_partitioned() {
-            return Ok(true);
-        }
-        if inner.flat_final_build_checked {
-            return Ok(false);
-        }
-
-        let rows = *self.state.flat_basic.build_rows;
-        if rows == 0 {
-            inner.flat_final_build_checked = true;
-            return Ok(false);
-        }
-
-        let (valid_rows, est) = self.estimate_chunks_hash_table_bytes(&self.state.flat_basic, rows);
-        let global_in_flight = PartitionedJoinState::global_in_flight_flat_build_bytes();
-        let need_spill = self.memory_settings.check_spill()
-            || self
-                .memory_settings
-                .check_spill_remain()
-                .is_some_and(|remain| remain < (global_in_flight.saturating_add(est)) as isize);
-
-        inner.flat_final_build_checked = true;
-        if !need_spill {
-            self.state.reserve_flat_build(est);
-            return Ok(false);
-        }
-
-        info!(
-            "HashJoin flat build final admission switching to partitioned mode, level: {}, rows: {}, valid_rows: {}, estimated_bytes: {}, global_in_flight: {}",
-            self.state.level, rows, valid_rows, est, global_in_flight
-        );
-        inner.scattering_in_build_final = true;
-        self.state.move_flat_chunks_to_transition();
-        self.state.set_partitioned();
-        Ok(true)
-    }
-
-    /// Deterministically plan which `Collecting` partitions remain resident (`InMemory`) and which
-    /// flip to `Spilled` (largest first) at the start of `BuildFinal`, accounting for:
-    /// - hash table memory of kept resident partitions,
-    /// - build chunk memory freed by spilling victim partitions, and
-    /// - `Stage::Probe` headroom (partition buffers + Parquet probe writers + resident contexts).
-    fn plan_build_final_partitions(&self) {
-        let mut inner = self.state.lock();
-        if inner.build_final_planned {
-            return;
-        }
-        inner.scattering_in_build_final = false;
-        inner.build_final_planned = true;
-
-        // Empty partitions cost 0 bytes and become InMemory immediately.
-        for slot in inner.partitions.iter_mut() {
-            if slot.status == PartitionStatus::Collecting && slot.build_rows == 0 {
-                slot.status = PartitionStatus::InMemory;
-            }
-        }
-
-        if !self.state.can_spill() {
-            return;
-        }
-
-        // Collect non-empty Collecting partitions sorted smallest-first (tie-broken by pid for
-        // deterministic decisions across runs).
-        let mut candidates: Vec<(usize, usize, usize, usize)> = inner
-            .partitions
-            .iter()
-            .enumerate()
-            .filter(|(_, s)| s.status == PartitionStatus::Collecting)
-            .map(|(pid, s)| {
-                let (_, est) = self.estimate_chunks_hash_table_bytes(&s.basic_state, s.build_rows);
-                (pid, s.build_rows, s.build_bytes, est)
-            })
-            .collect();
-
-        if candidates.is_empty() {
-            let spilled_count = inner
-                .partitions
-                .iter()
-                .filter(|s| s.status == PartitionStatus::Spilled)
-                .count();
-            info!(
-                "HashJoin build final plan, level: {}, resident: {}, spilled: {}",
-                self.state.level,
-                NUM_PARTITIONS - spilled_count,
-                spilled_count
-            );
-            return;
-        }
-
-        candidates.sort_by_key(|&(pid, rows, bytes, est)| (est, bytes, rows, pid));
-
-        let already_spilled = inner
-            .partitions
-            .iter()
-            .filter(|s| s.status == PartitionStatus::Spilled)
-            .count();
-
-        let remain = self.memory_settings.check_spill_remain();
-        let force_spill = self
-            .ctx
-            .get_settings()
-            .get_force_join_data_spill()
-            .unwrap_or(false);
-
-        let keep_count = if force_spill {
-            0
-        } else if let Some(remain_bytes) = remain {
-            let settings = self.ctx.get_settings();
-            let max_threads = settings.get_max_threads().unwrap_or(1) as usize;
-            let max_block_size = settings.get_max_block_size().unwrap_or(65536) as usize;
-            let probe_cols = self.desc.probe_schema.fields().len();
-            let total_candidate_bytes: usize = candidates.iter().map(|c| c.2).sum();
-
-            // Find the largest `k` (keeping the `k` smallest partitions resident) whose net memory
-            // requirement fits within `remain_bytes`.
-            let mut best_k = 0usize;
-            let mut resident_est = 0usize;
-            let mut resident_chunk_bytes = 0usize;
-            for (idx, &(_, _, bytes, est)) in candidates.iter().enumerate() {
-                let k = idx + 1;
-                resident_est = resident_est.saturating_add(est);
-                resident_chunk_bytes = resident_chunk_bytes.saturating_add(bytes);
-                let spilled_count = already_spilled + (candidates.len() - k);
-                let spilled_chunk_freed =
-                    total_candidate_bytes.saturating_sub(resident_chunk_bytes);
-                let probe_headroom = estimate_probe_headroom(
-                    max_threads,
-                    max_block_size,
-                    probe_cols,
-                    k,
-                    spilled_count,
-                );
-                let net_needed = (resident_est.saturating_add(probe_headroom) as isize)
-                    - (spilled_chunk_freed as isize);
-                if net_needed <= remain_bytes {
-                    best_k = k;
-                } else {
-                    break;
-                }
-            }
-            best_k
-        } else {
-            candidates.len()
-        };
-
-        let mut spilled_now = 0usize;
-        for &(pid, rows, bytes, _) in &candidates[keep_count..] {
-            info!(
-                "HashJoin spilling partition {} during build final, level: {}, rows: {}, bytes: {}",
-                pid, self.state.level, rows, bytes
-            );
-            self.state.mark_partition_spilled(&mut inner, pid);
-            spilled_now += 1;
-        }
-
-        let total_spilled = already_spilled + spilled_now;
-        info!(
-            "HashJoin build final plan, level: {}, resident: {}, spilled: {} (newly_spilled: {}, remain: {:?})",
-            self.state.level,
-            NUM_PARTITIONS - total_spilled,
-            total_spilled,
-            spilled_now,
-            remain
-        );
-    }
-
-    /// Execute one step of `Stage::BuildFinal` in `Partitioned` mode:
-    /// - If Round 1 scatter from `Flat` mode is active, drain `transition_queue`, flush and drop
-    ///   `build_partition_stream`, mark `local.need_build_final_reenter = true`, and return `None`
-    ///   so all processors synchronize at the `Stage::BuildFinal` barrier before Round 2.
-    /// - Otherwise:
-    ///   1. Run deterministic partition planning (once).
-    ///   2. Drain all `pending_spill_blocks` and close `build_writers` FIRST (freeing spilled
-    ///      chunks and writer buffers before allocating resident hash tables!).
-    ///   3. Claim remaining `Collecting` partitions one by one to build independent hash tables
-    ///      (with a dynamic `check_spill()` safety check in case external memory pressure spikes).
-    fn final_build_partitioned(&mut self) -> Result<Option<ProgressValues>> {
-        let is_scattering = {
-            let inner = self.state.lock();
-            inner.scattering_in_build_final
-        };
-
-        if is_scattering {
-            self.drain_transition_queue()?;
-            self.flush_and_drop_build_partition_stream()?;
-            self.spill_partitions_on_build_pressure()?;
-            if let JoinLocal::Partitioned(local) = &mut self.local {
-                local.need_build_final_reenter = true;
-            }
-            return Ok(None);
-        }
-
-        // Release `build_partition_stream` buffers if any remain from `Stage::Build`.
-        self.flush_and_drop_build_partition_stream()?;
-
-        // Step 1: deterministic resident vs spilled plan (runs once under lock).
-        self.plan_build_final_partitions();
-
-        // Step 2: drain all planned spilled build chunks and close build writers FIRST so their
-        // chunks and Parquet writer buffers are released BEFORE building resident hash tables.
-        let drained = self.drain_pending_spill_blocks()?;
-        if drained.rows > 0 {
-            return Ok(Some(drained));
-        }
-        if let JoinLocal::Partitioned(local) = &mut self.local {
-            local.close_build_writers(&self.state)?;
-        }
-
-        // Step 3: claim next planned resident `Collecting` partition to build (with dynamic spill
-        // safety guard in case concurrent queries eat memory while resident tables are building).
-        enum BuildAction {
-            Build {
-                pid: usize,
-                est: usize,
-                basic_state: Arc<BasicHashJoinState>,
-            },
-            Spilled,
-            Done,
-        }
-
-        let action = {
-            let mut inner = self.state.lock();
-
-            let smallest = inner
-                .partitions
-                .iter()
-                .enumerate()
-                .filter(|(_, s)| s.status == PartitionStatus::Collecting)
-                .min_by_key(|&(pid, s)| (s.build_bytes, s.build_rows, pid))
-                .map(|(pid, _)| pid);
-
-            match smallest {
-                None => BuildAction::Done,
-                Some(smallest_pid) => {
-                    let (_, est) = self.estimate_chunks_hash_table_bytes(
-                        &inner.partitions[smallest_pid].basic_state,
-                        inner.partitions[smallest_pid].build_rows,
-                    );
-
-                    // Dynamic guard: only spill an already-planned resident partition if real
-                    // memory pressure has since exceeded remaining headroom.
-                    let over_limit =
-                        self.state.can_spill()
-                            && (self.memory_settings.check_spill()
-                                || self.memory_settings.check_spill_remain().is_some_and(
-                                    |remain| remain < (inner.in_flight_build_bytes + est) as isize,
-                                ));
-
-                    if over_limit {
-                        let largest_pid = inner
-                            .partitions
-                            .iter()
-                            .enumerate()
-                            .filter(|(_, s)| s.status == PartitionStatus::Collecting)
-                            .max_by_key(|&(pid, s)| (s.build_bytes, s.build_rows, pid))
-                            .map(|(pid, _)| pid)
-                            .unwrap_or(smallest_pid);
-
-                        let rows = inner.partitions[largest_pid].build_rows;
-                        let bytes = inner.partitions[largest_pid].build_bytes;
-                        info!(
-                            "HashJoin spilling partition {} dynamically during build final, level: {}, rows: {}, bytes: {}",
-                            largest_pid, self.state.level, rows, bytes
-                        );
-                        self.state.mark_partition_spilled(&mut inner, largest_pid);
-                        BuildAction::Spilled
-                    } else {
-                        inner.in_flight_build_bytes += est;
-                        inner.partitions[smallest_pid].status = PartitionStatus::Building;
-                        let basic_state = inner.partitions[smallest_pid].basic_state.clone();
-                        BuildAction::Build {
-                            pid: smallest_pid,
-                            est,
-                            basic_state,
+                                let total_spilled = inner
+                                    .partitions
+                                    .iter()
+                                    .filter(|s| s.status == PartitionStatus::Spilled)
+                                    .count();
+                                info!(
+                                    "HashJoin build final spill triggered by check_spill, level: {}, resident: {}, spilled: {} (newly_spilled: {})",
+                                    self.state.level,
+                                    NUM_PARTITIONS - total_spilled,
+                                    total_spilled,
+                                    newly_spilled
+                                );
+                                BuildStep::DrainSpills
+                            } else {
+                                inner.partitions[pid].status = PartitionStatus::InMemory;
+                                inner.active_build_pid = Some(pid);
+                                BuildStep::BuildChunk {
+                                    pid,
+                                    basic_state: inner.partitions[pid].basic_state.clone(),
+                                }
+                            }
                         }
                     }
                 }
-            }
-        };
+            };
 
-        match action {
-            BuildAction::Build {
-                pid,
-                est,
-                basic_state,
-            } => {
-                let build_res = (|| -> Result<ProgressValues> {
+            match step {
+                BuildStep::BuildChunk { pid, basic_state } => {
                     let join = self.get_or_create_partition_join(pid, basic_state)?;
-                    let mut progress = ProgressValues::default();
-                    while let Some(p) = join.final_build()? {
-                        check_interrupt()?;
-                        progress.rows += p.rows;
-                        progress.bytes += p.bytes;
+                    if let Some(progress) = join.final_build()? {
+                        return Ok(Some(progress));
                     }
-                    Ok(progress)
-                })();
-
-                let mut inner = self.state.lock();
-                inner.in_flight_build_bytes = inner.in_flight_build_bytes.saturating_sub(est);
-                match build_res {
-                    Ok(progress) => {
-                        inner.partitions[pid].status = PartitionStatus::InMemory;
-                        Ok(Some(progress))
+                    // This partition's build queue is exhausted; allow claiming the next partition.
+                    let mut inner = self.state.lock();
+                    if inner.active_build_pid == Some(pid) {
+                        inner.active_build_pid = None;
                     }
-                    Err(err) => Err(err),
                 }
-            }
-            BuildAction::Spilled => {
-                let progress = self.drain_pending_spill_blocks()?;
-                if let JoinLocal::Partitioned(local) = &mut self.local {
-                    local.close_build_writers(&self.state)?;
+                BuildStep::DrainSpills => {
+                    let progress = self.drain_pending_spill_blocks()?;
+                    if progress.rows > 0 {
+                        return Ok(Some(progress));
+                    }
                 }
-                Ok(Some(progress))
-            }
-            BuildAction::Done => {
-                let drained = self.drain_pending_spill_blocks()?;
-                if drained.rows > 0 {
-                    return Ok(Some(drained));
+                BuildStep::Done => {
+                    let drained = self.drain_pending_spill_blocks()?;
+                    if drained.rows > 0 {
+                        return Ok(Some(drained));
+                    }
+                    if let JoinLocal::Partitioned(local) = &mut self.local {
+                        local.close_build_writers(&self.state)?;
+                    }
+                    return Ok(None);
                 }
-                if let JoinLocal::Partitioned(local) = &mut self.local {
-                    local.close_build_writers(&self.state)?;
-                }
-                Ok(None)
             }
         }
     }
@@ -1170,7 +718,7 @@ impl PartitionedHashJoin {
                     PartitionProbeAction::ProbeInMemory
                 }
             }
-            PartitionStatus::Collecting | PartitionStatus::Building => {
+            PartitionStatus::Collecting => {
                 unreachable!("partition must be InMemory or Spilled when probing")
             }
         });
@@ -1192,6 +740,9 @@ impl PartitionedHashJoin {
         }
 
         let actions = self.ensure_probe_actions();
+        if actions.iter().all(|&a| a == PartitionProbeAction::Skip) {
+            return Ok(Box::new(EmptyJoinStream));
+        }
 
         let mut hashes = Vec::with_capacity(data.num_rows());
         get_hashes(
@@ -1209,8 +760,11 @@ impl PartitionedHashJoin {
             *hash = get_partition_id(*hash, shift_bits);
         }
 
+        let has_spilled = self.state.has_spilled();
         let ready = match &mut self.local {
-            JoinLocal::Partitioned(local) => local.probe_stream().partition(hashes, data, true),
+            JoinLocal::Partitioned(local) => local
+                .probe_stream(has_spilled)
+                .partition(hashes, data, true),
             JoinLocal::Flat(_) => unreachable!(),
         };
 
@@ -1268,8 +822,10 @@ impl PartitionedHashJoin {
                 let next_stage = if self.has_right_final_probe() && self.has_any_nonempty_resident()
                 {
                     ProbeFinalStage::FlushResidentFinal
-                } else {
+                } else if self.state.has_spilled() {
                     ProbeFinalStage::RestoreBuild
+                } else {
+                    ProbeFinalStage::Done
                 };
 
                 if let JoinLocal::Partitioned(local) = &mut self.local {
@@ -1283,8 +839,13 @@ impl PartitionedHashJoin {
                 }
             }
             ProbeFinalStage::FlushResidentFinal => {
+                let next_stage = if self.state.has_spilled() {
+                    ProbeFinalStage::RestoreBuild
+                } else {
+                    ProbeFinalStage::Done
+                };
                 if let JoinLocal::Partitioned(local) = &mut self.local {
-                    local.probe_final_stage = ProbeFinalStage::RestoreBuild;
+                    local.probe_final_stage = next_stage;
                 }
                 Ok(Some(ResidentFinalProbeStream::create(self)))
             }
@@ -1382,13 +943,7 @@ impl PartitionedHashJoin {
                     while sub_join.final_build()?.is_some() {
                         check_interrupt()?;
                     }
-                    if sub_join.needs_build_final_reenter() {
-                        // Stay in RestoreBuildFinal so all processors pass the TransformHashJoin
-                        // barrier before running Round 2 of `sub_join.final_build()`.
-                        sub_join.finish_build_final_reenter()?;
-                    } else {
-                        local.probe_final_stage = ProbeFinalStage::RestoreProbe;
-                    }
+                    local.probe_final_stage = ProbeFinalStage::RestoreProbe;
                 }
                 Ok(Some(Box::new(EmptyJoinStream)))
             }
@@ -1482,86 +1037,31 @@ impl Join for PartitionedHashJoin {
             self.state.add_build_input_rows(block.num_rows());
         }
 
-        // 1. If another processor already switched to Partitioned mode, follow it.
-        if self.state.is_partitioned() && matches!(self.local, JoinLocal::Flat(_)) {
-            self.ensure_partitioned_local(true)?;
-        }
-
         let finished = data.is_none();
 
         match &mut self.local {
-            JoinLocal::Flat(flat_join) => {
-                flat_join.add_block(data)?;
-
-                // Stay 100% on the Flat path during Stage::Build unless memory pressure triggers
-                // spilling (or another processor has already switched to Partitioned mode).
-                let should_switch = self.state.can_spill()
-                    && (self.state.is_partitioned()
-                        || (self.state.build_input_rows() > 0
-                            && self.memory_settings.check_spill()));
-
-                if should_switch {
-                    self.ensure_partitioned_local(!finished)?;
-                    self.drain_transition_queue()?;
-                    if finished {
-                        self.flush_and_drop_build_partition_stream()?;
-                    }
-                    self.spill_partitions_on_build_pressure()?;
-                }
-                Ok(())
-            }
+            JoinLocal::Flat(flat_join) => flat_join.add_block(data),
             JoinLocal::Partitioned(_) => {
                 if let Some(block) = data {
                     self.partition_build_block(block)?;
                 }
-                self.drain_transition_queue()?;
                 if finished {
                     self.flush_and_drop_build_partition_stream()?;
                 }
-                self.spill_partitions_on_build_pressure()
+                self.spill_partitions_on_build_pressure()?;
+                if finished && let JoinLocal::Partitioned(local) = &mut self.local {
+                    local.close_build_writers(&self.state)?;
+                }
+                Ok(())
             }
         }
     }
 
     fn final_build(&mut self) -> Result<Option<ProgressValues>> {
-        // Follow any switch to Partitioned mode made during Stage::Build.
-        if self.state.is_partitioned() && matches!(self.local, JoinLocal::Flat(_)) {
-            self.ensure_partitioned_local(false)?;
-        }
-
-        // If still in Flat mode, check upfront whether the flat hash table fits in memory.
-        if matches!(self.local, JoinLocal::Flat(_)) && self.check_flat_final_build_admission()? {
-            self.ensure_partitioned_local(false)?;
-        }
-
         match &mut self.local {
-            JoinLocal::Flat(flat_join) => {
-                let res = flat_join.final_build()?;
-                if res.is_none() {
-                    self.state.release_flat_build_reservation();
-                }
-                Ok(res)
-            }
+            JoinLocal::Flat(flat_join) => flat_join.final_build(),
             JoinLocal::Partitioned(_) => self.final_build_partitioned(),
         }
-    }
-
-    fn needs_build_final_reenter(&self) -> bool {
-        match &self.local {
-            JoinLocal::Flat(_) => false,
-            JoinLocal::Partitioned(local) => local.need_build_final_reenter,
-        }
-    }
-
-    fn finish_build_final_reenter(&mut self) -> Result<()> {
-        if let JoinLocal::Partitioned(local) = &mut self.local {
-            local.need_build_final_reenter = false;
-        }
-        // Safe to clear here: `needs_build_final_reenter()` only reads the per-processor
-        // `local.need_build_final_reenter` flag, and clearing `scattering_in_build_final` is
-        // idempotent across all processors before Round 2 of `Stage::BuildFinal`.
-        self.state.lock().scattering_in_build_final = false;
-        Ok(())
     }
 
     fn add_runtime_filter_packet(&self, packet: JoinRuntimeFilterPacket) {

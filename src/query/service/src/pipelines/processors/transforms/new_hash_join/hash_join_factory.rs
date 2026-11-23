@@ -17,6 +17,7 @@ use std::sync::Arc;
 use databend_common_exception::Result;
 use databend_common_expression::FunctionContext;
 use databend_common_expression::HashMethodKind;
+use databend_common_functions::BUILTIN_FUNCTIONS;
 use databend_common_pipeline_transforms::MemorySettings;
 use databend_common_sql::plans::JoinType;
 
@@ -60,15 +61,25 @@ impl HashJoinFactory {
 
     /// Create the state shared by all processors of one hash join recursion level.
     ///
-    /// When `shared_build_chunks` is true (e.g. a `CacheScan` reads `flat_basic.chunks` during
-    /// probing) or there are no join keys, partitioning and spilling are disabled so build chunks
-    /// stay intact in `flat_basic`.
+    /// Partitioning and spilling are disabled (keeping the single-partition flat path) when:
+    /// - `shared_build_chunks` is true (`CacheScan` reads `flat_basic.chunks` during probing),
+    /// - there are no join keys (cross join), or
+    /// - any join key or residual predicate is non-deterministic (e.g. `running_difference`,
+    ///   `rand`, `nextval`), since partitioning re-evaluates keys and reorders rows across blocks.
     pub fn create_level_state(
         self: &Arc<Self>,
         level: usize,
         shared_build_chunks: bool,
     ) -> Result<Arc<PartitionedJoinState>> {
-        let allow_spill = !shared_build_chunks && !self.desc.build_keys.is_empty();
+        let deterministic_exprs = self
+            .desc
+            .build_keys
+            .iter()
+            .chain(self.desc.probe_keys.iter())
+            .chain(self.desc.other_predicate.iter())
+            .all(|expr| expr.is_deterministic(&BUILTIN_FUNCTIONS));
+        let allow_spill =
+            !shared_build_chunks && !self.desc.build_keys.is_empty() && deterministic_exprs;
         PartitionedJoinState::create(self.ctx.clone(), level, self.clone(), allow_spill)
     }
 
@@ -146,7 +157,11 @@ impl HashJoinFactory {
         typ: JoinType,
         state: Arc<PartitionedJoinState>,
     ) -> Result<PartitionedHashJoin> {
-        let flat_join = self.create_memory_join(typ, state.flat_basic.clone())?;
+        let flat_join = if state.can_spill() {
+            None
+        } else {
+            Some(self.create_memory_join(typ, state.flat_basic.clone())?)
+        };
         let memory_settings = MemorySettings::from_join_settings(&self.ctx)?;
 
         PartitionedHashJoin::create(

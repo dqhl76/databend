@@ -312,7 +312,7 @@ create or replace table t1(a string, b bool);
 statement ok
 insert into t1 values('1', true),('1.0', false),('2.0', true),('2.1', false);
 
-query ITB
+query ITB rowsort
 select * from t join t1 on t.a = t1.a
 ----
 1 1 1
