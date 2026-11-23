@@ -155,7 +155,6 @@ pub struct PartitionedJoinState {
 
     /// Build state for the flat single-partition fast path (and for `TransformCacheScan`).
     pub flat_basic: Arc<BasicHashJoinState>,
-    flat_bytes: AtomicUsize,
     flat_reserved_bytes: AtomicUsize,
     build_input_rows: AtomicUsize,
 
@@ -205,7 +204,6 @@ impl PartitionedJoinState {
             max_level,
             allow_spill,
             flat_basic: Arc::new(BasicHashJoinState::create()),
-            flat_bytes: AtomicUsize::new(0),
             flat_reserved_bytes: AtomicUsize::new(0),
             build_input_rows: AtomicUsize::new(0),
             partitioned: AtomicBool::new(false),
@@ -257,14 +255,6 @@ impl PartitionedJoinState {
         self.build_input_rows.load(Ordering::Acquire)
     }
 
-    pub fn add_flat_bytes(&self, bytes: usize) -> usize {
-        self.flat_bytes.fetch_add(bytes, Ordering::AcqRel) + bytes
-    }
-
-    pub fn flat_bytes(&self) -> usize {
-        self.flat_bytes.load(Ordering::Acquire)
-    }
-
     pub fn global_in_flight_flat_build_bytes() -> usize {
         GLOBAL_IN_FLIGHT_FLAT_BUILD_BYTES.load(Ordering::Acquire)
     }
@@ -295,7 +285,6 @@ impl PartitionedJoinState {
                 .push(block)
                 .expect("push unbounded concurrent queue failed");
         }
-        self.flat_bytes.store(0, Ordering::Release);
     }
 
     /// Transition partition `pid` from `Collecting` to `Spilled` while `inner` is locked, moving
@@ -344,20 +333,23 @@ pub fn get_partition_id(hash: u64, shift_bits: usize) -> u64 {
     ((hash >> (4 + shift_bits)) ^ hash) & 0b1111
 }
 
-/// Estimate the net memory growth of building an in-memory hash table for `rows` build rows whose
-/// raw chunks occupy `chunks_bytes`.
+/// Estimate the net memory growth of building an in-memory hash table for `total_rows` build rows
+/// of which `valid_rows` have non-NULL join keys (and will actually be inserted into the entry
+/// arena), with `binary_key_bytes` bytes of encoded key data for `SingleBinary`/`Serializer`
+/// methods when `build_projection` is non-empty.
 pub fn estimate_hash_table_bytes(
-    rows: usize,
-    chunks_bytes: usize,
+    total_rows: usize,
+    valid_rows: usize,
+    binary_key_bytes: usize,
     method: &HashMethodKind,
     join_type: JoinType,
-    has_build_projection: bool,
 ) -> usize {
-    if rows == 0 {
+    if total_rows == 0 {
         return 0;
     }
 
-    let bucket_capacity = std::cmp::max(rows.saturating_mul(2).next_power_of_two(), 1 << 10);
+    let valid_rows = valid_rows.min(total_rows);
+    let bucket_capacity = std::cmp::max(total_rows.saturating_mul(2).next_power_of_two(), 1 << 10);
     let bucket_bytes = bucket_capacity.saturating_mul(std::mem::size_of::<u64>());
 
     let entry_size = match method {
@@ -371,19 +363,16 @@ pub fn estimate_hash_table_bytes(
             std::mem::size_of::<StringRawEntry>()
         }
     };
-    let entry_bytes = rows.saturating_mul(entry_size);
+    let entry_bytes = valid_rows.saturating_mul(entry_size);
 
     let scan_map_bytes = match join_type {
-        JoinType::Right | JoinType::RightSemi | JoinType::RightAnti => rows,
+        JoinType::Right | JoinType::RightSemi | JoinType::RightAnti => total_rows,
         _ => 0,
     };
 
-    // Binary/serializer hash tables copy encoded key bytes into the arena. When `build_projection`
-    // is empty, the original key columns are dropped as each chunk is inserted, so net key-byte
-    // growth is bounded near zero; otherwise `chunks_bytes` is a safe upper bound.
-    let binary_key_bytes = match method {
-        HashMethodKind::Serializer(_) | HashMethodKind::SingleBinary(_) if has_build_projection => {
-            chunks_bytes
+    let arena_key_bytes = match method {
+        HashMethodKind::Serializer(_) | HashMethodKind::SingleBinary(_) if valid_rows > 0 => {
+            binary_key_bytes
         }
         _ => 0,
     };
@@ -391,7 +380,7 @@ pub fn estimate_hash_table_bytes(
     bucket_bytes
         .saturating_add(entry_bytes)
         .saturating_add(scan_map_bytes)
-        .saturating_add(binary_key_bytes)
+        .saturating_add(arena_key_bytes)
 }
 
 /// Estimate the memory needed during `Stage::Probe` when `spilled_count > 0` partitions are
@@ -456,7 +445,7 @@ mod tests {
         let u64_method = HashMethodKind::KeysU64(HashMethodFixedKeys::<u64>::default());
 
         assert_eq!(
-            estimate_hash_table_bytes(0, 0, &u64_method, JoinType::Inner, false),
+            estimate_hash_table_bytes(0, 0, 0, &u64_method, JoinType::Inner),
             0
         );
 
@@ -464,34 +453,46 @@ mod tests {
         let expected_buckets = (rows * 2).next_power_of_two() * std::mem::size_of::<u64>();
         let expected_u64 = expected_buckets + rows * std::mem::size_of::<RawEntry<u64>>();
         assert_eq!(
-            estimate_hash_table_bytes(rows, 80_000, &u64_method, JoinType::Inner, false),
+            estimate_hash_table_bytes(rows, rows, 0, &u64_method, JoinType::Inner),
             expected_u64
+        );
+
+        // High-NULL build side: buckets still size for `total_rows`, entries only for `valid_rows`.
+        let valid_rows: usize = 1_000;
+        assert_eq!(
+            estimate_hash_table_bytes(rows, valid_rows, 0, &u64_method, JoinType::Inner),
+            expected_buckets + valid_rows * std::mem::size_of::<RawEntry<u64>>()
         );
 
         // Right join includes 1 byte per row for `scan_map`.
         assert_eq!(
-            estimate_hash_table_bytes(rows, 80_000, &u64_method, JoinType::Right, false),
+            estimate_hash_table_bytes(rows, rows, 0, &u64_method, JoinType::Right),
             expected_u64 + rows
         );
 
         // Wider fixed key uses larger RawEntry.
         let u256_method = HashMethodKind::KeysU256(HashMethodFixedKeys::<U256>::default());
         assert_eq!(
-            estimate_hash_table_bytes(rows, 80_000, &u256_method, JoinType::Right, false),
+            estimate_hash_table_bytes(rows, rows, 0, &u256_method, JoinType::Right),
             expected_buckets + rows * std::mem::size_of::<RawEntry<U256>>() + rows
         );
 
-        // Binary/serializer keys add `chunks_bytes` only when `has_build_projection` is true.
+        // Binary/serializer keys add only the measured `binary_key_bytes` when `valid_rows > 0`.
         let ser_method = HashMethodKind::Serializer(HashMethodSerializer::default());
         let bin_method = HashMethodKind::SingleBinary(HashMethodSingleBinary::default());
         let expected_str_base = expected_buckets + rows * std::mem::size_of::<StringRawEntry>();
         assert_eq!(
-            estimate_hash_table_bytes(rows, 200_000, &ser_method, JoinType::Inner, false),
+            estimate_hash_table_bytes(rows, rows, 0, &ser_method, JoinType::Inner),
             expected_str_base
         );
         assert_eq!(
-            estimate_hash_table_bytes(rows, 200_000, &bin_method, JoinType::Inner, true),
-            expected_str_base + 200_000
+            estimate_hash_table_bytes(rows, rows, 40_000, &bin_method, JoinType::Inner),
+            expected_str_base + 40_000
+        );
+        // All-NULL binary keys insert zero entries and zero arena bytes.
+        assert_eq!(
+            estimate_hash_table_bytes(rows, 0, 40_000, &bin_method, JoinType::Inner),
+            expected_buckets
         );
     }
 

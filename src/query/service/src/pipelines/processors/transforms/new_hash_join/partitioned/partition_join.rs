@@ -14,14 +14,19 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::PoisonError;
 
 use databend_base::uniq_id::GlobalUniq;
 use databend_common_base::base::ProgressValues;
 use databend_common_exception::Result;
+use databend_common_expression::BlockEntry;
 use databend_common_expression::BlockPartitionStream;
+use databend_common_expression::ColumnRef;
 use databend_common_expression::DataBlock;
+use databend_common_expression::Expr;
 use databend_common_expression::FunctionContext;
 use databend_common_expression::HashMethodKind;
+use databend_common_expression::arrow::and_validities;
 use databend_common_pipeline::core::check_interrupt;
 use databend_common_pipeline_transforms::MemorySettings;
 use databend_common_pipeline_transforms::traits::Location;
@@ -570,6 +575,223 @@ impl PartitionedHashJoin {
         Ok(())
     }
 
+    /// Inspect collected `chunks` to estimate `(valid_rows, hash_table_bytes)` accurately:
+    /// - `valid_rows` excludes rows with NULL values in non-null-equal key columns, because
+    ///   `BasicHashJoin::final_build` filters them out before inserting into the entry arena.
+    /// - `binary_key_bytes` (for `SingleBinary` / `Serializer` joins with a non-empty build
+    ///   projection) sums only the key columns' memory size rather than all payload columns.
+    fn estimate_chunks_hash_table_bytes(
+        &self,
+        basic_state: &BasicHashJoinState,
+        total_rows: usize,
+    ) -> (usize, usize) {
+        if total_rows == 0 {
+            return (0, 0);
+        }
+
+        let locked = basic_state.mutex.lock();
+        let _locked = locked.unwrap_or_else(PoisonError::into_inner);
+        let chunks: &[DataBlock] = &basic_state.chunks;
+        if chunks.is_empty() {
+            return (0, 0);
+        }
+
+        // 1. Estimate `valid_rows` (rows surviving NULL-key filtering during `BuildFinal`).
+        let mut nullable_col_ids: Vec<usize> = Vec::new();
+        let mut has_non_colref_nullable_key = false;
+        let mut has_all_null_type = false;
+
+        for (expr, &is_null_equal) in self
+            .desc
+            .build_keys
+            .iter()
+            .zip(self.desc.is_null_equal.iter())
+        {
+            if is_null_equal {
+                continue;
+            }
+            let dt = expr.data_type();
+            if dt.is_null() {
+                has_all_null_type = true;
+                break;
+            }
+            if dt.is_nullable() {
+                match expr {
+                    Expr::ColumnRef(ColumnRef { id, .. }) => {
+                        if !nullable_col_ids.contains(id) {
+                            nullable_col_ids.push(*id);
+                        }
+                    }
+                    _ => {
+                        has_non_colref_nullable_key = true;
+                    }
+                }
+            }
+        }
+
+        let valid_rows = if has_all_null_type {
+            0
+        } else if !has_non_colref_nullable_key && nullable_col_ids.is_empty() {
+            total_rows
+        } else if !has_non_colref_nullable_key {
+            let mut valid = 0usize;
+            if nullable_col_ids.len() == 1 {
+                let col_id = nullable_col_ids[0];
+                for chunk in chunks {
+                    match chunk.get_by_offset(col_id) {
+                        BlockEntry::Const(scalar, _, n) => {
+                            if !scalar.is_null() {
+                                valid = valid.saturating_add(*n);
+                            }
+                        }
+                        BlockEntry::Column(col) => {
+                            let (all_null, validity) = col.validity();
+                            if !all_null {
+                                valid = valid.saturating_add(match validity {
+                                    Some(bm) => chunk.num_rows().saturating_sub(bm.null_count()),
+                                    None => chunk.num_rows(),
+                                });
+                            }
+                        }
+                    }
+                }
+            } else {
+                for chunk in chunks {
+                    let mut combined = None;
+                    let mut all_null_chunk = false;
+                    for &col_id in &nullable_col_ids {
+                        match chunk.get_by_offset(col_id) {
+                            BlockEntry::Const(scalar, _, _) => {
+                                if scalar.is_null() {
+                                    all_null_chunk = true;
+                                    break;
+                                }
+                            }
+                            BlockEntry::Column(col) => {
+                                let (all_null, validity) = col.validity();
+                                if all_null {
+                                    all_null_chunk = true;
+                                    break;
+                                }
+                                combined = and_validities(combined, validity.cloned());
+                                if combined
+                                    .as_ref()
+                                    .is_some_and(|bm| bm.null_count() == bm.len())
+                                {
+                                    all_null_chunk = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if !all_null_chunk {
+                        valid = valid.saturating_add(match combined {
+                            Some(bm) => chunk.num_rows().saturating_sub(bm.null_count()),
+                            None => chunk.num_rows(),
+                        });
+                    }
+                }
+            }
+            valid.min(total_rows)
+        } else if let Some(sample) = chunks.iter().find(|c| !c.is_empty()) {
+            match self
+                .desc
+                .build_key(sample, &self.function_ctx)
+                .and_then(|entries| {
+                    let keys_block = DataBlock::new(entries, sample.num_rows());
+                    self.desc.build_valids_by_keys(&keys_block)
+                }) {
+                Ok(Some(bm)) => {
+                    ((total_rows as u128 * bm.true_count() as u128) / sample.num_rows() as u128)
+                        as usize
+                }
+                _ => total_rows,
+            }
+        } else {
+            total_rows
+        };
+
+        // 2. Estimate `binary_key_bytes` for `SingleBinary` / `Serializer` methods only.
+        let need_binary_key_bytes = valid_rows > 0
+            && !self.desc.build_projection.is_empty()
+            && matches!(
+                self.hash_method_kind,
+                HashMethodKind::Serializer(_) | HashMethodKind::SingleBinary(_)
+            );
+
+        let binary_key_bytes = if !need_binary_key_bytes {
+            0
+        } else {
+            let mut key_col_ids: Vec<usize> = Vec::with_capacity(self.desc.build_keys.len());
+            let mut all_colrefs = true;
+            for expr in &self.desc.build_keys {
+                match expr {
+                    Expr::ColumnRef(ColumnRef { id, .. }) => {
+                        if !key_col_ids.contains(id) {
+                            key_col_ids.push(*id);
+                        }
+                    }
+                    _ => {
+                        all_colrefs = false;
+                        break;
+                    }
+                }
+            }
+
+            if all_colrefs {
+                let mut key_bytes = 0usize;
+                for chunk in chunks {
+                    for &col_id in &key_col_ids {
+                        let col_bytes = match chunk.get_by_offset(col_id) {
+                            BlockEntry::Const(scalar, _, n) => {
+                                if scalar.is_null() {
+                                    0
+                                } else {
+                                    scalar.as_ref().memory_size().saturating_mul(*n)
+                                }
+                            }
+                            BlockEntry::Column(col) => col.memory_size(false),
+                        };
+                        key_bytes = key_bytes.saturating_add(col_bytes);
+                    }
+                }
+                key_bytes
+            } else if let Some(sample) = chunks.iter().find(|c| !c.is_empty()) {
+                match self.desc.build_key(sample, &self.function_ctx) {
+                    Ok(entries) => {
+                        let sample_bytes: usize = entries
+                            .iter()
+                            .map(|entry| match entry {
+                                BlockEntry::Const(scalar, _, n) => {
+                                    if scalar.is_null() {
+                                        0
+                                    } else {
+                                        scalar.as_ref().memory_size().saturating_mul(*n)
+                                    }
+                                }
+                                BlockEntry::Column(col) => col.memory_size(false),
+                            })
+                            .sum();
+                        ((sample_bytes as u128 * valid_rows as u128) / sample.num_rows() as u128)
+                            as usize
+                    }
+                    Err(_) => chunks.iter().map(|c| c.memory_size()).sum(),
+                }
+            } else {
+                0
+            }
+        };
+
+        let est = estimate_hash_table_bytes(
+            total_rows,
+            valid_rows,
+            binary_key_bytes,
+            &self.hash_method_kind,
+            self.join_type,
+        );
+        (valid_rows, est)
+    }
+
     /// Upfront admission check at the start of `Stage::BuildFinal` when the join stayed in `Flat`
     /// mode throughout `Stage::Build`.
     ///
@@ -597,13 +819,7 @@ impl PartitionedHashJoin {
             return Ok(false);
         }
 
-        let est = estimate_hash_table_bytes(
-            rows,
-            self.state.flat_bytes(),
-            &self.hash_method_kind,
-            self.join_type,
-            !self.desc.build_projection.is_empty(),
-        );
+        let (valid_rows, est) = self.estimate_chunks_hash_table_bytes(&self.state.flat_basic, rows);
         let global_in_flight = PartitionedJoinState::global_in_flight_flat_build_bytes();
         let need_spill = self.memory_settings.check_spill()
             || self
@@ -618,8 +834,8 @@ impl PartitionedHashJoin {
         }
 
         info!(
-            "HashJoin flat build final admission switching to partitioned mode, level: {}, rows: {}, estimated_bytes: {}, global_in_flight: {}",
-            self.state.level, rows, est, global_in_flight
+            "HashJoin flat build final admission switching to partitioned mode, level: {}, rows: {}, valid_rows: {}, estimated_bytes: {}, global_in_flight: {}",
+            self.state.level, rows, valid_rows, est, global_in_flight
         );
         inner.scattering_in_build_final = true;
         self.state.move_flat_chunks_to_transition();
@@ -659,13 +875,7 @@ impl PartitionedHashJoin {
             .enumerate()
             .filter(|(_, s)| s.status == PartitionStatus::Collecting)
             .map(|(pid, s)| {
-                let est = estimate_hash_table_bytes(
-                    s.build_rows,
-                    s.build_bytes,
-                    &self.hash_method_kind,
-                    self.join_type,
-                    !self.desc.build_projection.is_empty(),
-                );
+                let (_, est) = self.estimate_chunks_hash_table_bytes(&s.basic_state, s.build_rows);
                 (pid, s.build_rows, s.build_bytes, est)
             })
             .collect();
@@ -830,12 +1040,9 @@ impl PartitionedHashJoin {
             match smallest {
                 None => BuildAction::Done,
                 Some(smallest_pid) => {
-                    let est = estimate_hash_table_bytes(
+                    let (_, est) = self.estimate_chunks_hash_table_bytes(
+                        &inner.partitions[smallest_pid].basic_state,
                         inner.partitions[smallest_pid].build_rows,
-                        inner.partitions[smallest_pid].build_bytes,
-                        &self.hash_method_kind,
-                        self.join_type,
-                        !self.desc.build_projection.is_empty(),
                     );
 
                     // Dynamic guard: only spill an already-planned resident partition if real
@@ -1284,9 +1491,6 @@ impl Join for PartitionedHashJoin {
 
         match &mut self.local {
             JoinLocal::Flat(flat_join) => {
-                if let Some(block) = data.as_ref() {
-                    self.state.add_flat_bytes(block.memory_size());
-                }
                 flat_join.add_block(data)?;
 
                 // Stay 100% on the Flat path during Stage::Build unless memory pressure triggers
