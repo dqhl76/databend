@@ -261,6 +261,19 @@ impl Processor for TransformHashJoin {
                 self.instant = Instant::now();
                 Stage::BuildFinal(BuildFinalState::new())
             }
+            Stage::BuildFinal(_) if self.join.needs_build_final_reenter() => {
+                self.join.finish_build_final_reenter()?;
+
+                let wait_elapsed = self.instant.elapsed() - elapsed;
+                log::info!(
+                    "HashJoin build final stage scattered to partitions, sync work elapsed: {:?}, wait elapsed: {:?}",
+                    elapsed,
+                    wait_elapsed
+                );
+
+                self.instant = Instant::now();
+                Stage::BuildFinal(BuildFinalState::new())
+            }
             Stage::BuildFinal(_) => {
                 let wait_elapsed = self.instant.elapsed() - elapsed;
                 log::info!(

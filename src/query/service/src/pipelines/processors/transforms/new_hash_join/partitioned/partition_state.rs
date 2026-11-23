@@ -39,11 +39,13 @@ use crate::sessions::QueryContext;
 use crate::sessions::TableContextSettings;
 
 pub const NUM_PARTITIONS: usize = 16;
+pub const BYTES_PER_MIB: usize = 1024 * 1024;
 
-/// Switch from flat single-partition collection to 16-way radix partitioning once the build side
-/// exceeds these thresholds, so small joins pay zero partitioning overhead.
-pub const PARTITION_ROWS_THRESHOLD: usize = 65_536;
-pub const PARTITION_BYTES_THRESHOLD: usize = 4 * 1024 * 1024;
+/// Process-wide estimated bytes of in-flight flat hash table builds.
+///
+/// Checked when multiple joins enter `Stage::BuildFinal` concurrently so later joins account for
+/// hash tables already admitted into memory before mutating their own build chunks.
+static GLOBAL_IN_FLIGHT_FLAT_BUILD_BYTES: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Debug)]
 pub struct SpillMetadata {
@@ -93,8 +95,14 @@ impl PartitionSlot {
 
 pub struct PartitionedInner {
     pub partitions: [PartitionSlot; NUM_PARTITIONS],
-    /// Whether upfront admission check in `Flat` mode has already decided `Flat` vs `Spilled`.
+    /// Whether upfront admission check in `Flat` mode has already decided `Flat` vs `Partitioned`.
     pub flat_final_build_checked: bool,
+    /// True during Round 1 of `Stage::BuildFinal` when a flat join switched to `Partitioned` at
+    /// the start of `BuildFinal` and all processors are scattering untouched chunks into the 16
+    /// partitions before the stage barrier.
+    pub scattering_in_build_final: bool,
+    /// Whether the deterministic `BuildFinal` resident/spilled partition plan has been computed.
+    pub build_final_planned: bool,
     /// Estimated build bytes of partitions currently in `PartitionStatus::Building`.
     pub in_flight_build_bytes: usize,
     /// Whether all resident `InMemory` partitions have released their hash tables before restore.
@@ -114,6 +122,8 @@ impl PartitionedInner {
         PartitionedInner {
             partitions: std::array::from_fn(|_| PartitionSlot::new()),
             flat_final_build_checked: false,
+            scattering_in_build_final: false,
+            build_final_planned: false,
             in_flight_build_bytes: 0,
             residents_released: false,
             restore_partition: None,
@@ -128,9 +138,12 @@ impl PartitionedInner {
 
 /// Shared state across all processors of one hash join level.
 ///
-/// A join starts in flat single-partition mode (`partitioned == false`, storing blocks in
-/// `flat_basic`) and switches to 16-way radix partitioned mode (`partitioned == true`) once the
-/// build side grows beyond the small-table threshold or memory pressure triggers spilling.
+/// A join stays on the flat single-partition path (`partitioned == false`, storing blocks in
+/// `flat_basic`) whenever it fits in memory — incurring zero partitioning overhead, zero extra
+/// key hashing, and zero bucket power-of-2 inflation on non-spilling queries. It switches to
+/// 16-way radix partitioned mode (`partitioned == true`) only when memory pressure triggers
+/// during `Stage::Build` or when the upfront `Stage::BuildFinal` admission check determines the
+/// flat hash table would exceed remaining memory.
 pub struct PartitionedJoinState {
     pub ctx: Arc<QueryContext>,
     pub factory: Arc<HashJoinFactory>,
@@ -143,12 +156,15 @@ pub struct PartitionedJoinState {
     /// Build state for the flat single-partition fast path (and for `TransformCacheScan`).
     pub flat_basic: Arc<BasicHashJoinState>,
     flat_bytes: AtomicUsize,
+    flat_reserved_bytes: AtomicUsize,
     build_input_rows: AtomicUsize,
 
     /// Whether this level has switched from flat mode to 16-way radix partitioned mode.
     partitioned: AtomicBool,
     /// Whether any partition at this level has ever spilled to disk.
     ever_spilled: AtomicBool,
+    /// Fast-path flag indicating all 16 partitions are already `Spilled`.
+    all_spilled: AtomicBool,
 
     /// Untouched `build_schema` chunks moved from `flat_basic` when switching to partitioned mode.
     pub transition_queue: ConcurrentQueue<DataBlock>,
@@ -157,6 +173,12 @@ pub struct PartitionedJoinState {
     pub pending_spill_blocks: [ConcurrentQueue<DataBlock>; NUM_PARTITIONS],
 
     inner: Mutex<PartitionedInner>,
+}
+
+impl Drop for PartitionedJoinState {
+    fn drop(&mut self) {
+        self.release_flat_build_reservation();
+    }
 }
 
 impl PartitionedJoinState {
@@ -184,9 +206,11 @@ impl PartitionedJoinState {
             allow_spill,
             flat_basic: Arc::new(BasicHashJoinState::create()),
             flat_bytes: AtomicUsize::new(0),
+            flat_reserved_bytes: AtomicUsize::new(0),
             build_input_rows: AtomicUsize::new(0),
             partitioned: AtomicBool::new(false),
             ever_spilled: AtomicBool::new(false),
+            all_spilled: AtomicBool::new(false),
             transition_queue: ConcurrentQueue::unbounded(),
             pending_spill_blocks: std::array::from_fn(|_| ConcurrentQueue::unbounded()),
             inner: Mutex::new(PartitionedInner::new()),
@@ -221,6 +245,10 @@ impl PartitionedJoinState {
         self.ever_spilled.store(true, Ordering::Release);
     }
 
+    pub fn are_all_spilled(&self) -> bool {
+        self.all_spilled.load(Ordering::Acquire)
+    }
+
     pub fn add_build_input_rows(&self, rows: usize) {
         self.build_input_rows.fetch_add(rows, Ordering::AcqRel);
     }
@@ -237,12 +265,28 @@ impl PartitionedJoinState {
         self.flat_bytes.load(Ordering::Acquire)
     }
 
-    pub fn should_partition_flat(&self) -> bool {
-        if !self.can_spill() {
-            return false;
+    pub fn global_in_flight_flat_build_bytes() -> usize {
+        GLOBAL_IN_FLIGHT_FLAT_BUILD_BYTES.load(Ordering::Acquire)
+    }
+
+    pub fn reserve_flat_build(&self, bytes: usize) {
+        if bytes == 0 {
+            return;
         }
-        self.build_input_rows() >= PARTITION_ROWS_THRESHOLD
-            || self.flat_bytes() >= PARTITION_BYTES_THRESHOLD
+        if self
+            .flat_reserved_bytes
+            .compare_exchange(0, bytes, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            GLOBAL_IN_FLIGHT_FLAT_BUILD_BYTES.fetch_add(bytes, Ordering::AcqRel);
+        }
+    }
+
+    pub fn release_flat_build_reservation(&self) {
+        let bytes = self.flat_reserved_bytes.swap(0, Ordering::AcqRel);
+        if bytes > 0 {
+            GLOBAL_IN_FLIGHT_FLAT_BUILD_BYTES.fetch_sub(bytes, Ordering::AcqRel);
+        }
     }
 
     pub fn move_flat_chunks_to_transition(&self) {
@@ -270,6 +314,13 @@ impl PartitionedJoinState {
                 .expect("push unbounded concurrent queue failed");
         }
         self.set_spilled();
+        if inner
+            .partitions
+            .iter()
+            .all(|s| s.status == PartitionStatus::Spilled)
+        {
+            self.all_spilled.store(true, Ordering::Release);
+        }
     }
 
     pub fn has_any_pending_spill_blocks(&self) -> bool {
@@ -343,6 +394,44 @@ pub fn estimate_hash_table_bytes(
         .saturating_add(binary_key_bytes)
 }
 
+/// Estimate the memory needed during `Stage::Probe` when `spilled_count > 0` partitions are
+/// spilled and `resident_count` partitions stay in memory across `max_threads` processors.
+///
+/// Accounts for per-thread `probe_partition_stream` buffers, active `probe_writers` Parquet
+/// buffers, and per-resident `PerformanceContext` allocations so `BuildFinal` does not fill the
+/// entire budget with resident hash tables and then overshoot during `Stage::Probe`.
+pub fn estimate_probe_headroom(
+    max_threads: usize,
+    max_block_size: usize,
+    probe_cols: usize,
+    resident_count: usize,
+    spilled_count: usize,
+) -> usize {
+    if spilled_count == 0 {
+        return 0;
+    }
+
+    let threads = max_threads.max(1);
+    let cols = probe_cols.max(1);
+    let per_part_stream = max_block_size
+        .saturating_mul(cols)
+        .saturating_mul(4)
+        .min(512 * 1024);
+    let stream_bytes = threads
+        .saturating_mul(NUM_PARTITIONS)
+        .saturating_mul(per_part_stream);
+    let writer_bytes = threads
+        .saturating_mul(spilled_count)
+        .saturating_mul(4 * BYTES_PER_MIB);
+    let resident_ctx_bytes = threads
+        .saturating_mul(resident_count)
+        .saturating_mul(2 * BYTES_PER_MIB);
+
+    stream_bytes
+        .saturating_add(writer_bytes)
+        .saturating_add(resident_ctx_bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
@@ -356,6 +445,7 @@ mod tests {
 
     use super::NUM_PARTITIONS;
     use super::estimate_hash_table_bytes;
+    use super::estimate_probe_headroom;
     use super::get_partition_id;
     use crate::pipelines::processors::transforms::hash_join_table::HashJoinHashTable;
     use crate::pipelines::processors::transforms::hash_join_table::RawEntry;
@@ -403,6 +493,14 @@ mod tests {
             estimate_hash_table_bytes(rows, 200_000, &bin_method, JoinType::Inner, true),
             expected_str_base + 200_000
         );
+    }
+
+    #[test]
+    fn test_estimate_probe_headroom() {
+        assert_eq!(estimate_probe_headroom(8, 65536, 2, 16, 0), 0);
+        let h = estimate_probe_headroom(8, 65536, 1, 4, 12);
+        // 32 MiB stream + 384 MiB writers + 64 MiB resident ctx = 480 MiB.
+        assert_eq!(h, 480 * 1024 * 1024);
     }
 
     fn hash(key: u64, width: u32) -> u64 {
