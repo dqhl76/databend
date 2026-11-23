@@ -418,14 +418,17 @@ impl HashJoin {
         // as we will inject some runtime filter information into the context for the child nodes to use.
         let rf_desc = RuntimeFiltersDesc::create(&builder.ctx, self)?;
 
-        // States shared by all join processors at spill level 0.
-        let level_states = factory.create_level_states(0)?;
+        // State shared by all join processors at spill level 0.
+        let level_state = factory.create_level_state(0, self.build_side_cache_info.is_some())?;
 
         // After common subexpression elimination is completed, we can delete this type of code.
         if let Some((build_cache_index, column_map)) = &self.build_side_cache_info {
             builder.hash_join_states.insert(
                 *build_cache_index,
-                HashJoinStateRef::NewHashJoinState(level_states.basic.clone(), column_map.clone()),
+                HashJoinStateRef::NewHashJoinState(
+                    level_state.flat_basic.clone(),
+                    column_map.clone(),
+                ),
             );
         }
 
@@ -467,7 +470,7 @@ impl HashJoin {
                 build_input.clone(),
                 probe_input.clone(),
                 joined_output.clone(),
-                factory.create_hash_join(self.join_type, level_states.clone())?,
+                factory.create_hash_join(self.join_type, level_state.clone())?,
                 stage_sync_barrier.clone(),
                 self.projections.clone(),
                 rf_desc.clone(),

@@ -12,10 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod grace_join;
-pub mod grace_memory;
-mod grace_state;
+mod partition_join;
+mod partition_state;
 
-pub use grace_join::GraceHashJoin;
-pub use grace_memory::GraceMemoryJoin;
-pub use grace_state::*;
+pub use partition_join::PartitionedHashJoin;
+pub use partition_state::PartitionedJoinState;

@@ -57,7 +57,7 @@ impl BasicHashJoinState {
         }
     }
 
-    pub(super) fn push_chunk(&self, chunk: DataBlock) {
+    pub(crate) fn push_chunk(&self, chunk: DataBlock) {
         let locked = self.mutex.lock();
         let _locked = locked.unwrap_or_else(PoisonError::into_inner);
 
@@ -67,6 +67,34 @@ impl BasicHashJoinState {
         self.build_queue.as_mut().push_back(chunk_index);
         self.scan_map.as_mut().push(vec![]);
         self.scan_queue.as_mut().push_back(chunk_index);
+    }
+
+    /// Take all collected build chunks and reset the collection queues while keeping `packets`.
+    pub(crate) fn take_chunks_and_clear(&self) -> Vec<DataBlock> {
+        let locked = self.mutex.lock();
+        let _locked = locked.unwrap_or_else(PoisonError::into_inner);
+
+        *self.build_rows.as_mut() = 0;
+        self.build_queue.as_mut().clear();
+        self.scan_map.as_mut().clear();
+        self.scan_queue.as_mut().clear();
+        std::mem::take(self.chunks.as_mut())
+    }
+
+    /// Release all build chunks, hash table, arenas, columns, and scan state.
+    pub(crate) fn clear(&self) {
+        let locked = self.mutex.lock();
+        let _locked = locked.unwrap_or_else(PoisonError::into_inner);
+
+        self.columns.as_mut().clear();
+        self.chunks.as_mut().clear();
+        *self.build_rows.as_mut() = 0;
+        self.column_types.as_mut().clear();
+        self.arenas.as_mut().clear();
+        self.build_queue.as_mut().clear();
+        self.scan_map.as_mut().clear();
+        self.scan_queue.as_mut().clear();
+        *self.hash_table.as_mut() = HashJoinHashTable::Null;
     }
 
     pub fn steal_scan_chunk_index(&self) -> Option<(usize, usize)> {

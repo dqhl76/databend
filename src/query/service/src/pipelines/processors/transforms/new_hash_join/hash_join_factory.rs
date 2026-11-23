@@ -20,10 +20,8 @@ use databend_common_expression::HashMethodKind;
 use databend_common_pipeline_transforms::MemorySettings;
 use databend_common_sql::plans::JoinType;
 
-use super::grace::GraceMemoryJoin;
-use super::hybrid::HybridHashJoin;
-use super::hybrid::HybridHashJoinState;
-use super::hybrid::HybridLevelStates;
+use super::partitioned::PartitionedHashJoin;
+use super::partitioned::PartitionedJoinState;
 use crate::pipelines::memory_settings::MemorySettingsExt;
 use crate::pipelines::processors::HashJoinDesc;
 use crate::pipelines::processors::transforms::BasicHashJoinState;
@@ -60,28 +58,35 @@ impl HashJoinFactory {
         })
     }
 
-    /// Create the states shared by all processors of one hybrid hash join level.
-    pub fn create_level_states(self: &Arc<Self>, level: usize) -> Result<HybridLevelStates> {
-        Ok(HybridLevelStates {
-            basic: Arc::new(BasicHashJoinState::create()),
-            hybrid: HybridHashJoinState::create(self.ctx.clone(), level, self.clone())?,
-        })
+    /// Create the state shared by all processors of one hash join recursion level.
+    ///
+    /// When `shared_build_chunks` is true (e.g. a `CacheScan` reads `flat_basic.chunks` during
+    /// probing) or there are no join keys, partitioning and spilling are disabled so build chunks
+    /// stay intact in `flat_basic`.
+    pub fn create_level_state(
+        self: &Arc<Self>,
+        level: usize,
+        shared_build_chunks: bool,
+    ) -> Result<Arc<PartitionedJoinState>> {
+        let allow_spill = !shared_build_chunks && !self.desc.build_keys.is_empty();
+        PartitionedJoinState::create(self.ctx.clone(), level, self.clone(), allow_spill)
     }
 
     pub fn create_hash_join(
         self: &Arc<Self>,
         typ: JoinType,
-        states: HybridLevelStates,
+        state: Arc<PartitionedJoinState>,
     ) -> Result<Box<dyn Join>> {
-        Ok(Box::new(self.create_hybrid_join(typ, states)?))
+        Ok(Box::new(self.create_partitioned_join(typ, state)?))
     }
 
-    /// Create a basic memory join (used internally by HybridHashJoin)
+    /// Create an in-memory join on a single `BasicHashJoinState` (used for the flat fast path and
+    /// for each resident radix partition).
     pub fn create_memory_join(
         self: &Arc<Self>,
         typ: JoinType,
         basic_state: Arc<BasicHashJoinState>,
-    ) -> Result<Box<dyn GraceMemoryJoin>> {
+    ) -> Result<Box<dyn Join>> {
         match typ {
             JoinType::Inner => Ok(Box::new(InnerHashJoin::create(
                 &self.ctx.get_settings(),
@@ -136,25 +141,23 @@ impl HashJoinFactory {
         }
     }
 
-    /// Create a HybridHashJoin on the given level states
-    pub fn create_hybrid_join(
+    pub fn create_partitioned_join(
         self: &Arc<Self>,
         typ: JoinType,
-        states: HybridLevelStates,
-    ) -> Result<HybridHashJoin> {
-        let memory_join = self.create_memory_join(typ, states.basic.clone())?;
+        state: Arc<PartitionedJoinState>,
+    ) -> Result<PartitionedHashJoin> {
+        let flat_join = self.create_memory_join(typ, state.flat_basic.clone())?;
         let memory_settings = MemorySettings::from_join_settings(&self.ctx)?;
 
-        Ok(HybridHashJoin::create(
+        PartitionedHashJoin::create(
             self.ctx.clone(),
             self.function_ctx.clone(),
             self.hash_method.clone(),
             self.desc.clone(),
             memory_settings,
-            states.hybrid,
-            states.basic,
-            memory_join,
+            state,
+            flat_join,
             typ,
-        ))
+        )
     }
 }

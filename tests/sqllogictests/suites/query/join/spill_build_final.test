@@ -1,0 +1,99 @@
+# Test radix-partitioned hash join spilling during Stage::BuildFinal (mixed resident + spilled partitions).
+#
+# The query memory limit sits between the memory of the collected build partitions and the memory
+# needed to build hash tables for all 16 partitions in memory simultaneously, so some partitions
+# remain resident in memory while the rest spill untouched to disk and restore after probing.
+statement ok
+create or replace database spill_build_final;
+
+statement ok
+use spill_build_final;
+
+statement ok
+set disable_join_reorder = 1;
+
+statement ok
+set max_threads = 4;
+
+statement ok
+create or replace table probe_side as select number % 500000 as k, concat('k', (number % 500000)::string) as s, number as v from numbers(600000);
+
+statement ok
+create or replace table build_keys as select number * 7 as k from numbers(4000000);
+
+statement ok
+create or replace table build_nullable_keys as select if(number % 7 = 0, null, number * 7) as k from numbers(4000000);
+
+statement ok
+create or replace table build_string_keys as select concat('k', (number * 7)::string) as s from numbers(2000000);
+
+statement ok
+set max_query_memory_usage = 134217728;
+
+# INNER JOIN
+query II
+select count(*), sum(probe_side.v) from probe_side join build_keys on probe_side.k = build_keys.k;
+----
+85715 25714371427
+
+# LEFT OUTER JOIN
+query III
+select count(*), count(build_keys.k), sum(probe_side.v) from probe_side left join build_keys on probe_side.k = build_keys.k;
+----
+600000 85715 179999700000
+
+# LEFT SEMI JOIN
+query II
+select count(*), sum(probe_side.v) from probe_side where exists(select 1 from build_keys where probe_side.k = build_keys.k);
+----
+85715 25714371427
+
+# LEFT ANTI JOIN
+query II
+select count(*), sum(probe_side.v) from probe_side where not exists(select 1 from build_keys where probe_side.k = build_keys.k);
+----
+514285 154285328573
+
+# RIGHT SEMI JOIN
+query I
+select count(*) from probe_side right semi join build_keys on probe_side.k = build_keys.k;
+----
+71429
+
+# RIGHT ANTI JOIN
+query I
+select count(*) from probe_side right anti join build_keys on probe_side.k = build_keys.k;
+----
+3928571
+
+# The build key is computed from a column the join does not output.
+query II
+select count(*), sum(probe_side.v) from probe_side join build_keys on probe_side.k = build_keys.k::int32;
+----
+85715 25714371427
+
+# Two fixed size keys packed into one 128-bit key.
+query II
+select count(*), sum(probe_side.v) from probe_side join build_keys on probe_side.k = build_keys.k and probe_side.k % 3 = build_keys.k % 3;
+----
+85715 25714371427
+
+# Build rows with NULL keys must still be returned by the right join after spilling.
+query II
+select count(*), sum(probe_side.v) from probe_side right join build_nullable_keys on probe_side.k = build_nullable_keys.k;
+----
+4012245 22040632657
+
+statement ok
+set max_query_memory_usage = 150994944;
+
+query II
+select count(*), sum(probe_side.v) from probe_side join build_string_keys on probe_side.s = build_string_keys.s;
+----
+85715 25714371427
+
+statement ok
+unset (max_query_memory_usage, disable_join_reorder, max_threads);
+
+statement ok
+drop database spill_build_final;
