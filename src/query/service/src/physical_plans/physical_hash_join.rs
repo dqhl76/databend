@@ -425,10 +425,7 @@ impl HashJoin {
         if let Some((build_cache_index, column_map)) = &self.build_side_cache_info {
             builder.hash_join_states.insert(
                 *build_cache_index,
-                HashJoinStateRef::NewHashJoinState(
-                    level_state.flat_basic.clone(),
-                    column_map.clone(),
-                ),
+                HashJoinStateRef::NewHashJoinState(level_state.basic.clone(), column_map.clone()),
             );
         }
 

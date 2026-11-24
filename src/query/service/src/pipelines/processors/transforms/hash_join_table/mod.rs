@@ -12,10 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod buckets;
 mod hashjoin_hashtable;
 mod hashjoin_string_hashtable;
 mod traits;
 
+pub use buckets::Buckets;
+pub use buckets::NUM_PARTITIONS;
+pub use buckets::partition_id;
 pub use databend_common_hashtable::RowPtr;
 pub use hashjoin_hashtable::HashJoinHashTable;
 pub use hashjoin_hashtable::RawEntry;

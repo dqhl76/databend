@@ -262,23 +262,35 @@ impl Processor for TransformHashJoin {
                 Stage::BuildFinal(BuildFinalState::new())
             }
             Stage::BuildFinal(_) => {
-                let wait_elapsed = self.instant.elapsed() - elapsed;
-                log::info!(
-                    "HashJoin build final stage, sync work elapsed: {:?}, wait elapsed: {:?}",
-                    elapsed,
-                    wait_elapsed
-                );
-
-                self.instant = Instant::now();
-                if self.rf_desc.build_side_empty() && self.join.can_skip_probe() {
-                    self.probe_port.finish();
-                    self.joined_port.finish();
-
-                    self.join = FinishedJoin::create();
-
-                    Stage::Finished
+                if self.join.needs_build_final_reenter() {
+                    // Wait for all processors to observe `needs_build_final_reenter() == true`
+                    // before the leader mutates `build_final_mode`.
+                    let _ = self.stage_sync_barrier.wait().await;
+                    if wait_res.is_leader() {
+                        self.join.finish_build_final_reenter()?;
+                    }
+                    let _ = self.stage_sync_barrier.wait().await;
+                    self.instant = Instant::now();
+                    Stage::BuildFinal(BuildFinalState::new())
                 } else {
-                    Stage::Probe(ProbeState::new())
+                    let wait_elapsed = self.instant.elapsed() - elapsed;
+                    log::info!(
+                        "HashJoin build final stage, sync work elapsed: {:?}, wait elapsed: {:?}",
+                        elapsed,
+                        wait_elapsed
+                    );
+
+                    self.instant = Instant::now();
+                    if self.rf_desc.build_side_empty() && self.join.can_skip_probe() {
+                        self.probe_port.finish();
+                        self.joined_port.finish();
+
+                        self.join = FinishedJoin::create();
+
+                        Stage::Finished
+                    } else {
+                        Stage::Probe(ProbeState::new())
+                    }
                 }
             }
             Stage::Probe(_) => {

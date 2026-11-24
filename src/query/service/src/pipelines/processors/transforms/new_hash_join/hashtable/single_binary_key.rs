@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use databend_common_column::bitmap::Bitmap;
 use databend_common_exception::Result;
 use databend_common_expression::Column;
 use databend_common_expression::DataBlock;
@@ -44,8 +45,20 @@ impl<const UNIQUE: bool> SingleBinaryHashJoinHashTable<UNIQUE> {
         }
     }
 
-    pub fn insert(&self, keys: DataBlock, chunk: usize, arena: &mut Vec<u8>) -> Result<()> {
+    pub fn insert(
+        &self,
+        keys: DataBlock,
+        valids: Option<&Bitmap>,
+        chunk: usize,
+        arena: &mut Vec<u8>,
+    ) -> Result<()> {
         let num_rows = keys.num_rows();
+        if let Some(bitmap) = valids
+            && bitmap.true_count() == 0
+        {
+            return Ok(());
+        }
+
         let keys = ProjectedBlock::from(keys.columns());
         let keys_state = self.hash_method.build_keys_state(keys, num_rows)?;
         let build_keys_iter = self.hash_method.build_keys_iter(&keys_state)?;
@@ -60,41 +73,86 @@ impl<const UNIQUE: bool> SingleBinaryHashJoinHashTable<UNIQUE> {
         };
 
         static ENTRY_SIZE: usize = std::mem::size_of::<StringRawEntry>();
-        arena.reserve(num_rows * ENTRY_SIZE + space_size);
+        let valid_rows = valids.map_or(num_rows, Bitmap::true_count);
+        arena.reserve(valid_rows * ENTRY_SIZE + space_size);
 
         let (mut raw_entry_ptr, mut string_local_space_ptr) = unsafe {
             (
                 std::mem::transmute::<*mut u8, *mut StringRawEntry>(arena.as_mut_ptr()),
-                arena.as_mut_ptr().add(num_rows * ENTRY_SIZE),
+                arena.as_mut_ptr().add(valid_rows * ENTRY_SIZE),
             )
         };
 
-        for (row_index, key) in build_keys_iter.enumerate() {
-            let row_ptr = RowPtr {
-                chunk_index: chunk as u32,
-                row_index: row_index as u32,
-            };
+        match valids {
+            None => {
+                for (row_index, key) in build_keys_iter.enumerate() {
+                    let row_ptr = RowPtr {
+                        chunk_index: chunk as u32,
+                        row_index: row_index as u32,
+                    };
 
-            // # Safety
-            // The memory address of `raw_entry_ptr` is valid.
-            // string_offset + key.len() <= space_size.
-            unsafe {
-                (*raw_entry_ptr).row_ptr = row_ptr;
-                (*raw_entry_ptr).length = key.len() as u32;
-                (*raw_entry_ptr).next = 0;
-                (*raw_entry_ptr).key = string_local_space_ptr;
-                // The size of `early` is 4.
-                std::ptr::copy_nonoverlapping(
-                    key.as_ptr(),
-                    (*raw_entry_ptr).early.as_mut_ptr(),
-                    std::cmp::min(STRING_EARLY_SIZE, key.len()),
-                );
-                std::ptr::copy_nonoverlapping(key.as_ptr(), string_local_space_ptr, key.len());
-                string_local_space_ptr = string_local_space_ptr.add(key.len());
+                    // # Safety
+                    // The memory address of `raw_entry_ptr` is valid.
+                    // string_offset + key.len() <= space_size.
+                    unsafe {
+                        (*raw_entry_ptr).row_ptr = row_ptr;
+                        (*raw_entry_ptr).length = key.len() as u32;
+                        (*raw_entry_ptr).next = 0;
+                        (*raw_entry_ptr).key = string_local_space_ptr;
+                        // The size of `early` is 4.
+                        std::ptr::copy_nonoverlapping(
+                            key.as_ptr(),
+                            (*raw_entry_ptr).early.as_mut_ptr(),
+                            std::cmp::min(STRING_EARLY_SIZE, key.len()),
+                        );
+                        std::ptr::copy_nonoverlapping(
+                            key.as_ptr(),
+                            string_local_space_ptr,
+                            key.len(),
+                        );
+                        string_local_space_ptr = string_local_space_ptr.add(key.len());
+                    }
+
+                    self.hash_table.insert(key, raw_entry_ptr);
+                    raw_entry_ptr = unsafe { raw_entry_ptr.add(1) };
+                }
             }
+            Some(bitmap) => {
+                for (row_index, (valid, key)) in bitmap.iter().zip(build_keys_iter).enumerate() {
+                    if !valid {
+                        continue;
+                    }
+                    let row_ptr = RowPtr {
+                        chunk_index: chunk as u32,
+                        row_index: row_index as u32,
+                    };
 
-            self.hash_table.insert(key, raw_entry_ptr);
-            raw_entry_ptr = unsafe { raw_entry_ptr.add(1) };
+                    // # Safety
+                    // The memory address of `raw_entry_ptr` is valid.
+                    // string_offset + key.len() <= space_size.
+                    unsafe {
+                        (*raw_entry_ptr).row_ptr = row_ptr;
+                        (*raw_entry_ptr).length = key.len() as u32;
+                        (*raw_entry_ptr).next = 0;
+                        (*raw_entry_ptr).key = string_local_space_ptr;
+                        // The size of `early` is 4.
+                        std::ptr::copy_nonoverlapping(
+                            key.as_ptr(),
+                            (*raw_entry_ptr).early.as_mut_ptr(),
+                            std::cmp::min(STRING_EARLY_SIZE, key.len()),
+                        );
+                        std::ptr::copy_nonoverlapping(
+                            key.as_ptr(),
+                            string_local_space_ptr,
+                            key.len(),
+                        );
+                        string_local_space_ptr = string_local_space_ptr.add(key.len());
+                    }
+
+                    self.hash_table.insert(key, raw_entry_ptr);
+                    raw_entry_ptr = unsafe { raw_entry_ptr.add(1) };
+                }
+            }
         }
 
         Ok(())

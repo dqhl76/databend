@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use databend_common_base::hints::assume;
+use databend_common_column::bitmap::Bitmap;
 use databend_common_exception::Result;
 use databend_common_expression::DataBlock;
 use databend_common_expression::FixedKey;
@@ -44,36 +45,77 @@ impl<T: HashtableKeyable + FixedKey, const UNIQUE: bool> FixedKeyHashJoinHashTab
         }
     }
 
-    pub fn insert(&self, keys: DataBlock, chunk: usize, arena: &mut Vec<u8>) -> Result<()> {
+    pub fn insert(
+        &self,
+        keys: DataBlock,
+        valids: Option<&Bitmap>,
+        chunk: usize,
+        arena: &mut Vec<u8>,
+    ) -> Result<()> {
         let num_rows = keys.num_rows();
+        if let Some(bitmap) = valids
+            && bitmap.true_count() == 0
+        {
+            return Ok(());
+        }
+
         let keys = ProjectedBlock::from(keys.columns());
         let keys_state = self.hash_method.build_keys_state(keys, num_rows)?;
         let build_keys_iter = self.hash_method.build_keys_iter(&keys_state)?;
 
         let entry_size = std::mem::size_of::<RawEntry<T>>();
-        arena.reserve(num_rows * entry_size);
+        let valid_rows = valids.map_or(num_rows, Bitmap::true_count);
+        arena.reserve(valid_rows * entry_size);
 
         let mut raw_entry_ptr =
             unsafe { std::mem::transmute::<*mut u8, *mut RawEntry<T>>(arena.as_mut_ptr()) };
 
-        for (row_index, key) in build_keys_iter.enumerate() {
-            let row_ptr = RowPtr {
-                chunk_index: chunk as u32,
-                row_index: row_index as u32,
-            };
+        match valids {
+            None => {
+                for (row_index, key) in build_keys_iter.enumerate() {
+                    let row_ptr = RowPtr {
+                        chunk_index: chunk as u32,
+                        row_index: row_index as u32,
+                    };
 
-            // # Safety
-            // The memory address of `raw_entry_ptr` is valid.
-            unsafe {
-                *raw_entry_ptr = RawEntry {
-                    row_ptr,
-                    key: *key,
-                    next: 0,
+                    // # Safety
+                    // The memory address of `raw_entry_ptr` is valid.
+                    unsafe {
+                        *raw_entry_ptr = RawEntry {
+                            row_ptr,
+                            key: *key,
+                            next: 0,
+                        }
+                    }
+
+                    self.hash_table.insert(*key, raw_entry_ptr);
+                    raw_entry_ptr = unsafe { raw_entry_ptr.add(1) };
                 }
             }
+            Some(bitmap) => {
+                for (row_index, (valid, key)) in bitmap.iter().zip(build_keys_iter).enumerate() {
+                    if !valid {
+                        continue;
+                    }
+                    let row_ptr = RowPtr {
+                        chunk_index: chunk as u32,
+                        row_index: row_index as u32,
+                    };
 
-            self.hash_table.insert(*key, raw_entry_ptr);
-            raw_entry_ptr = unsafe { raw_entry_ptr.add(1) };
+                    // # Safety
+                    // The memory address of `raw_entry_ptr` is valid.
+                    unsafe {
+                        *raw_entry_ptr = RawEntry {
+                            row_ptr,
+                            key: *key,
+                            next: 0,
+                        }
+                    }
+
+                    self.hash_table.insert(*key, raw_entry_ptr);
+                    raw_entry_ptr = unsafe { raw_entry_ptr.add(1) };
+                }
+            }
         }
 
         Ok(())

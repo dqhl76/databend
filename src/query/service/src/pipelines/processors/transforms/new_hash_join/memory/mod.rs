@@ -22,6 +22,8 @@ mod right_join;
 mod right_join_anti;
 mod right_join_semi;
 
+pub(crate) use basic::create_hash_table;
+pub(crate) use basic::hash_table_buckets;
 pub use basic_state::BasicHashJoinState;
 pub use inner_join::InnerHashJoin;
 pub use left_join_anti::AntiLeftHashJoin;

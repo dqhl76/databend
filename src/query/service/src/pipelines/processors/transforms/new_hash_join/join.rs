@@ -31,6 +31,19 @@ pub trait Join: Send + Sync + 'static {
     /// returns its progress. Once all batches are consumed it returns `None` to signal completion.
     fn final_build(&mut self) -> Result<Option<ProgressValues>>;
 
+    /// Checked past the `Stage::BuildFinal` barrier: if true, the leader calls
+    /// [`Self::finish_build_final_reenter`] and all processors re-enter `Stage::BuildFinal`
+    /// after another barrier sync (used when optimistic `Single` build aborts to partitioned
+    /// scattering, or after scattering completes before partitioned build).
+    fn needs_build_final_reenter(&self) -> bool {
+        false
+    }
+
+    /// Invoked once on the barrier leader when [`Self::needs_build_final_reenter`] is true.
+    fn finish_build_final_reenter(&mut self) -> Result<()> {
+        Ok(())
+    }
+
     fn add_runtime_filter_packet(&self, _packet: JoinRuntimeFilterPacket) {}
 
     /// Generate runtime filter packet for the given filter description.

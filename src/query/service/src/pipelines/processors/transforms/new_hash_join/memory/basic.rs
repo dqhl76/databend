@@ -15,8 +15,10 @@
 use std::ops::Deref;
 use std::sync::Arc;
 use std::sync::PoisonError;
+use std::sync::atomic::Ordering;
 
 use databend_common_base::base::ProgressValues;
+use databend_common_column::bitmap::Bitmap;
 use databend_common_exception::Result;
 use databend_common_expression::Column;
 use databend_common_expression::DataBlock;
@@ -38,6 +40,7 @@ use crate::pipelines::processors::transforms::UniqueFixedKeyHashJoinHashTable;
 use crate::pipelines::processors::transforms::UniqueSerializerHashJoinHashTable;
 use crate::pipelines::processors::transforms::UniqueSingleBinaryHashJoinHashTable;
 use crate::pipelines::processors::transforms::hash_join_table::BinaryHashJoinHashMap;
+use crate::pipelines::processors::transforms::hash_join_table::Buckets;
 use crate::pipelines::processors::transforms::hash_join_table::HashJoinHashMap;
 use crate::pipelines::processors::transforms::new_hash_join::common::SquashBlocks;
 
@@ -90,6 +93,33 @@ impl BasicHashJoin {
             self.init_memory_hash_table();
         }
 
+        if self.state.preserve_build_chunks.load(Ordering::Acquire) {
+            let Some((chunk_index, chunk_block)) = self.state.steal_chunk_with_block() else {
+                return Ok(None);
+            };
+
+            let keys_entries = self.desc.build_key(&chunk_block, &self.function_ctx)?;
+            let mut keys_block = DataBlock::new(keys_entries, chunk_block.num_rows());
+            let valids = self.desc.build_valids_by_keys(&keys_block)?;
+            self.desc.remove_keys_nullable(&mut keys_block);
+
+            let num_rows = chunk_block.num_rows();
+            let num_bytes = chunk_block.memory_size();
+
+            if SCAN_MAP {
+                let mut scan_map = vec![0; num_rows];
+                let scan_maps = self.state.scan_map.as_mut();
+                std::mem::swap(&mut scan_maps[chunk_index], &mut scan_map);
+            }
+
+            self.build_hash_table(keys_block, valids.as_ref(), chunk_index)?;
+
+            return Ok(Some(ProgressValues {
+                rows: num_rows,
+                bytes: num_bytes,
+            }));
+        }
+
         let Some(chunk_index) = self.state.steal_chunk_index() else {
             return Ok(None);
         };
@@ -138,7 +168,7 @@ impl BasicHashJoin {
             std::mem::swap(&mut chunks[chunk_index], &mut chunk_block);
         }
 
-        self.build_hash_table(keys_block, chunk_index)?;
+        self.build_hash_table(keys_block, None, chunk_index)?;
 
         Ok(Some(ProgressValues {
             rows: num_rows,
@@ -149,37 +179,67 @@ impl BasicHashJoin {
 
 impl BasicHashJoin {
     pub(crate) fn finalize_chunks(&mut self) {
-        if self.desc.build_projection.is_empty() || !self.state.columns.is_empty() {
+        if self.state.chunks_finalized.load(Ordering::Acquire) {
             return;
         }
 
         let locked = self.state.mutex.lock();
         let _locked = locked.unwrap_or_else(PoisonError::into_inner);
 
-        if !self.state.columns.is_empty() {
+        if self.state.chunks_finalized.load(Ordering::Acquire) {
             return;
         }
-        if let Some(block) = self.state.chunks.first() {
-            *self.state.column_types.as_mut() = (0..self.desc.build_projection.len())
-                .map(|offset| block.get_by_offset(offset).data_type())
-                .collect();
-        } else {
-            return;
-        };
 
-        let mut columns = Vec::with_capacity(self.desc.build_projection.len());
-        for offset in 0..self.desc.build_projection.len() {
-            let full_columns = self
-                .state
-                .chunks
-                .iter()
-                .map(|block| block.get_by_offset(offset).to_column())
-                .collect::<Vec<_>>();
+        let preserved = self.state.preserve_build_chunks.load(Ordering::Acquire);
+        if !self.desc.build_projection.is_empty()
+            && let Some(block) = self.state.chunks.first()
+        {
+            if preserved {
+                *self.state.column_types.as_mut() = self
+                    .desc
+                    .build_projection
+                    .iter()
+                    .map(|&offset| block.get_by_offset(offset).data_type())
+                    .collect();
 
-            columns.push(Column::take_downcast_column_vec(&full_columns));
+                let mut columns = Vec::with_capacity(self.desc.build_projection.len());
+                for &offset in &self.desc.build_projection {
+                    let full_columns = self
+                        .state
+                        .chunks
+                        .iter()
+                        .map(|block| block.get_by_offset(offset).to_column())
+                        .collect::<Vec<_>>();
+
+                    columns.push(Column::take_downcast_column_vec(&full_columns));
+                }
+
+                *self.state.columns.as_mut() = columns;
+            } else {
+                *self.state.column_types.as_mut() = (0..self.desc.build_projection.len())
+                    .map(|offset| block.get_by_offset(offset).data_type())
+                    .collect();
+
+                let mut columns = Vec::with_capacity(self.desc.build_projection.len());
+                for offset in 0..self.desc.build_projection.len() {
+                    let full_columns = self
+                        .state
+                        .chunks
+                        .iter()
+                        .map(|block| block.get_by_offset(offset).to_column())
+                        .collect::<Vec<_>>();
+
+                    columns.push(Column::take_downcast_column_vec(&full_columns));
+                }
+
+                *self.state.columns.as_mut() = columns;
+            }
         }
 
-        *self.state.columns.as_mut() = columns;
+        if !self.state.shared_build_chunks {
+            self.state.chunks.as_mut().clear();
+        }
+        self.state.chunks_finalized.store(true, Ordering::Release);
     }
 
     fn init_memory_hash_table(&mut self) {
@@ -190,132 +250,179 @@ impl BasicHashJoin {
             return;
         }
 
-        let unique_entry = matches!(self.desc.join_type, JoinType::InnerAny | JoinType::LeftAny)
-            || (matches!(self.desc.join_type, JoinType::LeftSemi | JoinType::LeftAnti)
-                && self.desc.other_predicate.is_none());
-
-        let build_num_rows = *self.state.build_rows.deref();
-        *self.state.hash_table.as_mut() = match (self.method.clone(), unique_entry) {
-            (HashMethodKind::Serializer(_), false) => {
-                HashJoinHashTable::Serializer(SerializerHashJoinHashTable::new(
-                    BinaryHashJoinHashMap::with_build_row_num(build_num_rows),
-                    HashMethodSerializer::default(),
-                ))
-            }
-            (HashMethodKind::Serializer(_), true) => {
-                HashJoinHashTable::UniqueSerializer(UniqueSerializerHashJoinHashTable::new(
-                    BinaryHashJoinHashMap::with_build_row_num(build_num_rows),
-                    HashMethodSerializer::default(),
-                ))
-            }
-            (HashMethodKind::SingleBinary(_), false) => {
-                HashJoinHashTable::SingleBinary(SingleBinaryHashJoinHashTable::new(
-                    BinaryHashJoinHashMap::with_build_row_num(build_num_rows),
-                    HashMethodSingleBinary::default(),
-                ))
-            }
-            (HashMethodKind::SingleBinary(_), true) => {
-                HashJoinHashTable::UniqueSingleBinary(UniqueSingleBinaryHashJoinHashTable::new(
-                    BinaryHashJoinHashMap::with_build_row_num(build_num_rows),
-                    HashMethodSingleBinary::default(),
-                ))
-            }
-            (HashMethodKind::KeysU8(hash_method), false) => {
-                HashJoinHashTable::KeysU8(FixedKeyHashJoinHashTable::new(
-                    HashJoinHashMap::<u8>::with_build_row_num(build_num_rows),
-                    hash_method,
-                ))
-            }
-            (HashMethodKind::KeysU8(hash_method), true) => {
-                HashJoinHashTable::UniqueKeysU8(UniqueFixedKeyHashJoinHashTable::new(
-                    HashJoinHashMap::<u8, true>::with_build_row_num(build_num_rows),
-                    hash_method,
-                ))
-            }
-            (HashMethodKind::KeysU16(hash_method), false) => {
-                HashJoinHashTable::KeysU16(FixedKeyHashJoinHashTable::new(
-                    HashJoinHashMap::<u16>::with_build_row_num(build_num_rows),
-                    hash_method,
-                ))
-            }
-            (HashMethodKind::KeysU16(hash_method), true) => {
-                HashJoinHashTable::UniqueKeysU16(UniqueFixedKeyHashJoinHashTable::new(
-                    HashJoinHashMap::<u16, true>::with_build_row_num(build_num_rows),
-                    hash_method,
-                ))
-            }
-            (HashMethodKind::KeysU32(hash_method), false) => {
-                HashJoinHashTable::KeysU32(FixedKeyHashJoinHashTable::new(
-                    HashJoinHashMap::<u32>::with_build_row_num(build_num_rows),
-                    hash_method,
-                ))
-            }
-            (HashMethodKind::KeysU32(hash_method), true) => {
-                HashJoinHashTable::UniqueKeysU32(UniqueFixedKeyHashJoinHashTable::new(
-                    HashJoinHashMap::<u32, true>::with_build_row_num(build_num_rows),
-                    hash_method,
-                ))
-            }
-            (HashMethodKind::KeysU64(hash_method), false) => {
-                HashJoinHashTable::KeysU64(FixedKeyHashJoinHashTable::new(
-                    HashJoinHashMap::<u64>::with_build_row_num(build_num_rows),
-                    hash_method,
-                ))
-            }
-            (HashMethodKind::KeysU64(hash_method), true) => {
-                HashJoinHashTable::UniqueKeysU64(UniqueFixedKeyHashJoinHashTable::new(
-                    HashJoinHashMap::<u64, true>::with_build_row_num(build_num_rows),
-                    hash_method,
-                ))
-            }
-            (HashMethodKind::KeysU128(hash_method), false) => {
-                HashJoinHashTable::KeysU128(FixedKeyHashJoinHashTable::new(
-                    HashJoinHashMap::<u128>::with_build_row_num(build_num_rows),
-                    hash_method,
-                ))
-            }
-            (HashMethodKind::KeysU128(hash_method), true) => {
-                HashJoinHashTable::UniqueKeysU128(UniqueFixedKeyHashJoinHashTable::new(
-                    HashJoinHashMap::<u128, true>::with_build_row_num(build_num_rows),
-                    hash_method,
-                ))
-            }
-            (HashMethodKind::KeysU256(hash_method), false) => {
-                HashJoinHashTable::KeysU256(FixedKeyHashJoinHashTable::new(
-                    HashJoinHashMap::<U256>::with_build_row_num(build_num_rows),
-                    hash_method,
-                ))
-            }
-            (HashMethodKind::KeysU256(hash_method), true) => {
-                HashJoinHashTable::UniqueKeysU256(UniqueFixedKeyHashJoinHashTable::new(
-                    HashJoinHashMap::<U256, true>::with_build_row_num(build_num_rows),
-                    hash_method,
-                ))
-            }
-        };
+        let buckets = Buckets::with_build_row_num(*self.state.build_rows.deref());
+        *self.state.hash_table.as_mut() = create_hash_table(&self.desc, &self.method, buckets);
     }
+}
 
-    fn build_hash_table(&self, keys: DataBlock, chunk_idx: usize) -> Result<()> {
+/// An empty hash table for the join keys of `desc`, with `buckets` as its bucket headers.
+pub(crate) fn create_hash_table(
+    desc: &HashJoinDesc,
+    method: &HashMethodKind,
+    buckets: Buckets,
+) -> HashJoinHashTable {
+    let unique_entry = matches!(desc.join_type, JoinType::InnerAny | JoinType::LeftAny)
+        || (matches!(desc.join_type, JoinType::LeftSemi | JoinType::LeftAnti)
+            && desc.other_predicate.is_none());
+
+    match (method.clone(), unique_entry) {
+        (HashMethodKind::Serializer(_), false) => {
+            HashJoinHashTable::Serializer(SerializerHashJoinHashTable::new(
+                BinaryHashJoinHashMap::with_buckets(buckets),
+                HashMethodSerializer::default(),
+            ))
+        }
+        (HashMethodKind::Serializer(_), true) => {
+            HashJoinHashTable::UniqueSerializer(UniqueSerializerHashJoinHashTable::new(
+                BinaryHashJoinHashMap::with_buckets(buckets),
+                HashMethodSerializer::default(),
+            ))
+        }
+        (HashMethodKind::SingleBinary(_), false) => {
+            HashJoinHashTable::SingleBinary(SingleBinaryHashJoinHashTable::new(
+                BinaryHashJoinHashMap::with_buckets(buckets),
+                HashMethodSingleBinary::default(),
+            ))
+        }
+        (HashMethodKind::SingleBinary(_), true) => {
+            HashJoinHashTable::UniqueSingleBinary(UniqueSingleBinaryHashJoinHashTable::new(
+                BinaryHashJoinHashMap::with_buckets(buckets),
+                HashMethodSingleBinary::default(),
+            ))
+        }
+        (HashMethodKind::KeysU8(hash_method), false) => {
+            HashJoinHashTable::KeysU8(FixedKeyHashJoinHashTable::new(
+                HashJoinHashMap::<u8>::with_buckets(buckets),
+                hash_method,
+            ))
+        }
+        (HashMethodKind::KeysU8(hash_method), true) => {
+            HashJoinHashTable::UniqueKeysU8(UniqueFixedKeyHashJoinHashTable::new(
+                HashJoinHashMap::<u8, true>::with_buckets(buckets),
+                hash_method,
+            ))
+        }
+        (HashMethodKind::KeysU16(hash_method), false) => {
+            HashJoinHashTable::KeysU16(FixedKeyHashJoinHashTable::new(
+                HashJoinHashMap::<u16>::with_buckets(buckets),
+                hash_method,
+            ))
+        }
+        (HashMethodKind::KeysU16(hash_method), true) => {
+            HashJoinHashTable::UniqueKeysU16(UniqueFixedKeyHashJoinHashTable::new(
+                HashJoinHashMap::<u16, true>::with_buckets(buckets),
+                hash_method,
+            ))
+        }
+        (HashMethodKind::KeysU32(hash_method), false) => {
+            HashJoinHashTable::KeysU32(FixedKeyHashJoinHashTable::new(
+                HashJoinHashMap::<u32>::with_buckets(buckets),
+                hash_method,
+            ))
+        }
+        (HashMethodKind::KeysU32(hash_method), true) => {
+            HashJoinHashTable::UniqueKeysU32(UniqueFixedKeyHashJoinHashTable::new(
+                HashJoinHashMap::<u32, true>::with_buckets(buckets),
+                hash_method,
+            ))
+        }
+        (HashMethodKind::KeysU64(hash_method), false) => {
+            HashJoinHashTable::KeysU64(FixedKeyHashJoinHashTable::new(
+                HashJoinHashMap::<u64>::with_buckets(buckets),
+                hash_method,
+            ))
+        }
+        (HashMethodKind::KeysU64(hash_method), true) => {
+            HashJoinHashTable::UniqueKeysU64(UniqueFixedKeyHashJoinHashTable::new(
+                HashJoinHashMap::<u64, true>::with_buckets(buckets),
+                hash_method,
+            ))
+        }
+        (HashMethodKind::KeysU128(hash_method), false) => {
+            HashJoinHashTable::KeysU128(FixedKeyHashJoinHashTable::new(
+                HashJoinHashMap::<u128>::with_buckets(buckets),
+                hash_method,
+            ))
+        }
+        (HashMethodKind::KeysU128(hash_method), true) => {
+            HashJoinHashTable::UniqueKeysU128(UniqueFixedKeyHashJoinHashTable::new(
+                HashJoinHashMap::<u128, true>::with_buckets(buckets),
+                hash_method,
+            ))
+        }
+        (HashMethodKind::KeysU256(hash_method), false) => {
+            HashJoinHashTable::KeysU256(FixedKeyHashJoinHashTable::new(
+                HashJoinHashMap::<U256>::with_buckets(buckets),
+                hash_method,
+            ))
+        }
+        (HashMethodKind::KeysU256(hash_method), true) => {
+            HashJoinHashTable::UniqueKeysU256(UniqueFixedKeyHashJoinHashTable::new(
+                HashJoinHashMap::<U256, true>::with_buckets(buckets),
+                hash_method,
+            ))
+        }
+    }
+}
+
+/// The bucket headers of `table`, if it is initialized.
+pub(crate) fn hash_table_buckets(table: &HashJoinHashTable) -> Option<&Buckets> {
+    match table {
+        HashJoinHashTable::Null => None,
+        HashJoinHashTable::Serializer(v) => Some(&v.hash_table.buckets),
+        HashJoinHashTable::UniqueSerializer(v) => Some(&v.hash_table.buckets),
+        HashJoinHashTable::SingleBinary(v) => Some(&v.hash_table.buckets),
+        HashJoinHashTable::UniqueSingleBinary(v) => Some(&v.hash_table.buckets),
+        HashJoinHashTable::KeysU8(v) => Some(&v.hash_table.buckets),
+        HashJoinHashTable::UniqueKeysU8(v) => Some(&v.hash_table.buckets),
+        HashJoinHashTable::KeysU16(v) => Some(&v.hash_table.buckets),
+        HashJoinHashTable::UniqueKeysU16(v) => Some(&v.hash_table.buckets),
+        HashJoinHashTable::KeysU32(v) => Some(&v.hash_table.buckets),
+        HashJoinHashTable::UniqueKeysU32(v) => Some(&v.hash_table.buckets),
+        HashJoinHashTable::KeysU64(v) => Some(&v.hash_table.buckets),
+        HashJoinHashTable::UniqueKeysU64(v) => Some(&v.hash_table.buckets),
+        HashJoinHashTable::KeysU128(v) => Some(&v.hash_table.buckets),
+        HashJoinHashTable::UniqueKeysU128(v) => Some(&v.hash_table.buckets),
+        HashJoinHashTable::KeysU256(v) => Some(&v.hash_table.buckets),
+        HashJoinHashTable::UniqueKeysU256(v) => Some(&v.hash_table.buckets),
+    }
+}
+
+impl BasicHashJoin {
+    fn build_hash_table(
+        &self,
+        keys: DataBlock,
+        valids: Option<&Bitmap>,
+        chunk_idx: usize,
+    ) -> Result<()> {
         let mut arena = Vec::with_capacity(0);
 
         match self.state.hash_table.deref() {
             HashJoinHashTable::Null => (),
-            HashJoinHashTable::Serializer(v) => v.insert(keys, chunk_idx, &mut arena)?,
-            HashJoinHashTable::SingleBinary(v) => v.insert(keys, chunk_idx, &mut arena)?,
-            HashJoinHashTable::KeysU8(v) => v.insert(keys, chunk_idx, &mut arena)?,
-            HashJoinHashTable::KeysU16(v) => v.insert(keys, chunk_idx, &mut arena)?,
-            HashJoinHashTable::KeysU32(v) => v.insert(keys, chunk_idx, &mut arena)?,
-            HashJoinHashTable::KeysU64(v) => v.insert(keys, chunk_idx, &mut arena)?,
-            HashJoinHashTable::KeysU128(v) => v.insert(keys, chunk_idx, &mut arena)?,
-            HashJoinHashTable::KeysU256(v) => v.insert(keys, chunk_idx, &mut arena)?,
-            HashJoinHashTable::UniqueSerializer(v) => v.insert(keys, chunk_idx, &mut arena)?,
-            HashJoinHashTable::UniqueSingleBinary(v) => v.insert(keys, chunk_idx, &mut arena)?,
-            HashJoinHashTable::UniqueKeysU8(v) => v.insert(keys, chunk_idx, &mut arena)?,
-            HashJoinHashTable::UniqueKeysU16(v) => v.insert(keys, chunk_idx, &mut arena)?,
-            HashJoinHashTable::UniqueKeysU32(v) => v.insert(keys, chunk_idx, &mut arena)?,
-            HashJoinHashTable::UniqueKeysU64(v) => v.insert(keys, chunk_idx, &mut arena)?,
-            HashJoinHashTable::UniqueKeysU128(v) => v.insert(keys, chunk_idx, &mut arena)?,
-            HashJoinHashTable::UniqueKeysU256(v) => v.insert(keys, chunk_idx, &mut arena)?,
+            HashJoinHashTable::Serializer(v) => v.insert(keys, valids, chunk_idx, &mut arena)?,
+            HashJoinHashTable::SingleBinary(v) => v.insert(keys, valids, chunk_idx, &mut arena)?,
+            HashJoinHashTable::KeysU8(v) => v.insert(keys, valids, chunk_idx, &mut arena)?,
+            HashJoinHashTable::KeysU16(v) => v.insert(keys, valids, chunk_idx, &mut arena)?,
+            HashJoinHashTable::KeysU32(v) => v.insert(keys, valids, chunk_idx, &mut arena)?,
+            HashJoinHashTable::KeysU64(v) => v.insert(keys, valids, chunk_idx, &mut arena)?,
+            HashJoinHashTable::KeysU128(v) => v.insert(keys, valids, chunk_idx, &mut arena)?,
+            HashJoinHashTable::KeysU256(v) => v.insert(keys, valids, chunk_idx, &mut arena)?,
+            HashJoinHashTable::UniqueSerializer(v) => {
+                v.insert(keys, valids, chunk_idx, &mut arena)?
+            }
+            HashJoinHashTable::UniqueSingleBinary(v) => {
+                v.insert(keys, valids, chunk_idx, &mut arena)?
+            }
+            HashJoinHashTable::UniqueKeysU8(v) => v.insert(keys, valids, chunk_idx, &mut arena)?,
+            HashJoinHashTable::UniqueKeysU16(v) => v.insert(keys, valids, chunk_idx, &mut arena)?,
+            HashJoinHashTable::UniqueKeysU32(v) => v.insert(keys, valids, chunk_idx, &mut arena)?,
+            HashJoinHashTable::UniqueKeysU64(v) => v.insert(keys, valids, chunk_idx, &mut arena)?,
+            HashJoinHashTable::UniqueKeysU128(v) => {
+                v.insert(keys, valids, chunk_idx, &mut arena)?
+            }
+            HashJoinHashTable::UniqueKeysU256(v) => {
+                v.insert(keys, valids, chunk_idx, &mut arena)?
+            }
         };
 
         if arena.capacity() != 0 {

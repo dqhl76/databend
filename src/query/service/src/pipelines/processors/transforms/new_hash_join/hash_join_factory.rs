@@ -62,10 +62,14 @@ impl HashJoinFactory {
     /// Create the state shared by all processors of one hash join recursion level.
     ///
     /// Partitioning and spilling are disabled (keeping the single-partition flat path) when:
-    /// - `shared_build_chunks` is true (`CacheScan` reads `flat_basic.chunks` during probing),
+    /// - `shared_build_chunks` is true (`CacheScan` reads `basic.chunks` during probing),
     /// - there are no join keys (cross join), or
     /// - any join key or residual predicate is non-deterministic (e.g. `running_difference`,
     ///   `rand`, `nextval`), since partitioning re-evaluates keys and reorders rows across blocks.
+    pub fn desc(&self) -> &Arc<HashJoinDesc> {
+        &self.desc
+    }
+
     pub fn create_level_state(
         self: &Arc<Self>,
         level: usize,
@@ -78,9 +82,18 @@ impl HashJoinFactory {
             .chain(self.desc.probe_keys.iter())
             .chain(self.desc.other_predicate.iter())
             .all(|expr| expr.is_deterministic(&BUILTIN_FUNCTIONS));
-        let allow_spill =
-            !shared_build_chunks && !self.desc.build_keys.is_empty() && deterministic_exprs;
-        PartitionedJoinState::create(self.ctx.clone(), level, self.clone(), allow_spill)
+        let allow_spill = !shared_build_chunks
+            && !self.desc.build_keys.is_empty()
+            && !self.desc.build_schema.fields().is_empty()
+            && !self.desc.probe_schema.fields().is_empty()
+            && deterministic_exprs;
+        PartitionedJoinState::create(
+            self.ctx.clone(),
+            level,
+            self.clone(),
+            allow_spill,
+            shared_build_chunks,
+        )
     }
 
     pub fn create_hash_join(
@@ -160,7 +173,7 @@ impl HashJoinFactory {
         let flat_join = if state.can_spill() {
             None
         } else {
-            Some(self.create_memory_join(typ, state.flat_basic.clone())?)
+            Some(self.create_memory_join(typ, state.basic.clone())?)
         };
         let memory_settings = MemorySettings::from_join_settings(&self.ctx)?;
 

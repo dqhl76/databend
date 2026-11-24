@@ -13,7 +13,6 @@
 // limitations under the License.
 
 use std::marker::PhantomData;
-use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
 use databend_common_base::hints::assume;
@@ -22,6 +21,7 @@ use databend_common_hashtable::HashtableKeyable;
 use databend_common_hashtable::RowPtr;
 
 use super::HashJoinHashtableLike;
+use super::buckets::Buckets;
 
 pub struct RawEntry<K> {
     pub row_ptr: RowPtr,
@@ -81,9 +81,7 @@ pub fn hash_bits() -> u32 {
 }
 
 pub struct HashJoinHashTable<K: HashtableKeyable, const UNIQUE: bool = false> {
-    pub(crate) pointers: Box<[u64]>,
-    pub(crate) atomic_pointers: *mut AtomicU64,
-    pub(crate) hash_shift: usize,
+    pub(crate) buckets: Buckets,
     pub(crate) phantom: PhantomData<K>,
 }
 
@@ -93,38 +91,31 @@ unsafe impl<K: HashtableKeyable + Sync, const UNIQUE: bool> Sync for HashJoinHas
 
 impl<K: HashtableKeyable, const UNIQUE: bool> HashJoinHashTable<K, UNIQUE> {
     pub fn with_build_row_num(row_num: usize) -> Self {
-        let capacity = std::cmp::max((row_num * 2).next_power_of_two(), 1 << 10);
-        let mut hashtable = Self {
-            pointers: unsafe { Box::new_zeroed_slice(capacity).assume_init() },
-            atomic_pointers: std::ptr::null_mut(),
-            hash_shift: (hash_bits() - capacity.trailing_zeros()) as usize,
+        Self::with_buckets(Buckets::with_build_row_num(row_num))
+    }
+
+    pub fn with_buckets(buckets: Buckets) -> Self {
+        Self {
+            buckets,
             phantom: PhantomData,
-        };
-        hashtable.atomic_pointers = unsafe {
-            std::mem::transmute::<*mut u64, *mut AtomicU64>(hashtable.pointers.as_mut_ptr())
-        };
-        hashtable
+        }
     }
 
     #[allow(clippy::not_unsafe_ptr_arg_deref)]
     pub fn insert(&self, key: K, entry_ptr: *mut RawEntry<K>) {
         let hash = key.hash();
-        let index = (hash >> self.hash_shift) as usize;
+        let bucket = self.buckets.bucket(hash);
         let new_header = new_header(entry_ptr as u64, hash);
-        // # Safety
-        // `index` is less than the capacity of hash table.
-        let mut old_header = unsafe { (*self.atomic_pointers.add(index)).load(Ordering::Relaxed) };
+        let mut old_header = bucket.load(Ordering::Relaxed);
         loop {
             // TODO: compact concurrent link list if unique
 
-            let res = unsafe {
-                (*self.atomic_pointers.add(index)).compare_exchange_weak(
-                    old_header,
-                    combine_header(new_header, old_header),
-                    Ordering::SeqCst,
-                    Ordering::SeqCst,
-                )
-            };
+            let res = bucket.compare_exchange_weak(
+                old_header,
+                combine_header(new_header, old_header),
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            );
             match res {
                 Ok(_) => break,
                 Err(x) => old_header = x,
@@ -133,6 +124,128 @@ impl<K: HashtableKeyable, const UNIQUE: bool> HashJoinHashTable<K, UNIQUE> {
 
         unsafe { (*entry_ptr).next = remove_header_tag(old_header) };
     }
+}
+
+#[inline(always)]
+fn probe_with(
+    hashes: &mut [u64],
+    valids: Option<Bitmap>,
+    get_header: impl Fn(u64) -> u64,
+) -> usize {
+    let mut count = 0;
+    match valids {
+        Some(valids) => {
+            valids
+                .iter()
+                .zip(hashes.iter_mut())
+                .for_each(|(valid, hash)| {
+                    if valid {
+                        let header = get_header(*hash);
+                        if header != 0 {
+                            *hash = remove_header_tag(header);
+                            count += 1;
+                        } else {
+                            *hash = 0;
+                        }
+                    } else {
+                        *hash = 0;
+                    }
+                });
+        }
+        None => {
+            hashes.iter_mut().for_each(|hash| {
+                let header = get_header(*hash);
+                if header != 0 {
+                    *hash = remove_header_tag(header);
+                    count += 1;
+                } else {
+                    *hash = 0;
+                }
+            });
+        }
+    }
+    count
+}
+
+#[inline(always)]
+fn early_filtering_probe_with(
+    hashes: &mut [u64],
+    valids: Option<Bitmap>,
+    matched_selection: &mut Vec<u32>,
+    unmatched_selection: &mut Vec<u32>,
+    get_header: impl Fn(u64) -> u64,
+) -> (usize, usize) {
+    match valids {
+        Some(valids) => {
+            valids
+                .iter()
+                .zip(hashes.iter_mut().enumerate())
+                .for_each(|(valid, (idx, hash))| {
+                    if valid {
+                        let header = get_header(*hash);
+                        if header != 0 && early_filtering(header, *hash) {
+                            *hash = remove_header_tag(header);
+                            assume(matched_selection.len() < matched_selection.capacity());
+                            matched_selection.push(idx as u32);
+                        } else {
+                            assume(unmatched_selection.len() < unmatched_selection.capacity());
+                            unmatched_selection.push(idx as u32);
+                        }
+                    } else {
+                        assume(unmatched_selection.len() < unmatched_selection.capacity());
+                        unmatched_selection.push(idx as u32);
+                    }
+                });
+        }
+        None => {
+            hashes.iter_mut().enumerate().for_each(|(idx, hash)| {
+                let header = get_header(*hash);
+                if header != 0 && early_filtering(header, *hash) {
+                    *hash = remove_header_tag(header);
+                    assume(matched_selection.len() < matched_selection.capacity());
+                    matched_selection.push(idx as u32);
+                } else {
+                    assume(unmatched_selection.len() < unmatched_selection.capacity());
+                    unmatched_selection.push(idx as u32);
+                }
+            });
+        }
+    }
+    (matched_selection.len(), unmatched_selection.len())
+}
+
+#[inline(always)]
+fn early_filtering_matched_probe_with(
+    hashes: &mut [u64],
+    valids: Option<Bitmap>,
+    selection: &mut Vec<u32>,
+    get_header: impl Fn(u64) -> u64,
+) -> usize {
+    if let Some(valids) = valids {
+        for (valid, (idx, hash)) in valids.iter().zip(hashes.iter_mut().enumerate()) {
+            if valid {
+                let header = get_header(*hash);
+                if header != 0 && early_filtering(header, *hash) {
+                    *hash = remove_header_tag(header);
+                    assume(selection.len() < selection.capacity());
+                    selection.push(idx as u32);
+                }
+            }
+        }
+
+        return selection.len();
+    }
+
+    for (idx, hash) in hashes.iter_mut().enumerate() {
+        let header = get_header(*hash);
+        if header != 0 && early_filtering(header, *hash) {
+            *hash = remove_header_tag(header);
+            assume(selection.len() < selection.capacity());
+            selection.push(idx as u32);
+        }
+    }
+
+    selection.len()
 }
 
 impl<K: HashtableKeyable, const UNIQUE: bool> HashJoinHashtableLike
@@ -153,39 +266,30 @@ impl<K: HashtableKeyable, const UNIQUE: bool> HashJoinHashtableLike
                 valids = Some(bitmap);
             }
         }
-        let mut count = 0;
-        match valids {
-            Some(valids) => {
-                valids
-                    .iter()
-                    .zip(hashes.iter_mut())
-                    .for_each(|(valid, hash)| {
-                        if valid {
-                            let header = self.pointers[(*hash >> self.hash_shift) as usize];
-                            if header != 0 {
-                                *hash = remove_header_tag(header);
-                                count += 1;
-                            } else {
-                                *hash = 0;
-                            }
-                        } else {
-                            *hash = 0;
-                        }
-                    });
+        match &self.buckets {
+            Buckets::Single {
+                pointers,
+                hash_shift,
+            } => {
+                let hash_shift = *hash_shift;
+                probe_with(hashes, valids, |hash| {
+                    pointers[(hash >> hash_shift) as usize].load(Ordering::Relaxed)
+                })
             }
-            None => {
-                hashes.iter_mut().for_each(|hash| {
-                    let header = self.pointers[(*hash >> self.hash_shift) as usize];
-                    if header != 0 {
-                        *hash = remove_header_tag(header);
-                        count += 1;
-                    } else {
-                        *hash = 0;
-                    }
-                });
+            Buckets::Partitioned {
+                segments,
+                hash_shift,
+                partition_shift,
+                ..
+            } => {
+                let hash_shift = *hash_shift;
+                let partition_shift = *partition_shift;
+                probe_with(hashes, valids, |hash| {
+                    Buckets::partitioned_bucket(segments, hash_shift, partition_shift, hash)
+                        .load(Ordering::Relaxed)
+                })
             }
         }
-        count
     }
 
     // Perform early filtering probe, store matched indexes in `matched_selection` and store unmatched indexes
@@ -207,42 +311,40 @@ impl<K: HashtableKeyable, const UNIQUE: bool> HashJoinHashtableLike
             }
         }
 
-        match valids {
-            Some(valids) => {
-                valids.iter().zip(hashes.iter_mut().enumerate()).for_each(
-                    |(valid, (idx, hash))| {
-                        if valid {
-                            let header = self.pointers[(*hash >> self.hash_shift) as usize];
-                            if header != 0 && early_filtering(header, *hash) {
-                                *hash = remove_header_tag(header);
-                                assume(matched_selection.len() < matched_selection.capacity());
-                                matched_selection.push(idx as u32);
-                            } else {
-                                assume(unmatched_selection.len() < unmatched_selection.capacity());
-                                unmatched_selection.push(idx as u32);
-                            }
-                        } else {
-                            assume(unmatched_selection.len() < unmatched_selection.capacity());
-                            unmatched_selection.push(idx as u32);
-                        }
-                    },
-                );
+        match &self.buckets {
+            Buckets::Single {
+                pointers,
+                hash_shift,
+            } => {
+                let hash_shift = *hash_shift;
+                early_filtering_probe_with(
+                    hashes,
+                    valids,
+                    matched_selection,
+                    unmatched_selection,
+                    |hash| pointers[(hash >> hash_shift) as usize].load(Ordering::Relaxed),
+                )
             }
-            None => {
-                hashes.iter_mut().enumerate().for_each(|(idx, hash)| {
-                    let header = self.pointers[(*hash >> self.hash_shift) as usize];
-                    if header != 0 && early_filtering(header, *hash) {
-                        *hash = remove_header_tag(header);
-                        assume(matched_selection.len() < matched_selection.capacity());
-                        matched_selection.push(idx as u32);
-                    } else {
-                        assume(unmatched_selection.len() < unmatched_selection.capacity());
-                        unmatched_selection.push(idx as u32);
-                    }
-                });
+            Buckets::Partitioned {
+                segments,
+                hash_shift,
+                partition_shift,
+                ..
+            } => {
+                let hash_shift = *hash_shift;
+                let partition_shift = *partition_shift;
+                early_filtering_probe_with(
+                    hashes,
+                    valids,
+                    matched_selection,
+                    unmatched_selection,
+                    |hash| {
+                        Buckets::partitioned_bucket(segments, hash_shift, partition_shift, hash)
+                            .load(Ordering::Relaxed)
+                    },
+                )
             }
         }
-        (matched_selection.len(), unmatched_selection.len())
     }
 
     // Perform early filtering probe and store matched indexes in `selection`, return the number of matched indexes.
@@ -262,31 +364,30 @@ impl<K: HashtableKeyable, const UNIQUE: bool> HashJoinHashtableLike
             }
         }
 
-        if let Some(valids) = valids {
-            for (valid, (idx, hash)) in valids.iter().zip(hashes.iter_mut().enumerate()) {
-                if valid {
-                    let header = self.pointers[(*hash >> self.hash_shift) as usize];
-                    if header != 0 && early_filtering(header, *hash) {
-                        *hash = remove_header_tag(header);
-                        assume(selection.len() < selection.capacity());
-                        selection.push(idx as u32);
-                    }
-                }
+        match &self.buckets {
+            Buckets::Single {
+                pointers,
+                hash_shift,
+            } => {
+                let hash_shift = *hash_shift;
+                early_filtering_matched_probe_with(hashes, valids, selection, |hash| {
+                    pointers[(hash >> hash_shift) as usize].load(Ordering::Relaxed)
+                })
             }
-
-            return selection.len();
-        }
-
-        for (idx, hash) in hashes.iter_mut().enumerate() {
-            let header = self.pointers[(*hash >> self.hash_shift) as usize];
-            if header != 0 && early_filtering(header, *hash) {
-                *hash = remove_header_tag(header);
-                assume(selection.len() < selection.capacity());
-                selection.push(idx as u32);
+            Buckets::Partitioned {
+                segments,
+                hash_shift,
+                partition_shift,
+                ..
+            } => {
+                let hash_shift = *hash_shift;
+                let partition_shift = *partition_shift;
+                early_filtering_matched_probe_with(hashes, valids, selection, |hash| {
+                    Buckets::partitioned_bucket(segments, hash_shift, partition_shift, hash)
+                        .load(Ordering::Relaxed)
+                })
             }
         }
-
-        selection.len()
     }
 
     fn next_contains(&self, key: &Self::Key, mut ptr: u64) -> bool {
