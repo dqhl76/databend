@@ -41,6 +41,7 @@ use databend_common_sql::ColumnSet;
 use databend_common_sql::ScalarExpr;
 use databend_common_sql::Symbol;
 use databend_common_sql::TypeCheck;
+use databend_common_sql::executor::physical_plans::FragmentKind;
 use databend_common_sql::optimizer::ir::PExpr;
 use databend_common_sql::plans::Join;
 use databend_common_sql::plans::JoinType;
@@ -49,6 +50,7 @@ use tokio::sync::Barrier;
 use super::PhysicalPlanCast;
 use super::runtime_filter::PhysicalRuntimeFilters;
 use crate::physical_plans::Exchange;
+use crate::physical_plans::ExchangeSource;
 use crate::physical_plans::PhysicalPlanBuilder;
 use crate::physical_plans::explain::PlanStatsInfo;
 use crate::physical_plans::format::HashJoinFormatter;
@@ -130,6 +132,11 @@ pub struct HashJoin {
 
     pub runtime_filter: PhysicalRuntimeFilters,
     pub broadcast_id: Option<u32>,
+    /// True when both `probe` and `build` arrive directly from matching `GlobalShuffle`
+    /// exchanges so local pipeline lane `i` (`0..T`) already receives co-partitioned
+    /// disjoint key subsets.
+    #[serde(default)]
+    pub global_shuffled: bool,
 }
 
 #[typetag::serde]
@@ -250,6 +257,7 @@ impl IPhysicalPlan for HashJoin {
             build_side_cache_info: self.build_side_cache_info.clone(),
             runtime_filter: self.runtime_filter.clone(),
             broadcast_id: self.broadcast_id,
+            global_shuffled: self.global_shuffled,
         })
     }
 
@@ -418,16 +426,22 @@ impl HashJoin {
         // as we will inject some runtime filter information into the context for the child nodes to use.
         let rf_desc = RuntimeFiltersDesc::create(&builder.ctx, self)?;
 
-        // State shared by all join processors at spill level 0.
-        let level_state = factory.create_level_state(0, self.build_side_cache_info.is_some())?;
-
-        // After common subexpression elimination is completed, we can delete this type of code.
-        if let Some((build_cache_index, column_map)) = &self.build_side_cache_info {
-            builder.hash_join_states.insert(
-                *build_cache_index,
-                HashJoinStateRef::NewHashJoinState(level_state.basic.clone(), column_map.clone()),
-            );
-        }
+        // When `build_side_cache_info` is present, probe-side `CacheScan` resolves the shared
+        // build state during `self.probe.build_pipeline`, so create the non-pre-partitioned
+        // state up front. Otherwise create it after building child pipelines so we can verify
+        // direct 1-to-1 `GlobalShuffle` lane pairing.
+        let mut level_state =
+            if let Some((build_cache_index, column_map)) = &self.build_side_cache_info {
+                let state = factory.create_level_state(0, true)?;
+                // After common subexpression elimination is completed, we can delete this type of code.
+                builder.hash_join_states.insert(
+                    *build_cache_index,
+                    HashJoinStateRef::NewHashJoinState(state.basic.clone(), column_map.clone()),
+                );
+                Some(state)
+            } else {
+                None
+            };
 
         let mut sub_query_ctx = QueryContext::create_from(&builder.ctx);
         std::mem::swap(&mut builder.ctx, &mut sub_query_ctx);
@@ -438,7 +452,9 @@ impl HashJoin {
         self.probe.build_pipeline(builder)?;
 
         // Aligning hash join build and probe parallelism
-        let output_len = std::cmp::max(build_sinks.len(), builder.main_pipeline.output_len());
+        let raw_build_len = build_sinks.len();
+        let raw_probe_len = builder.main_pipeline.output_len();
+        let output_len = std::cmp::max(raw_build_len, raw_probe_len);
         builder.main_pipeline.resize(output_len, false)?;
 
         let probe_sinks = builder.main_pipeline.take_sinks();
@@ -451,11 +467,35 @@ impl HashJoin {
 
         debug_assert_eq!(build_sinks.len(), probe_sinks.len());
 
+        let pre_partitioned_lanes = (self.global_shuffled
+            && self.build_side_cache_info.is_none()
+            && ExchangeSource::check_physical_plan(&self.build)
+            && ExchangeSource::check_physical_plan(&self.probe)
+            && raw_build_len == raw_probe_len
+            && raw_build_len >= 2)
+            .then_some(output_len);
+
+        if let Some(lanes) = pre_partitioned_lanes {
+            log::info!(
+                "HashJoin using {} pre-partitioned GlobalShuffle lanes (join_type: {})",
+                lanes,
+                self.join_type
+            );
+        }
+
+        // State shared by all join processors at spill level 0.
+        let level_state = match level_state.take() {
+            Some(state) => state,
+            None => factory.create_level_state_with_lanes(0, false, pre_partitioned_lanes)?,
+        };
+
         let barrier = databend_common_base::base::Barrier::new(output_len);
         let stage_sync_barrier = Arc::new(barrier);
         let mut join_sinks = Vec::with_capacity(output_len * 2);
         let mut join_pipe_items = Vec::with_capacity(output_len);
-        for (build_sink, probe_sink) in build_sinks.into_iter().zip(probe_sinks) {
+        for (lane_id, (build_sink, probe_sink)) in
+            build_sinks.into_iter().zip(probe_sinks).enumerate()
+        {
             join_sinks.push(build_sink);
             join_sinks.push(probe_sink);
 
@@ -467,7 +507,7 @@ impl HashJoin {
                 build_input.clone(),
                 probe_input.clone(),
                 joined_output.clone(),
-                factory.create_hash_join(self.join_type, level_state.clone())?,
+                factory.create_hash_join(self.join_type, level_state.clone(), lane_id)?,
                 stage_sync_barrier.clone(),
                 self.projections.clone(),
                 rf_desc.clone(),
@@ -1146,6 +1186,19 @@ impl PhysicalPlanBuilder {
 
         // Step 3: unify exchange keys
         self.unify_keys(&mut probe_side, &mut build_side)?;
+        let global_shuffled = matches!(
+            (
+                Exchange::from_physical_plan(&probe_side),
+                Exchange::from_physical_plan(&build_side),
+            ),
+            (Some(probe_ex), Some(build_ex))
+                if probe_ex.kind == FragmentKind::GlobalShuffle
+                    && build_ex.kind == FragmentKind::GlobalShuffle
+                    && !probe_ex.keys.is_empty()
+                    && probe_ex.keys.len() == build_ex.keys.len()
+                    && !probe_ex.ignore_exchange
+                    && !build_ex.ignore_exchange
+        );
 
         // Step 4: Prepare schemas for both sides
         let build_schema = self.prepare_build_schema(join.join_type, &build_side)?;
@@ -1214,6 +1267,8 @@ impl PhysicalPlanBuilder {
         } else {
             None
         };
+        let global_shuffled =
+            global_shuffled && build_side_cache_info.is_none() && !right_join_conditions.is_empty();
         let mut hash_join = HashJoin {
             projections,
             build_projections,
@@ -1235,6 +1290,7 @@ impl PhysicalPlanBuilder {
             build_side_cache_info,
             runtime_filter,
             broadcast_id,
+            global_shuffled,
         };
         hash_join.build_zero_column_side();
         Ok(PhysicalPlan::new(hash_join))
@@ -1288,6 +1344,7 @@ mod tests {
             build_side_cache_info: None,
             runtime_filter: Default::default(),
             broadcast_id: None,
+            global_shuffled: false,
         }
     }
 

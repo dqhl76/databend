@@ -12,12 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::BTreeSet;
 use std::collections::VecDeque;
 use std::sync::Mutex;
 use std::sync::PoisonError;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
+use databend_common_expression::Column;
 use databend_common_expression::ColumnVec;
 use databend_common_expression::DataBlock;
 use databend_common_expression::types::DataType;
@@ -193,5 +195,67 @@ impl BasicHashJoinState {
         let idx = self.build_queue.as_mut().pop_front()?;
         let block = self.chunks[idx].clone();
         Some((idx, block))
+    }
+
+    /// Materialize projected build columns for probing and drop unprojected build chunks once
+    /// building finishes (unless `shared_build_chunks` is true for `CacheScan`).
+    pub fn finalize_chunks(&self, build_projection: &BTreeSet<usize>) {
+        if self.chunks_finalized.load(Ordering::Acquire) {
+            return;
+        }
+
+        let locked = self.mutex.lock();
+        let _locked = locked.unwrap_or_else(PoisonError::into_inner);
+
+        if self.chunks_finalized.load(Ordering::Acquire) {
+            return;
+        }
+
+        let preserved = self.preserve_build_chunks.load(Ordering::Acquire);
+        if !build_projection.is_empty()
+            && let Some(block) = self.chunks.first()
+        {
+            if preserved {
+                *self.column_types.as_mut() = build_projection
+                    .iter()
+                    .map(|&offset| block.get_by_offset(offset).data_type())
+                    .collect();
+
+                let mut columns = Vec::with_capacity(build_projection.len());
+                for &offset in build_projection {
+                    let full_columns = self
+                        .chunks
+                        .iter()
+                        .map(|block| block.get_by_offset(offset).to_column())
+                        .collect::<Vec<_>>();
+
+                    columns.push(Column::take_downcast_column_vec(&full_columns));
+                }
+
+                *self.columns.as_mut() = columns;
+            } else {
+                *self.column_types.as_mut() = (0..build_projection.len())
+                    .map(|offset| block.get_by_offset(offset).data_type())
+                    .collect();
+
+                let mut columns = Vec::with_capacity(build_projection.len());
+                for offset in 0..build_projection.len() {
+                    let full_columns = self
+                        .chunks
+                        .iter()
+                        .map(|block| block.get_by_offset(offset).to_column())
+                        .collect::<Vec<_>>();
+
+                    columns.push(Column::take_downcast_column_vec(&full_columns));
+                }
+
+                *self.columns.as_mut() = columns;
+            }
+        }
+
+        if !self.shared_build_chunks {
+            self.chunks.as_mut().clear();
+        }
+        self.chunks_finalized.store(true, Ordering::Release);
     }
 }

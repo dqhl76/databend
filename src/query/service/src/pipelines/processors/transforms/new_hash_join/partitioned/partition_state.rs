@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::collections::VecDeque;
+use std::ops::Deref;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
@@ -78,19 +79,22 @@ pub enum BuildFinalMode {
     PartitionedBuild,
 }
 
-/// Lifecycle of a single radix partition at one recursion level:
+/// Lifecycle of a single partition (16-way radix partition or `GlobalShuffle` lane):
 ///
 /// ```text
-/// Collecting ──▶ InMemory  (built into the hash table and probed in memory)
-///     │
-///     └────────▶ Spilled   (untouched build chunks written to Parquet, restored in ProbeFinal)
+/// Collecting ──▶ (Building) ──▶ InMemory  (built into hash table and probed in memory)
+///     │               │
+///     └───────────────┴───────▶ Spilled   (untouched build chunks written to Parquet, restored in ProbeFinal)
 /// ```
 ///
-/// Only `Collecting` partitions, whose chunks are untouched `build_schema` blocks, ever spill.
-/// Once a partition becomes `InMemory` it stays in memory.
+/// Only `Collecting` partitions (and `Building` pre-partitioned lanes whose `preserve_build_chunks`
+/// flag kept intact `build_schema` chunks) ever spill. Once `InMemory`, a partition stays in memory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PartitionStatus {
     Collecting,
+    /// Pre-partitioned `GlobalShuffle` mode only: one thread exclusively owns this lane's
+    /// `Buckets::Single` build and may abort directly to `Spilled` on `check_spill()`.
+    Building,
     InMemory,
     Spilled,
 }
@@ -126,7 +130,7 @@ pub struct PartitionedInner {
     pub build_final_round: usize,
     pub last_round_reentered: bool,
 
-    pub partitions: [PartitionSlot; NUM_PARTITIONS],
+    pub partitions: Vec<PartitionSlot>,
     /// Partition whose chunks all threads are currently inserting into the hash table. Building
     /// one partition at a time lets live `check_spill()` decide before each next partition.
     pub active_build_pid: Option<usize>,
@@ -143,13 +147,13 @@ pub struct PartitionedInner {
 }
 
 impl PartitionedInner {
-    fn new() -> Self {
+    fn new(num_partitions: usize) -> Self {
         PartitionedInner {
             build_mode: BuildStageMode::Unpartitioned,
             build_final_mode: BuildFinalMode::Deciding,
             build_final_round: 0,
             last_round_reentered: false,
-            partitions: std::array::from_fn(|_| PartitionSlot::new()),
+            partitions: (0..num_partitions).map(|_| PartitionSlot::new()).collect(),
             active_build_pid: None,
             residents_released: false,
             restore_partition: None,
@@ -164,15 +168,14 @@ impl PartitionedInner {
 
 /// Shared state across all processors of one hash join recursion level.
 ///
-/// Execution starts optimistically in `BuildStageMode::Unpartitioned` (squashing blocks straight
-/// into `basic.chunks` with zero scatter/hash overhead) and builds a single contiguous
-/// `Buckets::Single` hash table in `Stage::BuildFinal` (zero probe indirection).
-///
-/// If real `check_spill()` triggers during `Stage::Build`, or `Buckets::Single` does not fit in
-/// remaining memory, or `check_spill()` triggers mid-`Stage::BuildFinal` (including from
-/// concurrent external queries), the join transitions cleanly to 16-way radix partitioning over
-/// `Buckets::Partitioned`, building resident partitions one-by-one and spilling untouched
-/// `Collecting` partitions through one multiplexed Parquet writer per thread.
+/// Two level-0 topologies share the same state machine:
+/// - **Default (`pre_partitioned == false`)**: starts optimistically in
+///   `BuildStageMode::Unpartitioned` (`basic.chunks` + `Buckets::Single`) and falls back on real
+///   `check_spill()` to 16-way radix partitioning over `Buckets::Partitioned`.
+/// - **Distributed `GlobalShuffle` (`pre_partitioned == true`)**: build and probe already arrive
+///   co-partitioned across `T` disjoint lanes `lanes[0..T]`. Each lane builds its own independent
+///   `1/T`-sized `Buckets::Single` hash table (or spills directly without any level-0 re-scatter),
+///   and spilled lanes restore in full `T`-thread parallel at level 1.
 pub struct PartitionedJoinState {
     pub ctx: Arc<QueryContext>,
     pub factory: Arc<HashJoinFactory>,
@@ -180,9 +183,17 @@ pub struct PartitionedJoinState {
     pub max_level: usize,
     /// False when spilling/partitioning is disallowed (`CacheScan`, empty keys, or `max_level`).
     pub allow_spill: bool,
+    /// True when level-0 inputs arrive pre-partitioned into `lanes.len()` disjoint `GlobalShuffle`
+    /// lanes (1-to-1 paired between build and probe ports).
+    pub pre_partitioned: bool,
 
-    /// Build chunks and hash table of every partition kept in memory.
+    /// Build chunks and hash table of every partition kept in memory (non-pre-partitioned mode).
     pub basic: Arc<BasicHashJoinState>,
+    /// Independent per-lane states when `pre_partitioned == true` (empty otherwise).
+    pub lanes: Vec<Arc<BasicHashJoinState>>,
+    /// Unallocated remaining estimated build bytes of currently `Building` pre-partitioned lanes,
+    /// preventing `T` threads from concurrently overshooting memory limits without double-counting.
+    pub in_flight_unallocated_bytes: AtomicUsize,
     /// Empty block with `build_projection` schema: in `PartitionedBuild` (`preserve_build_chunks`
     /// is false) resident chunks are projected in-place, so spilled chunk slots are replaced by
     /// this placeholder to keep chunk indexes aligned.
@@ -197,15 +208,15 @@ pub struct PartitionedJoinState {
     aborting_single: AtomicBool,
     /// Whether any partition at this level has ever spilled to disk.
     ever_spilled: AtomicBool,
-    /// Fast-path flag indicating all 16 partitions are already `Spilled`.
+    /// Fast-path flag indicating all partitions at this level are already `Spilled`.
     all_spilled: AtomicBool,
 
     /// Untouched `build_schema` chunks moved out of `basic.chunks` when switching from
     /// `Unpartitioned` (or aborted `Single`) to `Partitioned`, to be scattered in parallel.
     pub transition_queue: ConcurrentQueue<DataBlock>,
-    /// Untouched `build_schema` chunks of partition `p`, taken from `basic` when `p` flips
-    /// `Collecting -> Spilled` and waiting to be written to Parquet.
-    pub pending_spill_blocks: [ConcurrentQueue<DataBlock>; NUM_PARTITIONS],
+    /// Untouched `build_schema` chunks of partition `p`, taken when `p` flips to `Spilled`
+    /// and waiting to be written to Parquet.
+    pub pending_spill_blocks: Vec<ConcurrentQueue<DataBlock>>,
 
     inner: Mutex<PartitionedInner>,
 }
@@ -217,6 +228,7 @@ impl PartitionedJoinState {
         factory: Arc<HashJoinFactory>,
         allow_spill: bool,
         shared_build_chunks: bool,
+        pre_partitioned_lanes: Option<usize>,
     ) -> Result<Arc<Self>> {
         // On SSE4.2, fast_hash (_mm_crc32_u64) only sets the low 32 bits.
         #[cfg(target_feature = "sse4.2")]
@@ -241,15 +253,29 @@ impl PartitionedJoinState {
             0,
         );
 
+        let (pre_partitioned, num_partitions, lanes) = match pre_partitioned_lanes {
+            Some(num_lanes) => (
+                true,
+                num_lanes,
+                (0..num_lanes)
+                    .map(|_| Arc::new(BasicHashJoinState::create()))
+                    .collect(),
+            ),
+            None => (false, NUM_PARTITIONS, Vec::new()),
+        };
+
         Ok(Arc::new(PartitionedJoinState {
             ctx,
             factory,
             level,
             max_level,
             allow_spill,
+            pre_partitioned,
             basic: Arc::new(BasicHashJoinState::with_shared_build_chunks(
                 shared_build_chunks,
             )),
+            lanes,
+            in_flight_unallocated_bytes: AtomicUsize::new(0),
             placeholder,
             build_input_rows: AtomicUsize::new(0),
             partition_rows: AtomicUsize::new(0),
@@ -258,13 +284,42 @@ impl PartitionedJoinState {
             ever_spilled: AtomicBool::new(false),
             all_spilled: AtomicBool::new(false),
             transition_queue: ConcurrentQueue::unbounded(),
-            pending_spill_blocks: std::array::from_fn(|_| ConcurrentQueue::unbounded()),
-            inner: Mutex::new(PartitionedInner::new()),
+            pending_spill_blocks: (0..num_partitions)
+                .map(|_| ConcurrentQueue::unbounded())
+                .collect(),
+            inner: Mutex::new(PartitionedInner::new(num_partitions)),
         }))
     }
 
     pub fn lock(&self) -> MutexGuard<'_, PartitionedInner> {
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    pub fn num_partitions(&self) -> usize {
+        self.pending_spill_blocks.len()
+    }
+
+    pub fn lane(&self, lane_id: usize) -> &Arc<BasicHashJoinState> {
+        if self.pre_partitioned {
+            &self.lanes[lane_id]
+        } else {
+            &self.basic
+        }
+    }
+
+    pub fn has_resident_build_rows(&self) -> bool {
+        if self.pre_partitioned {
+            self.lanes.iter().any(|lane| *lane.build_rows.deref() > 0)
+        } else {
+            *self.basic.build_rows.deref() > 0
+        }
+    }
+
+    pub fn clear_residents(&self) {
+        self.basic.clear();
+        for lane in &self.lanes {
+            lane.clear();
+        }
     }
 
     pub fn can_spill(&self) -> bool {
@@ -345,11 +400,50 @@ impl PartitionedJoinState {
         slot.status = PartitionStatus::Spilled;
         slot.build_rows = 0;
         slot.build_bytes = 0;
-        let chunks = std::mem::take(&mut slot.chunks);
-        for block in self.basic.take_unbuilt_chunks(&chunks, &self.placeholder) {
-            self.pending_spill_blocks[pid]
-                .push(block)
-                .expect("push unbounded concurrent queue failed");
+        let blocks = if self.pre_partitioned {
+            self.lanes[pid].take_all_chunks_for_transition()
+        } else {
+            let chunks = std::mem::take(&mut slot.chunks);
+            self.basic.take_unbuilt_chunks(&chunks, &self.placeholder)
+        };
+        for block in blocks {
+            if !block.is_empty() {
+                self.pending_spill_blocks[pid]
+                    .push(block)
+                    .expect("push unbounded concurrent queue failed");
+            }
+        }
+        self.set_spilled();
+
+        if inner
+            .partitions
+            .iter()
+            .all(|s| s.status == PartitionStatus::Spilled)
+        {
+            self.all_spilled.store(true, Ordering::Release);
+        }
+    }
+
+    /// Transition an aborted `Building` pre-partitioned lane to `Spilled` while `inner` is locked,
+    /// queuing its intact `build_schema` chunks to `pending_spill_blocks[pid]`.
+    pub fn mark_building_lane_spilled(
+        &self,
+        inner: &mut PartitionedInner,
+        pid: usize,
+        chunks: Vec<DataBlock>,
+    ) {
+        debug_assert!(self.pre_partitioned);
+        let slot = &mut inner.partitions[pid];
+        debug_assert_eq!(slot.status, PartitionStatus::Building);
+        slot.status = PartitionStatus::Spilled;
+        slot.build_rows = 0;
+        slot.build_bytes = 0;
+        for block in chunks {
+            if !block.is_empty() {
+                self.pending_spill_blocks[pid]
+                    .push(block)
+                    .expect("push unbounded concurrent queue failed");
+            }
         }
         self.set_spilled();
 

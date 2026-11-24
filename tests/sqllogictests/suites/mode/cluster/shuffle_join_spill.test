@@ -1,0 +1,212 @@
+# Test pre-partitioned GlobalShuffle hash join execution across in-memory, BuildFinal spill,
+# and Build spill (all 7 join types, NULL keys, NULL-safe <=>, empty lanes, skewed keys, strings).
+statement ok
+create or replace database shuffle_join_spill;
+
+statement ok
+use shuffle_join_spill;
+
+statement ok
+set enforce_shuffle_join = 1;
+
+statement ok
+set disable_join_reorder = 1;
+
+statement ok
+set max_threads = 4;
+
+# 1. Small edge-case tables: empty lanes (only 3 distinct keys across 3 nodes * 4 lanes),
+# NULL keys, NULL-safe <=>, skewed hot key, and residual non-equi predicates.
+statement ok
+create or replace table small_probe(k int null, v int not null);
+
+statement ok
+create or replace table small_build(k int null, v int not null);
+
+statement ok
+insert into small_probe values (1, 10), (1, 20), (2, 30), (null, 40), (null, 50), (99, 60);
+
+statement ok
+insert into small_build values (1, 100), (2, 200), (2, 201), (null, 300), (88, 400);
+
+query II
+select count(*), sum(p.v + b.v) from small_probe p join small_build b on p.k = b.k;
+----
+4 691
+
+query III
+select count(*), count(b.k), sum(p.v) from small_probe p left join small_build b on p.k = b.k;
+----
+7 4 240
+
+query III
+select count(*), count(p.k), sum(b.v) from small_probe p right join small_build b on p.k = b.k;
+----
+6 4 1301
+
+query II
+select count(*), sum(p.v) from small_probe p left semi join small_build b on p.k = b.k;
+----
+3 60
+
+query II
+select count(*), sum(p.v) from small_probe p left anti join small_build b on p.k = b.k;
+----
+3 150
+
+query II
+select count(*), sum(b.v) from small_probe p right semi join small_build b on p.k = b.k;
+----
+3 501
+
+query II
+select count(*), sum(b.v) from small_probe p right anti join small_build b on p.k = b.k;
+----
+2 700
+
+# NULL-safe equality (IS NOT DISTINCT FROM) routes NULLs to the exact same GlobalShuffle lane on both sides.
+query II
+select count(*), sum(p.v + b.v) from small_probe p join small_build b on p.k is not distinct from b.k;
+----
+6 1381
+
+# Mixed-type equi-key (Int32 = Int64) + non-equi residual predicate.
+query II
+select count(*), sum(p.v + b.v) from small_probe p join small_build b on p.k::bigint = b.k::bigint and p.v * 5 < b.v;
+----
+3 571
+
+# 2. Larger tables for in-memory, BuildFinal spill, and Build spill across 3 nodes.
+statement ok
+create or replace table probe_side as select number % 500000 as k, concat('k', (number % 500000)::string) as s, number as v from numbers(600000);
+
+statement ok
+create or replace table build_keys as select number * 7 as k from numbers(2000000);
+
+statement ok
+create or replace table build_nullable_keys as select if(number % 7 = 0, null, number * 7) as k from numbers(2000000);
+
+statement ok
+create or replace table build_string_keys as select concat('k', (number * 7)::string) as s from numbers(1000000);
+
+# In-memory pre-partitioned GlobalShuffle baseline (all 7 join types)
+query II
+select count(*), sum(probe_side.v) from probe_side join build_keys on probe_side.k = build_keys.k;
+----
+85715 25714371427
+
+query III
+select count(*), count(build_keys.k), sum(probe_side.v) from probe_side left join build_keys on probe_side.k = build_keys.k;
+----
+600000 85715 179999700000
+
+query II
+select count(*), sum(probe_side.v) from probe_side right join build_nullable_keys on probe_side.k = build_nullable_keys.k;
+----
+2012245 22040632657
+
+# BuildFinal / Build spill under tight per-node query memory limit (48 MiB)
+statement ok
+set max_query_memory_usage = 50331648;
+
+# INNER JOIN
+query II
+select count(*), sum(probe_side.v) from probe_side join build_keys on probe_side.k = build_keys.k;
+----
+85715 25714371427
+
+# LEFT OUTER JOIN
+query III
+select count(*), count(build_keys.k), sum(probe_side.v) from probe_side left join build_keys on probe_side.k = build_keys.k;
+----
+600000 85715 179999700000
+
+# LEFT SEMI JOIN
+query II
+select count(*), sum(probe_side.v) from probe_side where exists(select 1 from build_keys where probe_side.k = build_keys.k);
+----
+85715 25714371427
+
+# LEFT ANTI JOIN
+query II
+select count(*), sum(probe_side.v) from probe_side where not exists(select 1 from build_keys where probe_side.k = build_keys.k);
+----
+514285 154285328573
+
+# RIGHT SEMI JOIN
+query I
+select count(*) from probe_side right semi join build_keys on probe_side.k = build_keys.k;
+----
+71429
+
+# RIGHT ANTI JOIN
+query I
+select count(*) from probe_side right anti join build_keys on probe_side.k = build_keys.k;
+----
+1928571
+
+# RIGHT OUTER JOIN with NULL build keys (all NULLs land in one GlobalShuffle lane)
+query II
+select count(*), sum(probe_side.v) from probe_side right join build_nullable_keys on probe_side.k = build_nullable_keys.k;
+----
+2012245 22040632657
+
+# Type-cast equi-key (Int64 = Int32) under spill
+query II
+select count(*), sum(probe_side.v) from probe_side join build_keys on probe_side.k = build_keys.k::int32;
+----
+85715 25714371427
+
+# Multi-key (128-bit packed) under spill
+query II
+select count(*), sum(probe_side.v) from probe_side join build_keys on probe_side.k = build_keys.k and probe_side.k % 3 = build_keys.k % 3;
+----
+85715 25714371427
+
+# String key under BuildFinal spill
+query II
+select count(*), sum(probe_side.v) from probe_side join build_string_keys on probe_side.s = build_string_keys.s;
+----
+85715 25714371427
+
+# Tighter per-node limit (16 MiB) forces Stage::Build pre-partitioned lane spilling + level-1 parallel restore
+statement ok
+set max_query_memory_usage = 16777216;
+
+query II
+select count(*), sum(probe_side.v) from probe_side join build_string_keys on probe_side.s = build_string_keys.s;
+----
+85715 25714371427
+
+query III
+select count(*), count(build_keys.k), sum(probe_side.v) from probe_side left join build_keys on probe_side.k = build_keys.k;
+----
+600000 85715 179999700000
+
+query II
+select count(*), sum(probe_side.v) from probe_side right join build_nullable_keys on probe_side.k = build_nullable_keys.k;
+----
+2012245 22040632657
+
+# Force spill-disabled mode (max_hash_join_spill_level = 0) still uses pre-partitioned per-lane Flat joins
+statement ok
+set max_hash_join_spill_level = 0;
+
+statement ok
+unset max_query_memory_usage;
+
+query II
+select count(*), sum(probe_side.v) from probe_side join build_keys on probe_side.k = build_keys.k;
+----
+85715 25714371427
+
+query II
+select count(*), sum(probe_side.v) from probe_side right join build_nullable_keys on probe_side.k = build_nullable_keys.k;
+----
+2012245 22040632657
+
+statement ok
+unset (max_hash_join_spill_level, enforce_shuffle_join, disable_join_reorder, max_threads);
+
+statement ok
+drop database shuffle_join_spill;

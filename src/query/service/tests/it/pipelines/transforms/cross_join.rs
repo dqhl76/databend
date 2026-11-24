@@ -94,6 +94,7 @@ fn cross_join(probe: DataBlock, build: DataBlock, predicate: Option<Expr>) -> Ha
         build_side_cache_info: None,
         runtime_filter: Default::default(),
         broadcast_id: None,
+        global_shuffled: false,
     }
 }
 

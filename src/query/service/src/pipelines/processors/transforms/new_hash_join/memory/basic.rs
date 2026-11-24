@@ -20,7 +20,6 @@ use std::sync::atomic::Ordering;
 use databend_common_base::base::ProgressValues;
 use databend_common_column::bitmap::Bitmap;
 use databend_common_exception::Result;
-use databend_common_expression::Column;
 use databend_common_expression::DataBlock;
 use databend_common_expression::FunctionContext;
 use databend_common_expression::HashMethodKind;
@@ -179,67 +178,7 @@ impl BasicHashJoin {
 
 impl BasicHashJoin {
     pub(crate) fn finalize_chunks(&mut self) {
-        if self.state.chunks_finalized.load(Ordering::Acquire) {
-            return;
-        }
-
-        let locked = self.state.mutex.lock();
-        let _locked = locked.unwrap_or_else(PoisonError::into_inner);
-
-        if self.state.chunks_finalized.load(Ordering::Acquire) {
-            return;
-        }
-
-        let preserved = self.state.preserve_build_chunks.load(Ordering::Acquire);
-        if !self.desc.build_projection.is_empty()
-            && let Some(block) = self.state.chunks.first()
-        {
-            if preserved {
-                *self.state.column_types.as_mut() = self
-                    .desc
-                    .build_projection
-                    .iter()
-                    .map(|&offset| block.get_by_offset(offset).data_type())
-                    .collect();
-
-                let mut columns = Vec::with_capacity(self.desc.build_projection.len());
-                for &offset in &self.desc.build_projection {
-                    let full_columns = self
-                        .state
-                        .chunks
-                        .iter()
-                        .map(|block| block.get_by_offset(offset).to_column())
-                        .collect::<Vec<_>>();
-
-                    columns.push(Column::take_downcast_column_vec(&full_columns));
-                }
-
-                *self.state.columns.as_mut() = columns;
-            } else {
-                *self.state.column_types.as_mut() = (0..self.desc.build_projection.len())
-                    .map(|offset| block.get_by_offset(offset).data_type())
-                    .collect();
-
-                let mut columns = Vec::with_capacity(self.desc.build_projection.len());
-                for offset in 0..self.desc.build_projection.len() {
-                    let full_columns = self
-                        .state
-                        .chunks
-                        .iter()
-                        .map(|block| block.get_by_offset(offset).to_column())
-                        .collect::<Vec<_>>();
-
-                    columns.push(Column::take_downcast_column_vec(&full_columns));
-                }
-
-                *self.state.columns.as_mut() = columns;
-            }
-        }
-
-        if !self.state.shared_build_chunks {
-            self.state.chunks.as_mut().clear();
-        }
-        self.state.chunks_finalized.store(true, Ordering::Release);
+        self.state.finalize_chunks(&self.desc.build_projection);
     }
 
     fn init_memory_hash_table(&mut self) {

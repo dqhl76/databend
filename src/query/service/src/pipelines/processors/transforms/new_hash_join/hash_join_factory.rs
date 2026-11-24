@@ -75,6 +75,15 @@ impl HashJoinFactory {
         level: usize,
         shared_build_chunks: bool,
     ) -> Result<Arc<PartitionedJoinState>> {
+        self.create_level_state_with_lanes(level, shared_build_chunks, None)
+    }
+
+    pub fn create_level_state_with_lanes(
+        self: &Arc<Self>,
+        level: usize,
+        shared_build_chunks: bool,
+        pre_partitioned_lanes: Option<usize>,
+    ) -> Result<Arc<PartitionedJoinState>> {
         let deterministic_exprs = self
             .desc
             .build_keys
@@ -87,12 +96,16 @@ impl HashJoinFactory {
             && !self.desc.build_schema.fields().is_empty()
             && !self.desc.probe_schema.fields().is_empty()
             && deterministic_exprs;
+        let pre_partitioned_lanes = pre_partitioned_lanes.filter(|&n| {
+            level == 0 && n >= 2 && !shared_build_chunks && !self.desc.build_keys.is_empty()
+        });
         PartitionedJoinState::create(
             self.ctx.clone(),
             level,
             self.clone(),
             allow_spill,
             shared_build_chunks,
+            pre_partitioned_lanes,
         )
     }
 
@@ -100,8 +113,9 @@ impl HashJoinFactory {
         self: &Arc<Self>,
         typ: JoinType,
         state: Arc<PartitionedJoinState>,
+        lane_id: usize,
     ) -> Result<Box<dyn Join>> {
-        Ok(Box::new(self.create_partitioned_join(typ, state)?))
+        Ok(Box::new(self.create_partitioned_join(typ, state, lane_id)?))
     }
 
     /// Create an in-memory join on a single `BasicHashJoinState` (used for the flat fast path and
@@ -169,11 +183,12 @@ impl HashJoinFactory {
         self: &Arc<Self>,
         typ: JoinType,
         state: Arc<PartitionedJoinState>,
+        lane_id: usize,
     ) -> Result<PartitionedHashJoin> {
         let flat_join = if state.can_spill() {
             None
         } else {
-            Some(self.create_memory_join(typ, state.basic.clone())?)
+            Some(self.create_memory_join(typ, state.lane(lane_id).clone())?)
         };
         let memory_settings = MemorySettings::from_join_settings(&self.ctx)?;
 
@@ -186,6 +201,7 @@ impl HashJoinFactory {
             state,
             flat_join,
             typ,
+            lane_id,
         )
     }
 }
