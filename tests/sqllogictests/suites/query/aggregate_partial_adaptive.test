@@ -73,6 +73,31 @@ select count(), sum(s) from (select number k, sum(number) s from numbers(2000000
 statement ok
 unset max_block_size
 
+# Runs of equal keys, as input sorted by a cluster key comes: the partial aggregate probes only the
+# first row of each run. Every row is still aggregated into the group of its run.
+query IIIIII
+select count(), sum(c), sum(s), min(mn), max(mx), sum(dc) from (select number // 5 as k, count() c, sum(number) s, min(number) mn, max(number) mx, count(distinct number % 3) dc from numbers(2000000) group by k)
+----
+400000	2000000	1999999000000	0	1999999	1200000
+
+# Runs of nullable string keys over two columns.
+query II
+select count(), sum(c) from (select if((number // 4) % 5 = 0, null, to_string((number // 4) % 1000)) as k1, (number // 8) % 3 as k2, count() c from numbers(2000000) group by k1, k2)
+----
+2403	2000000
+
+# Runs whose keys come back after other runs.
+query III
+select count(), sum(s), max(s) from (select (number // 4) % 3000 as k, sum(number) s from numbers(2000000) group by k)
+----
+3000	1999999000000	670670330
+
+# Short runs over a few keys, which are not aggregated by runs.
+query III
+select count(), sum(c), sum(s) from (select (number // 4) % 4 as k, count() c, sum(number) s from numbers(2000000) group by k)
+----
+4	2000000	1999999000000
+
 # The final aggregate spills without changing the results.
 statement ok
 set force_aggregate_data_spill = 1

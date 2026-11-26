@@ -41,6 +41,12 @@ pub struct ProbeState {
     pub(super) slots: [usize; BATCH_SIZE],
     // The rows that created a group, set when probing with source states.
     pub(super) new_groups: [bool; BATCH_SIZE],
+    /// The ordinal of the run of equal group keys each row belongs to, see
+    /// `AggregateHashTable::add_runs_partial`.
+    pub(super) run_ordinals: [u16; BATCH_SIZE],
+    /// The first row of each run.
+    pub(super) run_first_rows: [u32; BATCH_SIZE],
+    pub(super) runs: RunLookout,
 
     pub(super) partition_entries: Vec<(u16, SelectVector)>,
 }
@@ -58,8 +64,49 @@ impl Default for ProbeState {
             empty_vector: [RowID::default(); BATCH_SIZE],
             slots: [0; BATCH_SIZE],
             new_groups: [false; BATCH_SIZE],
+            run_ordinals: [0; BATCH_SIZE],
+            run_first_rows: [0; BATCH_SIZE],
+            runs: RunLookout::default(),
             partition_entries: vec![],
         }
+    }
+}
+
+/// When a partial aggregate looks for runs of equal group keys in its batches.
+#[derive(Debug, Default)]
+pub(super) struct RunLookout {
+    /// Batches to aggregate before looking again.
+    pub(super) skip: u32,
+    /// The batches skipped after the last batch that had too few runs.
+    pub(super) backoff: u32,
+    /// A group key has a type runs are not looked for in.
+    pub(super) unsupported: bool,
+}
+
+/// Batches skipped at most between two looks for runs.
+const RUN_MAX_BACKOFF: u32 = 64;
+
+impl RunLookout {
+    pub(super) fn should_look(&mut self) -> bool {
+        if self.unsupported {
+            return false;
+        }
+        if self.skip > 0 {
+            self.skip -= 1;
+            return false;
+        }
+        true
+    }
+
+    /// The batch had too few runs: skip the next 1, then 3, 7, ... up to `RUN_MAX_BACKOFF`
+    /// batches before looking again.
+    pub(super) fn back_off(&mut self) {
+        self.backoff = (self.backoff * 2 + 1).min(RUN_MAX_BACKOFF);
+        self.skip = self.backoff;
+    }
+
+    pub(super) fn found(&mut self) {
+        self.backoff = 0;
     }
 }
 
@@ -72,8 +119,9 @@ impl ProbeState {
     pub fn new_boxed() -> Box<ProbeState> {
         let mut state = Box::<ProbeState>::new_zeroed();
         // SAFETY: all zeros is the value `default()` gives every field but `partition_entries`:
-        // hashes, ids, indices and slots of 0, null row and state addresses, rows of
-        // `RowID(0)` and `false`. Write that one before the box is taken as initialized.
+        // hashes, ids, indices, slots and run ordinals of 0, null row and state addresses, rows
+        // of `RowID(0)`, `false` and a `RunLookout` of zeros. Write that one before the box is
+        // taken as initialized.
         unsafe {
             std::ptr::addr_of_mut!((*state.as_mut_ptr()).partition_entries).write(Vec::new());
             state.assume_init()

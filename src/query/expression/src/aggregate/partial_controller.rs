@@ -79,6 +79,9 @@ pub struct PartialAddStats {
     pub new_groups: usize,
     /// Times the index restarted in place.
     pub windows: usize,
+    /// Runs of equal group keys among the rows; a row of a batch not aggregated by runs counts
+    /// as one.
+    pub runs: usize,
 }
 
 impl AddAssign for PartialAddStats {
@@ -86,6 +89,7 @@ impl AddAssign for PartialAddStats {
         self.rows += other.rows;
         self.new_groups += other.new_groups;
         self.windows += other.windows;
+        self.runs += other.runs;
     }
 }
 

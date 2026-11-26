@@ -26,6 +26,7 @@ mod payload_flush;
 mod payload_row;
 mod probe_state;
 mod row_ptr;
+mod run_detect;
 
 pub use aggregate_function::AggregateCall;
 pub use aggregate_function_state::*;

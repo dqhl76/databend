@@ -311,9 +311,10 @@ impl AccumulatingTransform for TransformPartialAggregate {
             .log_partial_finish_statistics(self.output_rows + table_rows, hash_index_resizes);
         let total = &self.total;
         log::info!(
-            "[PartialAggregate] Adaptive: final_state={:?}, rows={}, new_groups={}, windows={}, emits={:?}, group_bytes={}",
+            "[PartialAggregate] Adaptive: final_state={:?}, rows={}, runs={}, new_groups={}, windows={}, emits={:?}, group_bytes={}",
             self.state,
             total.rows,
+            total.runs,
             total.new_groups,
             total.windows,
             self.emits,

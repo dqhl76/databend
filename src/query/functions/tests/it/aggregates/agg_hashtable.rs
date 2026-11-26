@@ -622,3 +622,127 @@ fn test_payload_flush_all_with_reused_state() {
         }
     }
 }
+
+/// A partial aggregate over runs of equal group keys aggregates each row into the group of its
+/// run, probing only the first row of a run: the result must equal that of the rows, for every
+/// key type runs are looked for in and for several key columns.
+#[test]
+fn test_agg_hashtable_partial_runs() {
+    use databend_common_column::bitmap::Bitmap;
+    use databend_common_expression::Column;
+    use databend_common_expression::types::DateType;
+    use databend_common_expression::types::EncodedColumn;
+    use databend_common_expression::types::ForColumn;
+
+    // Runs of several lengths, keys that come back after other runs, and one stretch of rows
+    // without runs. Keys of few groups come in runs of 16, long enough for a table of few groups.
+    // Together, the key columns start a run every 4 or 6 rows, so that their rows still repeat
+    // enough.
+    let n = 20_000usize;
+    let run = |i: usize, len: usize| {
+        if (8_000..10_000).contains(&i) {
+            i
+        } else {
+            i / len
+        }
+    };
+    let uints = UInt64Type::from_data((0..n).map(|i| (run(i, 4) % 3000) as u64).collect_vec());
+    let nullable = Int32Type::from_data((0..n).map(|i| (run(i, 16) % 50) as i32).collect_vec())
+        .wrap_nullable(Some(Bitmap::from_iter((0..n).map(|i| run(i, 16) % 7 != 0))));
+    let strings = StringType::from_data(
+        (0..n)
+            .map(|i| format!("k{}", run(i, 6) % 2000))
+            .collect_vec(),
+    );
+    let dates = DateType::from_data((0..n).map(|i| run(i, 6) as i32).collect_vec());
+    let booleans = BooleanType::from_data((0..n).map(|i| run(i, 16) % 2 == 0).collect_vec());
+    let encoded = Column::Encoded(Box::new(EncodedColumn::For(
+        ForColumn::try_encode(&Int64Type::from_data(
+            (0..n).map(|i| 1_000_000 + run(i, 4) as i64).collect_vec(),
+        ))
+        .unwrap(),
+    )));
+    let floats = Float64Type::from_data((0..n).map(|i| F64::from(run(i, 4) as f64)).collect_vec());
+    // 3 keys every 4 rows: a quarter of the rows repeat the row before, too few to take runs.
+    let few_repeats = UInt64Type::from_data((0..n).map(|i| (i * 3 / 4) as u64).collect_vec());
+    // Runs of 4 over 4 keys: a table of few groups probes cheaply, too short runs to take.
+    let few_groups = UInt64Type::from_data((0..n).map(|i| (run(i, 4) % 4) as u64).collect_vec());
+    let all: Vec<BlockEntry> = vec![
+        uints.into(),
+        nullable.into(),
+        strings.into(),
+        dates.into(),
+        booleans.into(),
+        encoded.into(),
+        floats.into(),
+        BlockEntry::new_const_column_arg::<Int8Type>(3, n),
+        few_repeats.into(),
+        few_groups.into(),
+    ];
+    let params = vec![
+        vec![Int64Type::from_data((0..n).map(|i| i as i64).collect_vec()).into()],
+        vec![StringType::from_data((0..n).map(|i| format!("v{}", i % 97)).collect_vec()).into()],
+    ];
+    let aggrs = vec![
+        resolve_agg("sum", Int64Type::data_type()),
+        resolve_agg("max", StringType::data_type()),
+    ];
+
+    // Each key column alone, the constant with another, and all but the float together.
+    let key_sets: Vec<(Vec<usize>, bool)> = vec![
+        (vec![0], true),
+        (vec![1], true),
+        (vec![2], true),
+        (vec![3], true),
+        (vec![4], true),
+        (vec![5], true),
+        // Floats are not compared: no runs.
+        (vec![6], false),
+        (vec![8], false),
+        (vec![9], false),
+        (vec![7, 0], true),
+        (vec![0, 1, 2, 3, 4, 5, 7], true),
+    ];
+    for (keys, has_runs) in key_sets {
+        let group_columns = keys.iter().map(|k| all[*k].clone()).collect_vec();
+        let group_types = group_columns.iter().map(|c| c.data_type()).collect_vec();
+        let expected = aggregate_into_block(&group_columns, &params, &aggrs, n);
+        let mut partial = AggregateHashTable::new(
+            group_types.clone(),
+            aggrs.clone(),
+            HashTableConfig::partial_aggregate(),
+            Arc::new(Bump::new()),
+        );
+        let mut state = ProbeState::default();
+        let args: Vec<ProjectedBlock> = params.iter().map(|v| v.into()).collect_vec();
+        let stats = partial
+            .add_groups_partial(
+                &mut state,
+                (&group_columns).into(),
+                &args,
+                n,
+                AggregateHashTable::capacity_for_groups(0),
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(stats.rows, n);
+        assert_eq!(
+            stats.runs < n,
+            has_runs,
+            "keys {keys:?}: {} runs of {n} rows",
+            stats.runs
+        );
+
+        let mut final_table = AggregateHashTable::new_with_partitioned_arenas(
+            group_types.clone(),
+            aggrs.clone(),
+            HashTableConfig::default().with_initial_radix_bits(2),
+        );
+        let mut flush_state = PayloadFlushState::default();
+        final_table
+            .combine_payloads(&partial.payload, &mut flush_state)
+            .unwrap();
+        assert_block_value_sort_eq(&merge_result_block(final_table, aggrs.len()), &expected);
+    }
+}

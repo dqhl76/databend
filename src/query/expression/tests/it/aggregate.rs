@@ -1067,6 +1067,8 @@ fn learn_keys(
         rows,
         new_groups,
         windows: rows / 24_000,
+        // No runs.
+        runs: rows,
     };
     let reason = partial.step(
         observed(stats, group_bytes),
@@ -1228,6 +1230,7 @@ fn test_partial_shrinks_grown_table() {
         rows: 1 << 24,
         new_groups: 1 << 24,
         windows: 1 << 10,
+        runs: 1 << 24,
     };
     assert_eq!(
         partial.step(

@@ -36,6 +36,8 @@ use super::payload::GroupRows;
 use super::payload_flush::PayloadFlushState;
 use super::probe_state::ProbeState;
 use super::row_ptr::RowPtr;
+use super::run_detect::count_run_starts;
+use super::run_detect::mark_run_starts;
 use crate::BlockEntry;
 use crate::Column;
 use crate::ProjectedBlock;
@@ -109,6 +111,24 @@ impl GroupKeyState {
 
 /// Index capacity of a new table, and of a partial table restarted after it emits.
 const INITIAL_CAPACITY: usize = 8192 * 4;
+
+/// A partial table that holds at most this many groups has few groups, see `repeats_enough`.
+const RUN_FEW_GROUPS: usize = 1024;
+
+/// Whether `rows` rows in `runs` runs repeat enough to be aggregated by runs, into a table that
+/// holds `groups` groups: at least half of the rows repeat the row before, or seven eighths
+/// while the table holds few groups. Gathering the first row of each run and spreading its
+/// states back costs a little per row, which short runs over few groups do not always win
+/// back: with a few short string keys they are slower than probing every row. Keys that
+/// repeat by chance, as a few keys in random order do, are left out either way.
+fn repeats_enough(runs: usize, rows: usize, groups: usize) -> bool {
+    let repeats = rows - runs;
+    if groups <= RUN_FEW_GROUPS {
+        repeats * 8 >= rows * 7
+    } else {
+        repeats * 2 >= rows
+    }
+}
 
 pub struct AggregateHashTable {
     // Hash index entries store the ids of rows in these payload pages. Any path that replaces
@@ -279,7 +299,8 @@ impl AggregateHashTable {
     /// Adaptive partial aggregation entry point. When the index is full it grows at once to
     /// `capacity`, or restarts in place once it is that large; the group hashes are fed to
     /// `sampler` once it has started. `dict_hashes` hash the dictionaries of the group columns
-    /// once for all the batches, see [`DictValueHashes`].
+    /// once for all the batches, see [`DictValueHashes`]. A batch in runs of equal group keys
+    /// probes only the first row of each run, see `add_runs_partial`.
     #[allow(clippy::too_many_arguments)]
     pub fn add_groups_partial(
         &mut self,
@@ -299,6 +320,18 @@ impl AggregateHashTable {
             (&[]).into(),
             row_count,
             |group_columns, params, _, rows| {
+                if self.add_runs_partial(
+                    state,
+                    group_columns,
+                    params,
+                    rows,
+                    capacity,
+                    sampler.as_deref_mut(),
+                    dict_hashes,
+                    &mut stats,
+                )? {
+                    return Ok(());
+                }
                 Self::fill_group_hashes(
                     group_columns,
                     &mut state.group_hashes[..rows],
@@ -420,12 +453,93 @@ impl AggregateHashTable {
         params: &[ProjectedBlock],
         row_count: usize,
         capacity: usize,
-        mut sampler: Option<&mut DistinctSampler>,
+        sampler: Option<&mut DistinctSampler>,
         stats: &mut PartialAddStats,
     ) -> Result<()> {
         // The caller filled `state.group_hashes`.
         stats.rows += row_count;
+        // Not aggregated by runs: every row counts as a run.
+        stats.runs += row_count;
+        self.probe_partial(state, group_columns, row_count, capacity, sampler, stats);
+        self.accumulate_states(state, params, (&[]).into(), row_count)
+    }
 
+    /// Aggregate a batch by runs of equal group keys, when enough of its rows repeat the keys of
+    /// the row before (see `repeats_enough`): hash and probe only the first row of each run,
+    /// then accumulate every row into the group of its run. Every row is still accumulated, so this holds for
+    /// any aggregate function. Returns false, having done nothing, when the batch is not
+    /// aggregated this way.
+    ///
+    /// Input sorted by a cluster key, or correlated with one, often comes in runs: the probes,
+    /// compares and hashes of the other rows of a run are saved. After a batch with too few runs
+    /// the next ones are not looked at for a while, so input without runs costs a compare of
+    /// adjacent keys every few dozen batches.
+    #[allow(clippy::too_many_arguments)]
+    fn add_runs_partial(
+        &mut self,
+        state: &mut ProbeState,
+        group_columns: ProjectedBlock,
+        params: &[ProjectedBlock],
+        rows: usize,
+        capacity: usize,
+        sampler: Option<&mut DistinctSampler>,
+        dict_hashes: Option<&DictValueHashes>,
+        stats: &mut PartialAddStats,
+    ) -> Result<bool> {
+        if rows < 2 || !state.runs.should_look() {
+            return Ok(false);
+        }
+        let mut starts = [0u8; BATCH_SIZE];
+        if !mark_run_starts(group_columns, &mut starts[..rows]) {
+            state.runs.unsupported = true;
+            return Ok(false);
+        }
+        let runs = count_run_starts(&starts[..rows]);
+        if !repeats_enough(runs, rows, self.payload.len()) {
+            state.runs.back_off();
+            return Ok(false);
+        }
+        state.runs.found();
+
+        // Branch-free: every row writes its position into the slot of the next run, which only
+        // the first row of a run keeps, and takes the ordinal of the last run started. Some row
+        // repeats the one before, so the slots written stay below `rows`.
+        let mut run = 0;
+        for row in 0..rows {
+            state.run_first_rows[run] = row as u32;
+            run += starts[row] as usize;
+            state.run_ordinals[row] = (run - 1) as u16;
+        }
+        let first_rows = group_columns
+            .iter()
+            .map(|entry| entry.take(&state.run_first_rows[..runs]))
+            .collect::<Result<Vec<_>>>()?;
+        let first_rows: ProjectedBlock = (&first_rows).into();
+        Self::fill_group_hashes(first_rows, &mut state.group_hashes[..runs], dict_hashes);
+
+        stats.rows += rows;
+        stats.runs += runs;
+        self.probe_partial(state, first_rows, runs, capacity, sampler, stats);
+        // Every row takes the states of the first row of its run. Going down reads only places
+        // not yet written, as the ordinal of the run of a row is at most the row.
+        for row in (0..rows).rev() {
+            state.state_places[row] = state.state_places[state.run_ordinals[row] as usize];
+        }
+        self.accumulate_states(state, params, (&[]).into(), rows)?;
+        Ok(true)
+    }
+
+    /// Find or create the groups of the first `row_count` rows of `group_columns`, whose hashes
+    /// are in `state.group_hashes`, growing or restarting the index first when they may not fit.
+    fn probe_partial(
+        &mut self,
+        state: &mut ProbeState,
+        group_columns: ProjectedBlock,
+        row_count: usize,
+        capacity: usize,
+        mut sampler: Option<&mut DistinctSampler>,
+        stats: &mut PartialAddStats,
+    ) {
         if row_count + self.hash_index.count() > self.hash_index.resize_threshold() {
             if capacity > self.hash_index.capacity() {
                 // Grow at once. The index was not restarted since the payload was emitted, so
@@ -459,7 +573,6 @@ impl AggregateHashTable {
         stats.new_groups += self
             .hash_index
             .probe_and_create(state, row_count, &mut adapter);
-        self.accumulate_states(state, params, (&[]).into(), row_count)
     }
 
     fn accumulate_states(
