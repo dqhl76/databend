@@ -25,6 +25,8 @@ use databend_common_exception::Result;
 use log::info;
 
 use super::AggrState;
+use super::AggrStateLoc;
+use super::AggrStateType;
 use super::BATCH_SIZE;
 use super::PayloadFlushState;
 use super::RowID;
@@ -95,6 +97,226 @@ impl RowCursor {
         end: 0,
         page: usize::MAX,
     };
+}
+
+/// Where `Payload::move_rows_into` writes the next rows of a destination: the free rows of its
+/// writable page.
+struct MoveCursor {
+    /// The first row of the page, and the states of its first row.
+    base: *mut u8,
+    states: *mut u8,
+    /// The index of the page in its payload, the rows it held before, and the next row and
+    /// the end of its rows.
+    page: usize,
+    start: usize,
+    row: usize,
+    end: usize,
+}
+
+impl MoveCursor {
+    const EMPTY: MoveCursor = MoveCursor {
+        base: std::ptr::null_mut(),
+        states: std::ptr::null_mut(),
+        page: usize::MAX,
+        start: 0,
+        row: 0,
+        end: 0,
+    };
+
+    /// The free rows of the writable page of `dest`, none if it has no page or a full one.
+    fn open(dest: &mut Payload) -> MoveCursor {
+        match dest.current_write_page.checked_sub(1) {
+            Some(page) if dest.pages[page].rows < dest.row_per_page => Self::at(dest, page),
+            _ => Self::EMPTY,
+        }
+    }
+
+    /// The rows of the next page of `dest`, once its cursor was committed.
+    fn open_next(dest: &mut Payload) -> MoveCursor {
+        let (_, page) = dest.writable_page();
+        Self::at(dest, page)
+    }
+
+    fn at(dest: &mut Payload, page: usize) -> MoveCursor {
+        let offset = dest.row_layout.states.offset;
+        let data = &mut dest.pages[page];
+        let base = data.data.as_mut_ptr();
+        MoveCursor {
+            base,
+            states: unsafe { base.add(offset) },
+            page,
+            start: data.rows,
+            row: data.rows,
+            end: dest.row_per_page,
+        }
+    }
+
+    /// Count the rows written in the page, with their states, which moved with them. Committing
+    /// again counts only the rows written since.
+    fn commit(&mut self, dest: &mut Payload) {
+        if self.page == usize::MAX {
+            return;
+        }
+        let agg_len = dest.aggrs.len();
+        let page = &mut dest.pages[self.page];
+        page.rows = self.row;
+        page.initialized_states = self.row * agg_len;
+        dest.total_rows += self.row - self.start;
+        self.start = self.row;
+    }
+}
+
+/// The rows of a payload whose states a `RowMover` owns until they are moved.
+enum Unmoved<'a> {
+    /// Every row of the pages, in order.
+    Pages(&'a [Page], usize),
+    Rows(&'a [RowPtr]),
+}
+
+/// Moves rows of a payload with their states to other payloads, see `Payload::move_rows_into`
+/// and `Payload::move_rows_to`. The source gives its states up to the mover, which owns the
+/// states of `unmoved` from row `moved` on, and `dropped`. A row moved belongs to its destination
+/// once the cursor of the destination is committed. Dropping the mover, when done or on a panic,
+/// as an allocation that failed under the memory limit raises, commits the cursors and drops the
+/// states it still owns: each state is dropped once, and none leaks.
+struct RowMover<'a> {
+    aggrs: &'a [AggregateCallRef],
+    states_layout: Option<StatesLayout>,
+    states: StatesRegion,
+    dests: &'a mut [Payload],
+    cursors: Vec<MoveCursor>,
+    unmoved: Unmoved<'a>,
+    moved: usize,
+    dropped: &'a [StateAddr],
+}
+
+impl<'a> RowMover<'a> {
+    /// A mover of the rows `unmoved` of a payload of aggregates `aggrs`, which gave up its states,
+    /// `states_layout`, to the mover. The destinations have the layout of the payload, see
+    /// `Payload::same_layout`.
+    fn new(
+        aggrs: &'a [AggregateCallRef],
+        states_layout: Option<StatesLayout>,
+        states: StatesRegion,
+        unmoved: Unmoved<'a>,
+        dests: &'a mut [Payload],
+        dropped: &'a [StateAddr],
+    ) -> Self {
+        let mut mover = RowMover {
+            aggrs,
+            states_layout,
+            states,
+            dests,
+            cursors: vec![],
+            unmoved,
+            moved: 0,
+            dropped,
+        };
+        // Opening a page may fail: the mover, which now owns the states, drops them then.
+        mover.cursors = mover.dests.iter_mut().map(MoveCursor::open).collect();
+        mover
+    }
+
+    /// Move the row at `src`, the next row the mover owns, with its states at `src_states`, to
+    /// `dests[dest]`, copying its group values at `arena_offsets` into the arena of the
+    /// destination.
+    ///
+    /// # Safety
+    ///
+    /// `src` is the row of the source numbered `moved`, and the destinations have its layout.
+    #[inline(always)]
+    unsafe fn move_row(
+        &mut self,
+        dest: usize,
+        src: *const u8,
+        src_states: *const u8,
+        arena_offsets: &[usize],
+    ) {
+        let tuple_size = self.dests[dest].tuple_size;
+        let state_size = self.states.size;
+        let cursor = &mut self.cursors[dest];
+        if cursor.row == cursor.end {
+            let payload = &mut self.dests[dest];
+            cursor.commit(payload);
+            *cursor = MoveCursor::open_next(payload);
+        }
+        // SAFETY: the cursor is at a free row of a page of the destination, of the row and state
+        // sizes of the source. The row is counted, and its states change owner, only once every
+        // allocation for it is done.
+        unsafe {
+            let dst = cursor.base.add(cursor.row * tuple_size);
+            copy_small(src, dst, tuple_size);
+            if !arena_offsets.is_empty() {
+                let mut dst = RowMut::new(dst);
+                let src = RowPtr::new(src);
+                let arena = &self.dests[dest].arena;
+                for &offset in arena_offsets {
+                    dst.write_bytes(offset, arena.alloc_slice_copy(src.read_bytes(offset)));
+                }
+            }
+            copy_small(
+                src_states,
+                cursor.states.add(cursor.row * state_size),
+                state_size,
+            );
+        }
+        cursor.row += 1;
+        self.moved += 1;
+    }
+}
+
+impl Drop for RowMover<'_> {
+    fn drop(&mut self) {
+        for (cursor, dest) in self.cursors.iter_mut().zip(self.dests.iter_mut()) {
+            cursor.commit(dest);
+        }
+        let Some(states_layout) = self.states_layout.take() else {
+            return;
+        };
+        let agg_len = self.aggrs.len();
+        drop_guard(move || {
+            for (idx, (aggr, loc)) in self
+                .aggrs
+                .iter()
+                .zip(states_layout.states_loc.iter())
+                .enumerate()
+            {
+                if !aggr.state().need_manual_drop() {
+                    continue;
+                }
+                let drop_state = |addr: StateAddr| unsafe {
+                    aggr.drop_state(AggrState::new(addr, loc));
+                };
+                match self.unmoved {
+                    Unmoved::Pages(pages, tuple_size) => {
+                        let mut skip = self.moved;
+                        for page in pages {
+                            let rows = page.rows;
+                            let first = skip.min(rows);
+                            skip -= first;
+                            for row in first..rows {
+                                // A row whose states were not all initialized, at a failed
+                                // allocation, has only those dropped.
+                                if row * agg_len + idx >= page.initialized_states {
+                                    break;
+                                }
+                                let ptr = page.row_ptr(row, tuple_size).as_ptr();
+                                drop_state(StateAddr::from(self.states.ptr(ptr)));
+                            }
+                        }
+                    }
+                    Unmoved::Rows(rows) => {
+                        for row in &rows[self.moved..] {
+                            drop_state(StateAddr::from(self.states.ptr(row.as_ptr())));
+                        }
+                    }
+                }
+                for addr in self.dropped {
+                    drop_state(*addr);
+                }
+            }
+        });
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -296,6 +518,137 @@ impl Payload {
 
     pub(super) fn data_ptr(&self, page: &Page, row: usize) -> RowPtr {
         page.row_ptr(row, self.tuple_size)
+    }
+
+    /// Whether `other` holds rows of the layout of this payload: the same group types, and the
+    /// states of the same aggregates, of the same fields, at the same offsets in their row, and
+    /// dropped the same way. Aggregates created apart for the same call, as a partial and a final
+    /// aggregate have, are the same.
+    pub(super) fn same_layout(&self, other: &Payload) -> bool {
+        let same_state = |a: &AggregateCallRef, b: &AggregateCallRef| {
+            let (a, b) = (a.state(), b.state());
+            a.need_manual_drop() == b.need_manual_drop()
+                && a.state_version() == b.state_version()
+                && a.fields().len() == b.fields().len()
+                && a.fields().iter().zip(b.fields()).all(|pair| match pair {
+                    (AggrStateType::Bool, AggrStateType::Bool) => true,
+                    (AggrStateType::Custom(a), AggrStateType::Custom(b)) => a == b,
+                    _ => false,
+                })
+        };
+        let same_aggrs = self.aggrs.len() == other.aggrs.len()
+            && self.aggrs.iter().zip(&other.aggrs).all(|(a, b)| {
+                Arc::ptr_eq(a, b) || (a.signature() == b.signature() && same_state(a, b))
+            });
+        let same_locs = |a: &[AggrStateLoc], b: &[AggrStateLoc]| {
+            a.len() == b.len()
+                && a.iter().zip(b).all(|pair| match pair {
+                    (AggrStateLoc::Bool(i, x), AggrStateLoc::Bool(j, y))
+                    | (AggrStateLoc::Custom(i, x), AggrStateLoc::Custom(j, y)) => i == j && x == y,
+                    _ => false,
+                })
+        };
+        let same_states = match (
+            &self.row_layout.states_layout,
+            &other.row_layout.states_layout,
+        ) {
+            (None, None) => true,
+            (Some(a), Some(b)) => {
+                a.layout == b.layout
+                    && a.states_loc.len() == b.states_loc.len()
+                    && a.states_loc
+                        .iter()
+                        .zip(&b.states_loc)
+                        .all(|(a, b)| same_locs(a, b))
+            }
+            _ => false,
+        };
+        self.tuple_size == other.tuple_size
+            && self.row_layout.hash_offset == other.row_layout.hash_offset
+            && self.row_layout.states.size == other.row_layout.states.size
+            && self.group_types == other.group_types
+            && same_aggrs
+            && same_states
+    }
+
+    /// Move every row, with its states, to `dests[(hash & mask) >> shift]`, payloads of the
+    /// layout of this one. The group values at `arena_offsets`, whose bytes are in an arena, are
+    /// copied into the arena of their destination; the other rows of this payload's arena are not
+    /// needed after. This payload is left holding rows whose states it does not own.
+    pub(super) fn move_rows_into(
+        &mut self,
+        dests: &mut [Payload],
+        mask: u64,
+        shift: u64,
+        arena_offsets: &[usize],
+    ) {
+        self.assert_same_layout(dests);
+        let tuple_size = self.tuple_size;
+        let hash_offset = self.row_layout.hash_offset;
+        let src_states = self.row_layout.states;
+        let mut mover = RowMover::new(
+            &self.aggrs,
+            self.row_layout.states_layout.take(),
+            src_states,
+            Unmoved::Pages(&self.pages, tuple_size),
+            dests,
+            &[],
+        );
+        for page in self.pages.iter() {
+            let base = page.base();
+            let states_base = unsafe { base.add(src_states.offset) };
+            for row in 0..page.rows {
+                // SAFETY: `row` is a row of the page, the next row the mover owns.
+                unsafe {
+                    let src = base.add(row * tuple_size);
+                    let hash = std::ptr::read_unaligned(src.add(hash_offset).cast::<u64>());
+                    let bucket = ((hash & mask) >> shift) as usize;
+                    let states = states_base.add(row * src_states.size);
+                    mover.move_row(bucket, src, states, arena_offsets);
+                }
+            }
+        }
+    }
+
+    /// Move `rows`, rows of this payload, with their states, to the end of `dest`, a payload of
+    /// the layout of this one, copying their group values at `arena_offsets` into the arena of
+    /// `dest`; then drop `dropped`, the states of the other rows. This payload is left owning no
+    /// states.
+    pub(super) fn move_rows_to(
+        &mut self,
+        rows: &[RowPtr],
+        dropped: &[StateAddr],
+        dest: &mut Payload,
+        arena_offsets: &[usize],
+    ) {
+        let dests = std::slice::from_mut(dest);
+        self.assert_same_layout(dests);
+        let states = self.row_layout.states;
+        let mut mover = RowMover::new(
+            &self.aggrs,
+            self.row_layout.states_layout.take(),
+            states,
+            Unmoved::Rows(rows),
+            dests,
+            dropped,
+        );
+        for row in rows {
+            // SAFETY: `row` is a row of this payload, the next row the mover owns.
+            unsafe {
+                let src = row.as_ptr();
+                mover.move_row(0, src, states.ptr(src), arena_offsets);
+            }
+        }
+    }
+
+    /// Rows move only between payloads of the same layout: a row of another layout would be
+    /// written past the rows or states of its destination, or its states dropped by another
+    /// aggregate.
+    fn assert_same_layout(&self, dests: &[Payload]) {
+        assert!(
+            dests.iter().all(|dest| dest.same_layout(self)),
+            "rows moved to a payload of another layout"
+        );
     }
 
     /// Calls `f` with the group hash of each row.
@@ -573,7 +926,7 @@ impl Payload {
         payloads
     }
 
-    fn empty_like(&self) -> Payload {
+    pub(super) fn empty_like(&self) -> Payload {
         let mut payload = Payload::new(
             self.arena.clone(),
             self.group_types.clone(),
@@ -740,6 +1093,21 @@ impl Payload {
     }
 }
 
+/// Copy `len` bytes, with fixed-size moves for the sizes of common rows and states.
+#[inline(always)]
+unsafe fn copy_small(src: *const u8, dst: *mut u8, len: usize) {
+    unsafe {
+        match len {
+            0 => {}
+            8 => std::ptr::copy_nonoverlapping(src, dst, 8),
+            16 => std::ptr::copy_nonoverlapping(src, dst, 16),
+            24 => std::ptr::copy_nonoverlapping(src, dst, 24),
+            32 => std::ptr::copy_nonoverlapping(src, dst, 32),
+            _ => std::ptr::copy_nonoverlapping(src, dst, len),
+        }
+    }
+}
+
 /// Finalize the states of the rows a flush left in `flush_state` into its aggregate results.
 pub(super) fn merge_flushed_states(
     row_layout: &RowLayout,
@@ -805,5 +1173,292 @@ impl Drop for Payload {
                 }
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::alloc::Layout;
+    use std::cell::Cell;
+    use std::fmt;
+    use std::sync::LazyLock;
+
+    use databend_common_base::runtime::catch_unwind;
+
+    use super::*;
+    use crate::AggregateHashTable;
+    use crate::BlockEntry;
+    use crate::ColumnBuilder;
+    use crate::FromData;
+    use crate::HashTableConfig;
+    use crate::ProbeState;
+    use crate::StateSerdeItem;
+    use crate::aggregate::AggrStateType;
+    use crate::aggregate::AggregateCall;
+    use crate::aggregate::MAX_PAGE_SIZE;
+    use crate::aggregate::aggregate_function::get_states_layout;
+    use crate::aggregate::aggregate_function::*;
+    use crate::types::ArgType;
+    use crate::types::DataType;
+    use crate::types::StringType;
+    use crate::types::UInt64Type;
+
+    thread_local! {
+        /// The states of `LiveAggregate` alive on this thread.
+        static LIVE: Cell<isize> = const { Cell::new(0) };
+    }
+
+    fn live() -> isize {
+        LIVE.with(Cell::get)
+    }
+
+    /// A state on the heap that counts itself in `LIVE`: a state dropped twice leaves the count
+    /// below zero, a state never dropped above.
+    struct LiveState(#[allow(dead_code)] Box<u64>);
+
+    impl Drop for LiveState {
+        fn drop(&mut self) {
+            LIVE.with(|live| live.set(live.get() - 1));
+        }
+    }
+
+    /// An aggregate of no arguments whose states need a drop, see `LiveState`; or, without
+    /// `manual_drop`, the same call with states of the same size that are said not to.
+    struct LiveAggregate {
+        manual_drop: bool,
+    }
+
+    impl fmt::Display for LiveAggregate {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "live")
+        }
+    }
+
+    impl AggregateCall for LiveAggregate {
+        fn signature(&self) -> &AggregateSignature {
+            static SIGNATURE: LazyLock<AggregateSignature> = LazyLock::new(|| AggregateSignature {
+                name: "live".to_string(),
+                params: vec![],
+                args_type: vec![],
+                distinct: false,
+                order_by: vec![],
+                return_type: UInt64Type::data_type(),
+            });
+            &SIGNATURE
+        }
+
+        fn features(&self) -> &AggregateFeatures {
+            static FEATURES: AggregateFeatures = AggregateFeatures {
+                eager_aggregation: EagerAggregation::Unsupported,
+                supports_filter: false,
+                supports_state: false,
+                sort_policy: SortPolicy::Unsupported,
+                distinct_policy: DistinctPolicy::Unsupported,
+                hide_doc: false,
+                category: "",
+                description: "",
+                definition: "",
+                example: "",
+            };
+            &FEATURES
+        }
+
+        fn input_layout(&self) -> &FunctionInputLayout {
+            &FunctionInputLayout::Identity
+        }
+
+        fn state(&self) -> &AggregateStateDescription {
+            fn state(manual_drop: bool) -> AggregateStateDescription {
+                AggregateStateDescription::new(
+                    vec![AggrStateType::Custom(Layout::new::<LiveState>())],
+                    vec![StateSerdeItem::DataType(UInt64Type::data_type())],
+                )
+                .with_manual_drop(manual_drop)
+            }
+            static DROPPED: LazyLock<AggregateStateDescription> = LazyLock::new(|| state(true));
+            static KEPT: LazyLock<AggregateStateDescription> = LazyLock::new(|| state(false));
+            match self.manual_drop {
+                true => &DROPPED,
+                false => &KEPT,
+            }
+        }
+
+        fn init_state(&self, state: AggrState<'_>) {
+            LIVE.with(|live| live.set(live.get() + 1));
+            state.write(|| LiveState(Box::new(0)));
+        }
+
+        fn accumulate(&self, _: AggrState<'_>, _: ProjectedBlock<'_>) -> Result<()> {
+            Ok(())
+        }
+
+        fn accumulate_keys(&self, _: AggregateStateSet<'_>, _: ProjectedBlock<'_>) -> Result<()> {
+            Ok(())
+        }
+
+        fn accumulate_row(&self, _: AggrState<'_>, _: ProjectedBlock<'_>, _: usize) -> Result<()> {
+            Ok(())
+        }
+
+        fn accumulate_row_count(&self, _: AggrState<'_>, _: usize) -> Result<()> {
+            Ok(())
+        }
+
+        fn serialize(&self, _: AggregateStateSet<'_>, _: &mut [ColumnBuilder]) -> Result<()> {
+            unimplemented!()
+        }
+
+        fn merge_serialized(&self, _: AggregateStateSet<'_>, _: &BlockEntry) -> Result<()> {
+            unimplemented!()
+        }
+
+        fn merge_states(&self, _: AggrState<'_>, _: AggrState<'_>) -> Result<()> {
+            Ok(())
+        }
+
+        fn merge_result(&self, _: AggrState<'_>, _: &mut ColumnBuilder) -> Result<()> {
+            unimplemented!()
+        }
+
+        fn merge_result_read_only(&self, _: AggrState<'_>, _: &mut ColumnBuilder) -> Result<()> {
+            unimplemented!()
+        }
+
+        unsafe fn drop_state(&self, state: AggrState<'_>) {
+            unsafe { std::ptr::drop_in_place(state.get::<LiveState>()) };
+        }
+    }
+
+    /// A payload of `rows` groups of string keys, each with a live state.
+    fn source(rows: usize) -> Payload {
+        let aggrs: Vec<AggregateCallRef> = vec![Arc::new(LiveAggregate { manual_drop: true })];
+        let mut table = AggregateHashTable::new(
+            vec![DataType::String],
+            aggrs,
+            HashTableConfig::default().with_initial_radix_bits(0),
+            Arc::new(Bump::new()),
+        );
+        let keys = (0..rows)
+            .map(|i| format!("a group key long enough for the arena {i}"))
+            .collect::<Vec<_>>();
+        let keys: Vec<BlockEntry> = vec![StringType::from_data(keys).into()];
+        let params: Vec<ProjectedBlock> = vec![(&[]).into()];
+        table
+            .add_groups(
+                &mut ProbeState::default(),
+                (&keys).into(),
+                &params,
+                (&[]).into(),
+                rows,
+            )
+            .unwrap();
+        table.into_payloads().pop().unwrap()
+    }
+
+    /// An empty payload of the layout of `source`, whose arena takes at most `limit` bytes.
+    fn dest(source: &Payload, limit: Option<usize>) -> Payload {
+        let arena = Bump::new();
+        arena.set_allocation_limit(limit);
+        Payload::new(
+            Arc::new(arena),
+            source.group_types.clone(),
+            source.aggrs.clone(),
+            Some(get_states_layout(&source.aggrs).unwrap()),
+            MAX_PAGE_SIZE,
+        )
+    }
+
+    fn rows_of(payload: &Payload) -> Vec<RowPtr> {
+        payload
+            .pages
+            .iter()
+            .flat_map(|page| (0..page.rows).map(|row| payload.data_ptr(page, row)))
+            .collect()
+    }
+
+    // Moving every row: the states are dropped once, by the destinations, also when the arena
+    // of a destination runs out midway and the move panics.
+    #[test]
+    fn test_move_rows_into_drops_each_state_once() {
+        for limit in [None, Some(4096)] {
+            {
+                let mut source = source(2000);
+                let offsets = [source.row_layout.group_offsets[0]];
+                assert_eq!(live(), 2000);
+                let mut dests = [dest(&source, None), dest(&source, limit)];
+                let moved =
+                    catch_unwind(|| source.move_rows_into(&mut dests, 1 << 47, 47, &offsets));
+                let held = dests[0].len() + dests[1].len();
+                match limit {
+                    None => assert!(moved.is_ok() && held == 2000),
+                    Some(_) => assert!(moved.is_err() && 0 < held && held < 2000),
+                }
+                // The states of the rows not moved were dropped at the panic.
+                assert_eq!(live(), held as isize);
+            }
+            assert_eq!(live(), 0, "limit {limit:?}");
+        }
+    }
+
+    // Moving some rows and dropping the others: each state is dropped once, also when the move
+    // panics midway.
+    #[test]
+    fn test_move_rows_to_drops_each_state_once() {
+        for limit in [None, Some(4096)] {
+            {
+                let mut source = source(2000);
+                let offsets = [source.row_layout.group_offsets[0]];
+                let rows = rows_of(&source);
+                let kept = rows.iter().step_by(2).copied().collect::<Vec<_>>();
+                let dropped = rows
+                    .iter()
+                    .skip(1)
+                    .step_by(2)
+                    .map(|row| row.state_addr(&source.row_layout))
+                    .collect::<Vec<_>>();
+                let mut dest = dest(&source, limit);
+                let moved =
+                    catch_unwind(|| source.move_rows_to(&kept, &dropped, &mut dest, &offsets));
+                match limit {
+                    None => assert!(moved.is_ok() && dest.len() == 1000),
+                    Some(_) => assert!(moved.is_err() && 0 < dest.len() && dest.len() < 1000),
+                }
+                assert_eq!(live(), dest.len() as isize);
+            }
+            assert_eq!(live(), 0, "limit {limit:?}");
+        }
+    }
+
+    // Rows move only to payloads of the same layout.
+    #[test]
+    #[should_panic(expected = "rows moved to a payload of another layout")]
+    fn test_move_rows_into_another_layout() {
+        let mut source = source(10);
+        let mut other = Payload::new(
+            Arc::new(Bump::new()),
+            vec![DataType::String],
+            vec![],
+            None,
+            MAX_PAGE_SIZE,
+        );
+        source.move_rows_into(std::slice::from_mut(&mut other), 0, 0, &[]);
+    }
+
+    // An aggregate of the same call and state size, whose states are not dropped the same way,
+    // has another layout.
+    #[test]
+    #[should_panic(expected = "rows moved to a payload of another layout")]
+    fn test_move_rows_into_another_state() {
+        let mut source = source(10);
+        let aggrs: Vec<AggregateCallRef> = vec![Arc::new(LiveAggregate { manual_drop: false })];
+        let mut other = Payload::new(
+            Arc::new(Bump::new()),
+            source.group_types.clone(),
+            aggrs.clone(),
+            Some(get_states_layout(&aggrs).unwrap()),
+            MAX_PAGE_SIZE,
+        );
+        assert_eq!(other.tuple_size, source.tuple_size);
+        source.move_rows_into(std::slice::from_mut(&mut other), 0, 0, &[]);
     }
 }

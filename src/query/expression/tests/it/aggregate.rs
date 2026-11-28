@@ -22,12 +22,14 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
 use bumpalo::Bump;
+use databend_common_column::bitmap::Bitmap;
 use databend_common_exception::ErrorCode;
 use databend_common_exception::Result;
 use databend_common_expression::AggrState;
 use databend_common_expression::AggrStateType;
 use databend_common_expression::AggregateHashTable;
 use databend_common_expression::BlockEntry;
+use databend_common_expression::Column;
 use databend_common_expression::ColumnBuilder;
 use databend_common_expression::DataBlock;
 use databend_common_expression::DistinctSampler;
@@ -47,6 +49,7 @@ use databend_common_expression::ProbeState;
 use databend_common_expression::ProjectedBlock;
 use databend_common_expression::Scalar;
 use databend_common_expression::ScalarRef;
+use databend_common_expression::StagedGroups;
 use databend_common_expression::StateSerdeItem;
 use databend_common_expression::aggregate::aggregate_function::*;
 use databend_common_expression::aggregate_function::EagerAggregation;
@@ -54,7 +57,11 @@ use databend_common_expression::block_debug::assert_block_value_sort_eq;
 use databend_common_expression::group_hash_entries;
 use databend_common_expression::partial_table_bytes;
 use databend_common_expression::types::ArgType;
+use databend_common_expression::types::ArrayColumn;
 use databend_common_expression::types::DataType;
+use databend_common_expression::types::DecimalColumn;
+use databend_common_expression::types::DecimalSize;
+use databend_common_expression::types::Int32Type;
 use databend_common_expression::types::Int64Type;
 use databend_common_expression::types::NumberDataType;
 use databend_common_expression::types::NumberScalar;
@@ -1381,4 +1388,579 @@ fn candidate_lists(types: &[DataType], len: usize) -> Vec<Vec<DataType>> {
         }
     }
     out
+}
+
+/// The inputs of a final aggregate in `test_staged_groups_match_the_hash_table`: payloads of
+/// partial tables, raw rows, and serialized states, over the same groups.
+struct StagedInputs {
+    group_types: Vec<DataType>,
+    /// The group column of each input block.
+    blocks: Vec<BlockEntry>,
+}
+
+impl StagedInputs {
+    /// `blocks` blocks of `rows` keys of `groups` groups each, in another order each time: a
+    /// group repeats in a block when `rows` is above `groups`.
+    fn int_keys(groups: usize, rows: usize, blocks: usize) -> Vec<Vec<usize>> {
+        (0..blocks)
+            .map(|r| {
+                (0..rows)
+                    .map(|i| (i * 7919 + r * 104_729) % groups)
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn ints(groups: usize, rows: usize, blocks: usize) -> Self {
+        let blocks = Self::int_keys(groups, rows, blocks)
+            .into_iter()
+            .map(|keys| {
+                let keys = keys.into_iter().map(|k| k as i64 * 3 - 1_000_000);
+                Int64Type::from_data(keys.collect::<Vec<_>>()).into()
+            })
+            .collect();
+        StagedInputs {
+            group_types: vec![Int64Type::data_type()],
+            blocks,
+        }
+    }
+
+    fn nullable_ints(groups: usize, rows: usize, blocks: usize) -> Self {
+        let blocks = Self::int_keys(groups, rows, blocks)
+            .into_iter()
+            .map(|keys| {
+                let keys = keys.into_iter().map(|k| k as i32).collect::<Vec<_>>();
+                // The values under the NULLs differ, as a column may hold any value there: a
+                // NULL is one group whatever it holds.
+                let validity = keys.iter().map(|k| k % 11 != 0).collect::<Bitmap>();
+                Int32Type::from_data(keys)
+                    .wrap_nullable(Some(validity))
+                    .into()
+            })
+            .collect();
+        StagedInputs {
+            group_types: vec![Int32Type::data_type().wrap_nullable()],
+            blocks,
+        }
+    }
+
+    fn strings(groups: usize, rows: usize, blocks: usize) -> Self {
+        let blocks = Self::int_keys(groups, rows, blocks)
+            .into_iter()
+            .map(|keys| {
+                let keys = keys
+                    .into_iter()
+                    .map(|k| format!("a group key long enough for the arena {k}"))
+                    .collect::<Vec<_>>();
+                StringType::from_data(keys).into()
+            })
+            .collect();
+        StagedInputs {
+            group_types: vec![DataType::String],
+            blocks,
+        }
+    }
+
+    /// Decimal keys of precision 10, held in a 128-bit column as some kernels leave them, rather
+    /// than the 64 bits the precision needs; one in 11 NULL with `nullable`.
+    fn non_strict_decimals(groups: usize, rows: usize, blocks: usize, nullable: bool) -> Self {
+        let size = DecimalSize::new_unchecked(10, 2);
+        let blocks = Self::int_keys(groups, rows, blocks)
+            .into_iter()
+            .map(|keys| {
+                let validity = keys.iter().map(|k| k % 11 != 0).collect::<Bitmap>();
+                let values = keys.into_iter().map(|k| k as i128 * 7 - 50_000);
+                let column = Column::Decimal(DecimalColumn::Decimal128(values.collect(), size));
+                match nullable {
+                    true => column.wrap_nullable(Some(validity)).into(),
+                    false => column.into(),
+                }
+            })
+            .collect();
+        let data_type = DataType::Decimal(size);
+        StagedInputs {
+            group_types: vec![match nullable {
+                true => data_type.wrap_nullable(),
+                false => data_type,
+            }],
+            blocks,
+        }
+    }
+
+    fn table(&self, fixture: &TrackedHeapFixture, config: HashTableConfig) -> AggregateHashTable {
+        AggregateHashTable::new(
+            self.group_types.clone(),
+            fixture.aggrs(),
+            config,
+            Arc::new(Bump::new()),
+        )
+    }
+
+    /// Input `i` as `kind` 0 (payloads of a partial table), 1 (raw rows) or 2 (serialized
+    /// states), added to `direct` and to `staged`.
+    fn add(
+        &self,
+        fixture: &TrackedHeapFixture,
+        i: usize,
+        kind: usize,
+        direct: &mut AggregateHashTable,
+        staged: &mut StagedGroups,
+        flush_state: &mut PayloadFlushState,
+    ) {
+        let groups = vec![self.blocks[i].clone()];
+        let rows = groups[0].len();
+        let markers = [vec![UInt64Type::from_data(vec![0u64; rows]).into()]];
+        let params: Vec<ProjectedBlock> = markers.iter().map(|v| v.into()).collect();
+        match kind {
+            0 => {
+                let mut partial =
+                    self.table(fixture, HashTableConfig::default().with_route_partitions(3));
+                partial
+                    .add_groups(
+                        &mut ProbeState::default(),
+                        (&groups).into(),
+                        &params,
+                        (&[]).into(),
+                        rows,
+                    )
+                    .unwrap();
+                for payload in partial.into_payloads() {
+                    direct.combine_payload(&payload, flush_state).unwrap();
+                    // The partial table, its arena with it, is gone before the staged rows are
+                    // aggregated: they keep their values.
+                    staged.add_payload(payload, flush_state).unwrap();
+                }
+            }
+            1 => {
+                direct
+                    .add_raw_groups(flush_state, (&groups).into(), &params, rows)
+                    .unwrap();
+                staged
+                    .add_rows(flush_state, (&groups).into(), &params, (&[]).into(), rows)
+                    .unwrap();
+            }
+            _ => {
+                let mut partial = self.table(
+                    fixture,
+                    HashTableConfig::default().with_initial_radix_bits(0),
+                );
+                partial
+                    .add_groups(
+                        &mut ProbeState::default(),
+                        (&groups).into(),
+                        &params,
+                        (&[]).into(),
+                        rows,
+                    )
+                    .unwrap();
+                let serialized = partial.payload.aggregate_flush_all().unwrap();
+                let states = ProjectedBlock::project(&[0], &serialized);
+                let keys = ProjectedBlock::project(&[1], &serialized);
+                let groups = serialized.num_rows();
+                direct
+                    .add_serialized_groups(flush_state, keys, states, groups)
+                    .unwrap();
+                staged
+                    .add_rows(flush_state, keys, &[], states, groups)
+                    .unwrap();
+            }
+        }
+    }
+
+    /// The inputs added to a hash table and to staged groups of `bits` bits from `start_bit`,
+    /// input `i` as kind `kind(i)`, see `add`.
+    fn aggregate(
+        &self,
+        fixture: &TrackedHeapFixture,
+        start_bit: u64,
+        bits: u64,
+        kind: impl Fn(usize) -> usize,
+    ) -> (AggregateHashTable, StagedGroups) {
+        self.aggregate_with(fixture, HashTableConfig::default(), start_bit, bits, kind)
+    }
+
+    /// `aggregate`, with a hash table of `config`.
+    fn aggregate_with(
+        &self,
+        fixture: &TrackedHeapFixture,
+        config: HashTableConfig,
+        start_bit: u64,
+        bits: u64,
+        kind: impl Fn(usize) -> usize,
+    ) -> (AggregateHashTable, StagedGroups) {
+        let mut direct = self.table(fixture, config);
+        let mut staged =
+            StagedGroups::new(self.group_types.clone(), fixture.aggrs(), start_bit, bits);
+        let mut flush_state = PayloadFlushState::default();
+        for i in 0..self.blocks.len() {
+            self.add(
+                fixture,
+                i,
+                kind(i),
+                &mut direct,
+                &mut staged,
+                &mut flush_state,
+            );
+        }
+        (direct, staged)
+    }
+}
+
+fn staged_blocks(staged: StagedGroups, serialize: bool) -> Vec<(usize, DataBlock)> {
+    let mut output = staged.into_output(serialize);
+    let mut flush_state = PayloadFlushState::default();
+    let mut blocks = vec![];
+    while let Some(block) = output.next_block(&mut flush_state).unwrap() {
+        blocks.push(block);
+    }
+    // The buckets come out in order.
+    assert!(blocks.windows(2).all(|w| w[0].0 <= w[1].0));
+    blocks
+}
+
+/// The staged groups of a final aggregate give the groups of the hash table for the same inputs,
+/// and drop every state once: with fixed, nullable and string keys, inputs of every kind or
+/// partial aggregate payloads only, aggregated in place, groups repeated within a block, buckets
+/// merged into their tables as the input comes and others only at the output, and buckets split
+/// for being too big.
+#[test]
+fn test_staged_groups_match_the_hash_table() {
+    for (name, inputs, bits) in [
+        ("ints", StagedInputs::ints(60_000, 180_000, 6), 2),
+        (
+            "ints repeated in a block",
+            StagedInputs::ints(3_000, 40_000, 3),
+            1,
+        ),
+        // Too few rows for a bucket to be merged before the output.
+        ("ints, few rows", StagedInputs::ints(3_000, 4_000, 3), 0),
+        (
+            "ints, one bucket",
+            StagedInputs::ints(1_000_000, 400_000, 3),
+            0,
+        ),
+        ("strings", StagedInputs::strings(30_000, 30_000, 3), 3),
+        (
+            "strings repeated",
+            StagedInputs::strings(20_000, 60_000, 4),
+            1,
+        ),
+        (
+            "nullable ints",
+            StagedInputs::nullable_ints(40_000, 120_000, 4),
+            2,
+        ),
+        (
+            "non-strict decimals",
+            StagedInputs::non_strict_decimals(40_000, 120_000, 4, false),
+            2,
+        ),
+        (
+            "nullable non-strict decimals",
+            StagedInputs::non_strict_decimals(40_000, 120_000, 4, true),
+            2,
+        ),
+    ] {
+        // Inputs of every kind, and partial aggregate payloads only, aggregated in place.
+        for (kinds, kind) in [
+            ("all kinds", (|i| i % 3) as fn(usize) -> usize),
+            ("payloads", |_| 0),
+        ] {
+            let fixture = TrackedHeapFixture::new();
+            {
+                let (direct, staged) = inputs.aggregate(&fixture, 0, bits, kind);
+                let groups = direct.payload.len();
+                let expected = fixture.merge_result_block(direct);
+                let blocks = staged_blocks(staged, false);
+                let staged =
+                    DataBlock::concat(&blocks.into_iter().map(|(_, b)| b).collect::<Vec<_>>())
+                        .unwrap();
+                assert_eq!(staged.num_rows(), groups, "{name}, {kinds}");
+                assert_block_value_sort_eq(&expected, &staged);
+            }
+            fixture.assert_all_states_dropped();
+        }
+    }
+}
+
+/// Partial aggregate payloads that send the same groups again and again, a payload per block, are
+/// aggregated in place in their bucket as it grows, several times: the buckets hold about two rows
+/// per group at most, the result is the hash table's, and every state, merged or kept, is dropped
+/// once.
+#[test]
+fn test_staged_groups_compact_repeated_payloads() {
+    for (name, inputs, bits) in [
+        ("ints", StagedInputs::ints(40_000, 40_000, 30), 0),
+        (
+            "ints, 4 buckets",
+            StagedInputs::ints(200_000, 200_000, 12),
+            2,
+        ),
+        ("strings", StagedInputs::strings(40_000, 40_000, 20), 0),
+        (
+            "nullable ints",
+            StagedInputs::nullable_ints(50_000, 50_000, 16),
+            0,
+        ),
+    ] {
+        let fixture = TrackedHeapFixture::new();
+        {
+            let (direct, staged) = inputs.aggregate(&fixture, 0, bits, |_| 0);
+            let groups = direct.payload.len();
+            // Every block sends every group: without the compactions the buckets would hold
+            // all of them.
+            assert!(
+                staged.staged_rows() <= 3 * groups,
+                "{name}: {} rows staged for {groups} groups, {} sent",
+                staged.staged_rows(),
+                staged.len(),
+            );
+            let expected = fixture.merge_result_block(direct);
+            let blocks = staged_blocks(staged, false);
+            let staged =
+                DataBlock::concat(&blocks.into_iter().map(|(_, b)| b).collect::<Vec<_>>()).unwrap();
+            assert_eq!(staged.num_rows(), groups, "{name}");
+            assert_block_value_sort_eq(&expected, &staged);
+        }
+        fixture.assert_all_states_dropped();
+    }
+}
+
+/// A bucket whose groups were distinct at first waits long before it is aggregated in place
+/// again; once its groups start to repeat, it still grows by at most 512K rows before it is.
+#[test]
+fn test_staged_groups_compact_bounds_late_repeats() {
+    let inputs = StagedInputs::ints(40_000, 40_000, 20);
+    let fixture = TrackedHeapFixture::new();
+    {
+        let mut direct = inputs.table(&fixture, HashTableConfig::default());
+        let mut staged = StagedGroups::new(inputs.group_types.clone(), fixture.aggrs(), 0, 0);
+        let mut flush_state = PayloadFlushState::default();
+        let mut most = 0;
+        for i in 0..inputs.blocks.len() {
+            inputs.add(&fixture, i, 0, &mut direct, &mut staged, &mut flush_state);
+            most = most.max(staged.staged_rows());
+        }
+        // The first 40K distinct groups would put the next compaction 16 times later, at 640K
+        // rows.
+        assert!(most <= 512 * 1024 + 40_000, "{most} rows staged");
+        let expected = fixture.merge_result_block(direct);
+        let blocks = staged_blocks(staged, false);
+        let staged =
+            DataBlock::concat(&blocks.into_iter().map(|(_, b)| b).collect::<Vec<_>>()).unwrap();
+        assert_block_value_sort_eq(&expected, &staged);
+    }
+    fixture.assert_all_states_dropped();
+}
+
+/// Constant columns, a group key and an argument, are repeated into each bucket, and give the
+/// groups of the hash table.
+#[test]
+fn test_staged_groups_const_columns() {
+    let fixture = TrackedHeapFixture::new();
+    {
+        let types = vec![Int64Type::data_type(), DataType::String];
+        let mut direct = AggregateHashTable::new(
+            types.clone(),
+            fixture.aggrs(),
+            HashTableConfig::default(),
+            Arc::new(Bump::new()),
+        );
+        let mut staged = StagedGroups::new(types, fixture.aggrs(), 0, 2);
+        let mut flush_state = PayloadFlushState::default();
+        let rows = 50_000;
+        for block in 0..4 {
+            let keys = (0..rows).map(|i| ((i * 7919 + block * 13) % 30_000) as i64);
+            let constant = format!("a constant key long enough for the arena {}", block % 2);
+            let groups: Vec<BlockEntry> = vec![
+                Int64Type::from_data(keys.collect::<Vec<_>>()).into(),
+                BlockEntry::Const(Scalar::String(constant), DataType::String, rows),
+            ];
+            let markers = [vec![BlockEntry::Const(
+                Scalar::Number(NumberScalar::UInt64(0)),
+                UInt64Type::data_type(),
+                rows,
+            )]];
+            let params: Vec<ProjectedBlock> = markers.iter().map(|v| v.into()).collect();
+            direct
+                .add_raw_groups(&mut flush_state, (&groups).into(), &params, rows)
+                .unwrap();
+            staged
+                .add_rows(
+                    &mut flush_state,
+                    (&groups).into(),
+                    &params,
+                    (&[]).into(),
+                    rows,
+                )
+                .unwrap();
+        }
+        let expected = fixture.merge_result_block(direct);
+        let blocks = staged_blocks(staged, false);
+        let staged =
+            DataBlock::concat(&blocks.into_iter().map(|(_, b)| b).collect::<Vec<_>>()).unwrap();
+        assert_eq!(staged.num_rows(), 60_000);
+        assert_block_value_sort_eq(&expected, &staged);
+    }
+    fixture.assert_all_states_dropped();
+}
+
+/// Decimals held wider than their precision needs, inside a tuple key, an array argument and a
+/// constant array argument: a key is one group whatever the width its decimal is held at, and the
+/// buckets buffer the values at the width of their precision.
+#[test]
+fn test_staged_groups_nested_non_strict_decimals() {
+    let size = DecimalSize::new_unchecked(10, 2);
+    let decimal = DataType::Decimal(size);
+    let key_type = DataType::Tuple(vec![decimal.clone(), Int64Type::data_type()]);
+    let array_type = DataType::Array(Box::new(decimal.clone()));
+    let rows = 20_000;
+    // Every key in every block; the decimal of the key is held at 128 bits in every other block.
+    let key = |strict: bool, block: usize| -> BlockEntry {
+        let keys = (0..rows).map(|i| (i * 7919 + block * 104_729) % 5_000);
+        let keys = keys.collect::<Vec<_>>();
+        let values = keys.iter().map(|k| *k as i64 * 3 - 7_000);
+        let decimals = match strict {
+            true => DecimalColumn::Decimal64(values.collect(), size),
+            false => DecimalColumn::Decimal128(values.map(i128::from).collect(), size),
+        };
+        let ints = Int64Type::from_data(keys.iter().map(|k| *k as i64 % 7).collect::<Vec<_>>());
+        Column::Tuple(vec![Column::Decimal(decimals), ints]).into()
+    };
+    let wide = |values: Vec<i128>| Column::Decimal(DecimalColumn::Decimal128(values.into(), size));
+    let arrays: BlockEntry = Column::Array(Box::new(ArrayColumn::new(
+        wide((0..rows as i128).collect()),
+        (0..=rows as u64).collect(),
+    )))
+    .into();
+    let constant = BlockEntry::Const(Scalar::Array(wide(vec![1, 2, 3])), array_type, rows);
+    let fixture = TrackedHeapFixture::new();
+    {
+        let mut direct = AggregateHashTable::new(
+            vec![key_type.clone()],
+            fixture.aggrs(),
+            HashTableConfig::default(),
+            Arc::new(Bump::new()),
+        );
+        let mut staged = StagedGroups::new(vec![key_type], fixture.aggrs(), 0, 2);
+        let mut flush_state = PayloadFlushState::default();
+        for block in 0..6 {
+            let args = [vec![
+                UInt64Type::from_data(vec![0u64; rows]).into(),
+                arrays.clone(),
+                constant.clone(),
+            ]];
+            let params: Vec<ProjectedBlock> = args.iter().map(|v| v.into()).collect();
+            let strict = [key(true, block)];
+            direct
+                .add_raw_groups(&mut flush_state, (&strict).into(), &params, rows)
+                .unwrap();
+            let keys = [key(block % 2 == 1, block)];
+            staged
+                .add_rows(
+                    &mut flush_state,
+                    (&keys).into(),
+                    &params,
+                    (&[]).into(),
+                    rows,
+                )
+                .unwrap();
+        }
+        let expected = fixture.merge_result_block(direct);
+        let blocks = staged_blocks(staged, false);
+        let staged =
+            DataBlock::concat(&blocks.into_iter().map(|(_, b)| b).collect::<Vec<_>>()).unwrap();
+        assert_eq!(staged.num_rows(), 5_000);
+        assert_block_value_sort_eq(&expected, &staged);
+    }
+    fixture.assert_all_states_dropped();
+}
+
+/// A column shorter than the rows of its block is refused, rather than read past its end.
+#[test]
+#[should_panic(expected = "a column of another length than its rows")]
+fn test_staged_groups_reject_short_columns() {
+    let fixture = TrackedHeapFixture::new();
+    let mut staged = StagedGroups::new(vec![Int64Type::data_type()], fixture.aggrs(), 0, 2);
+    let groups: Vec<BlockEntry> = vec![Int64Type::from_data(vec![1i64, 2, 3, 4]).into()];
+    let markers = [vec![UInt64Type::from_data(vec![0u64; 2]).into()]];
+    let params: Vec<ProjectedBlock> = markers.iter().map(|v| v.into()).collect();
+    let _ = staged.add_rows(
+        &mut PayloadFlushState::default(),
+        (&groups).into(),
+        &params,
+        (&[]).into(),
+        4,
+    );
+}
+
+/// The groups of a spill bucket, restored from its serialized blocks into a table of the inputs'
+/// aggregates.
+fn restore_spill(
+    inputs: &StagedInputs,
+    fixture: &TrackedHeapFixture,
+    blocks: &[&DataBlock],
+) -> DataBlock {
+    let mut flush_state = PayloadFlushState::default();
+    let mut restored = inputs.table(fixture, HashTableConfig::default());
+    for block in blocks {
+        restored
+            .add_serialized_groups(
+                &mut flush_state,
+                ProjectedBlock::project(&[1], block),
+                ProjectedBlock::project(&[0], block),
+                block.num_rows(),
+            )
+            .unwrap();
+    }
+    fixture.merge_result_block(restored)
+}
+
+/// The serialized groups of the staged buckets, as a spill writes them, go to the spill bucket a
+/// hash table spilling at the same depth writes them to: each spill bucket restores alone to the
+/// groups of that table's bucket, also mixed with the blocks that table spilled there.
+#[test]
+fn test_staged_groups_serialize_for_spill() {
+    for inputs in [
+        StagedInputs::strings(20_000, 20_000, 3),
+        StagedInputs::ints(200_000, 600_000, 3),
+    ] {
+        for kind in [(|i| i % 3) as fn(usize) -> usize, |_| 0] {
+            let fixture = TrackedHeapFixture::new();
+            {
+                // Spill depth 1: two bits of the group hash from bit 2, the first two bits of
+                // the staged buckets.
+                let config = HashTableConfig::default()
+                    .with_initial_radix_bits(2)
+                    .with_partition_start_bit(2);
+                let (table, staged) = inputs.aggregate_with(&fixture, config, 2, 4, kind);
+                let mut staged_spill = vec![vec![]; 4];
+                for (bucket, block) in staged_blocks(staged, true) {
+                    staged_spill[bucket >> 2].push(block);
+                }
+                let table_spill = table
+                    .payload
+                    .into_bucket_payloads()
+                    .map(|(_, payload)| payload.aggregate_flush_all().unwrap())
+                    .collect::<Vec<_>>();
+                assert_eq!(table_spill.len(), 4);
+                for (bucket, table_block) in table_spill.iter().enumerate() {
+                    let staged_blocks = staged_spill[bucket].iter().collect::<Vec<_>>();
+                    assert!(table_block.num_rows() > 0, "bucket {bucket}");
+                    assert_block_value_sort_eq(
+                        &restore_spill(&inputs, &fixture, &[table_block]),
+                        &restore_spill(&inputs, &fixture, &staged_blocks),
+                    );
+                    // The same groups spilled twice, once from each: each group merges once.
+                    let mut mixed = staged_blocks.clone();
+                    mixed.push(table_block);
+                    assert_block_value_sort_eq(
+                        &restore_spill(&inputs, &fixture, &[table_block, table_block]),
+                        &restore_spill(&inputs, &fixture, &mixed),
+                    );
+                }
+            }
+            fixture.assert_all_states_dropped();
+        }
+    }
 }
